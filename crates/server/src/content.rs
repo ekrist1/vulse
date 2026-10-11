@@ -2,10 +2,12 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
+use std::collections::BTreeMap;
+
 use vulse_model::{
-    Blueprint, CollectionView, CreateCollection, DocumentView, DocumentWrite, Page,
+    Blueprint, CollectionView, CreateCollection, DocumentView, DocumentWrite, FieldType, Page,
     UpdateCollection, check_collection_name, page_bounds, reference_collections,
-    validate_blueprint, validate_document,
+    take_field_renames, validate_blueprint, validate_document,
 };
 
 use crate::auth::{AuthUser, Editor, Principal, SchemaAdmin, require_collection};
@@ -119,20 +121,83 @@ pub async fn update_collection(
             check_collection_name(&name).map_err(AppError::bad)?;
             let visibility = body.visibility.unwrap_or(current.visibility);
             let mut blueprint = body.blueprint.clone().unwrap_or(current.blueprint.clone());
+            // Renamed fields keep their values, formulas, title and views.
+            let renames =
+                take_field_renames(&mut blueprint, &current.blueprint).map_err(AppError::bad)?;
             retarget_self(&mut blueprint, &current.name, &name);
             prepare_blueprint(&blueprint, &name)?;
             ensure_targets(conn, &blueprint, &name).await?;
+            // Stored values of removed fields are only deleted on request.
+            let removed: Vec<String> = current
+                .blueprint
+                .fields
+                .iter()
+                .filter(|old| old.kind != FieldType::Calculated)
+                .filter(|old| !blueprint.fields.iter().any(|new| new.name == old.name))
+                .filter(|old| !renames.contains_key(&old.name))
+                .map(|old| old.name.clone())
+                .collect();
+            let mut holding = BTreeMap::<String, usize>::new();
+            let mut holders = Vec::new();
+            let mut stripped = Vec::new();
             let mut failing = Vec::new();
-            for (doc, body) in store::list_document_bodies(conn, &id).await? {
-                match check_body(conn, &id, &name, &blueprint, &body).await {
+            let mut first_error = None;
+            for (doc, mut source) in store::list_document_bodies(conn, &id).await? {
+                if let Some(object) = source.as_object_mut() {
+                    let mut renamed = false;
+                    for (old, new) in &renames {
+                        if let Some(value) = object.remove(old) {
+                            object.insert(new.clone(), value);
+                            renamed = true;
+                        }
+                    }
+                    let mut changed = false;
+                    for field in &removed {
+                        if let Some(value) = object.remove(field) {
+                            changed = true;
+                            if !value.is_null() {
+                                *holding.entry(field.clone()).or_default() += 1;
+                            }
+                        }
+                    }
+                    if changed {
+                        holders.push(doc.clone());
+                    }
+                    if changed || renamed {
+                        let action = if renamed { "fields renamed" } else { "fields removed" };
+                        stripped.push((doc.clone(), source.clone(), action));
+                    }
+                }
+                match check_body(conn, &id, &name, &blueprint, &source).await {
                     Ok(()) => {}
-                    Err(AppError::BadRequest(_)) => failing.push(doc),
+                    Err(AppError::BadRequest(message)) => {
+                        first_error.get_or_insert(message);
+                        failing.push(doc);
+                    }
                     Err(err) => return Err(err),
                 }
             }
+            if !holding.is_empty() && !body.remove_field_data {
+                let fields = holding
+                    .iter()
+                    .map(|(field, count)| {
+                        format!("'{field}' ({count} record{})", if *count == 1 { "" } else { "s" })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AppError::conflict_docs(
+                    format!(
+                        "Removing fields deletes their stored values: {fields}. Confirm with remove_field_data to continue."
+                    ),
+                    holders,
+                ));
+            }
             if !failing.is_empty() {
                 return Err(AppError::conflict_docs(
-                    "blueprint would invalidate existing documents",
+                    format!(
+                        "Existing records do not fit the new fields: {}",
+                        first_error.unwrap_or_default()
+                    ),
                     failing,
                 ));
             }
@@ -146,6 +211,14 @@ pub async fn update_collection(
             )
             .await
             .map_err(|err| unique_message(err, "a collection with that name already exists"))?;
+            // The previous revision of each record keeps the old values.
+            let now = timeutil::now_rfc3339();
+            for (doc, source, action) in &stripped {
+                store::update_document_as(conn, &id, doc, source, &now, action).await?;
+            }
+            if !renames.is_empty() {
+                crate::records::rename_view_fields(conn, &id, &renames).await?;
+            }
             if name != current.name {
                 for mut related in crate::relationships::all_collections(conn).await? {
                     if related.id == id {

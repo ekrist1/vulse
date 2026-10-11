@@ -62,6 +62,22 @@ pub fn page_bounds(limit: Option<u32>, offset: Option<u32>) -> Result<(u32, u32)
     Ok((limit, offset))
 }
 
+/// A real calendar date written exactly as `YYYY-MM-DD`, years 0001–9999.
+pub fn is_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() && &value[..4] != "0000"
+}
+
 pub fn is_uuid(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
@@ -100,6 +116,29 @@ fn is_slug(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::is_date;
+
+    #[test]
+    fn dates_must_be_real_iso_calendar_days() {
+        for good in ["2026-10-11", "2024-02-29", "0001-01-01", "9999-12-31"] {
+            assert!(is_date(good), "{good}");
+        }
+        for bad in [
+            "2023-02-29",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-1-5",
+            "26-10-11",
+            "2026/10/11",
+            "2026-10-11T00:00",
+            "0000-01-01",
+            "+2026-10-1",
+            "",
+        ] {
+            assert!(!is_date(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     #[test]

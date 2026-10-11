@@ -104,15 +104,23 @@ pub fn validate_query(blueprint: &Blueprint, query: &RecordQuery) -> Result<(), 
         if ["empty", "not_empty"].contains(&filter.op.as_str()) {
             continue;
         }
-        if ["gt", "gte", "lt", "lte"].contains(&filter.op.as_str())
-            && (!matches!(field.kind, FieldType::Number | FieldType::Calculated)
-                || !filter.value.is_number())
-        {
-            return Err("numeric comparisons require a numeric field and value".into());
+        let is_date_value = filter.value.as_str().is_some_and(crate::is_date);
+        if ["gt", "gte", "lt", "lte"].contains(&filter.op.as_str()) {
+            let comparable = match field.kind {
+                FieldType::Number | FieldType::Calculated => filter.value.is_number(),
+                FieldType::Date => is_date_value,
+                _ => false,
+            };
+            if !comparable {
+                return Err(
+                    "comparisons require a number or date field and a matching value".into(),
+                );
+            }
         }
         if matches!(filter.op.as_str(), "eq" | "neq")
             && ((field.kind == FieldType::Number && !filter.value.is_number())
-                || (field.kind == FieldType::Boolean && !filter.value.is_boolean()))
+                || (field.kind == FieldType::Boolean && !filter.value.is_boolean())
+                || (field.kind == FieldType::Date && !is_date_value))
         {
             return Err("filter value does not match field type".into());
         }

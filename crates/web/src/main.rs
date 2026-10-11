@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod collection_api;
+mod confirm;
 mod drafts;
 mod editor;
 mod form;

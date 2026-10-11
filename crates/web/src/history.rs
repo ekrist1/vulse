@@ -1,6 +1,7 @@
 use crate::{
     api,
-    app::{Route, confirm},
+    app::Route,
+    confirm::{ConfirmRequest, use_confirm},
 };
 use vulse_model::{CollectionView, DocumentRevision, DocumentView};
 use yew::prelude::*;
@@ -17,6 +18,7 @@ pub struct HistoryProps {
 }
 #[function_component(HistoryPanel)]
 pub fn history_panel(props: &HistoryProps) -> Html {
+    let confirm = use_confirm();
     let revisions = use_state(Vec::<DocumentRevision>::new);
     let error = use_state(String::new);
     let busy = use_state(|| false);
@@ -62,7 +64,7 @@ pub fn history_panel(props: &HistoryProps) -> Html {
     html! {<section class="card history-panel"><h2>{if props.document.is_some(){"Revision history"}else{"Trash"}}</h2><p class="muted">{"Review a saved version before restoring it. Restores use the current fields and formulas; unavailable references or files must be corrected first."}</p>
     if !error.is_empty(){<p class="error" role="alert">{(*error).clone()}</p>}
     if revisions.is_empty(){<p class="muted">{"No versions to show."}</p>}
-    {for revisions.iter().map(|revision|{let title=vulse_model::record_title(&revision.blueprint,&revision.body,&revision.document_id);let restore={let id=props.collection.id.clone();let rev=revision.clone();let expected=props.document.as_ref().map(|d|d.updated_at.clone());let busy=busy.clone();let error=error.clone();let on_restore=props.on_restore.clone();let refresh=refresh.clone();let dirty=props.dirty;Callback::from(move |_|{if *busy||!confirm(if dirty{"Restore this version and replace your unsaved edits?"}else{"Restore this version?"}){return;}busy.set(true);let(id,rev,expected,busy,error,on_restore,refresh)=(id.clone(),rev.clone(),expected.clone(),busy.clone(),error.clone(),on_restore.clone(),refresh.clone());wasm_bindgen_futures::spawn_local(async move{match api::restore_revision(&id,&rev.document_id,&rev.id,expected).await{Ok(doc)=>{on_restore.emit(doc);refresh.set(*refresh+1);error.set(String::new());},Err(e)=>error.set(e)}busy.set(false);});})};
+    {for revisions.iter().map(|revision|{let title=vulse_model::record_title(&revision.blueprint,&revision.body,&revision.document_id);let restore={let id=props.collection.id.clone();let rev=revision.clone();let expected=props.document.as_ref().map(|d|d.updated_at.clone());let busy=busy.clone();let error=error.clone();let on_restore=props.on_restore.clone();let refresh=refresh.clone();let dirty=props.dirty;let confirm=confirm.clone();let deleted=props.document.is_none();Callback::from(move |_|{if *busy{return;}let request=if dirty{ConfirmRequest::danger("Restore this version?","Your unsaved edits are replaced by this version. The current saved version stays in the history.","Replace and restore")}else if deleted{ConfirmRequest::new("Restore this record?","The record returns to the collection with this version's values.","Restore record")}else{ConfirmRequest::new("Restore this version?","The record's current values are replaced by this version. The current version stays in the history.","Restore version")};let(id,rev,expected,busy,error,on_restore,refresh,confirm)=(id.clone(),rev.clone(),expected.clone(),busy.clone(),error.clone(),on_restore.clone(),refresh.clone(),confirm.clone());wasm_bindgen_futures::spawn_local(async move{if !confirm.ask(request).await{return;}busy.set(true);match api::restore_revision(&id,&rev.document_id,&rev.id,expected).await{Ok(doc)=>{on_restore.emit(doc);refresh.set(*refresh+1);error.set(String::new());},Err(e)=>error.set(e)}busy.set(false);});})};
     let historical=vulse_model::calculate_document(&revision.blueprint,&revision.body).0;
     html!{<details><summary>{format!("{} · {} · {}",title,revision.action,revision.created_at)}</summary>
     if let Some(current)=&props.document {<table class="diff-table"><thead><tr><th>{"Field"}</th><th>{"This version"}</th><th>{"Current"}</th></tr></thead><tbody>{for props.collection.blueprint.fields.iter().chain(revision.blueprint.fields.iter().filter(|f|!props.collection.blueprint.fields.iter().any(|c|c.name==f.name))).filter(|f|historical.get(&f.name)!=current.body.get(&f.name)).map(|field|html!{<tr><th>{field.display_label()}</th><td>{vulse_model::display_value(&historical[&field.name])}</td><td>{vulse_model::display_value(&current.body[&field.name])}</td></tr>})}</tbody></table>}

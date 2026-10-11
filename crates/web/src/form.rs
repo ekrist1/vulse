@@ -49,7 +49,7 @@ fn input_from_field(field: &FieldDef, value: Option<&Value>) -> Result<ValueInpu
     };
     match field.kind {
         FieldType::Calculated => Ok(ValueInput::Calculated),
-        FieldType::String => Ok(ValueInput::String(expect_string(field, value)?)),
+        FieldType::String | FieldType::Date => Ok(ValueInput::String(expect_string(field, value)?)),
         FieldType::Number => {
             if value.is_number() {
                 Ok(ValueInput::Number(value.to_string()))
@@ -97,7 +97,7 @@ fn input_from_item(field: &FieldDef, value: &Value) -> Result<ValueInput, String
 fn blank_input(field: &FieldDef) -> ValueInput {
     match field.kind {
         FieldType::Calculated => ValueInput::Calculated,
-        FieldType::String => ValueInput::String(String::new()),
+        FieldType::String | FieldType::Date => ValueInput::String(String::new()),
         FieldType::Number => ValueInput::Number(String::new()),
         FieldType::Boolean => ValueInput::Boolean(false),
         FieldType::Json => ValueInput::Json(String::new()),
@@ -121,6 +121,12 @@ fn value_from_input(field: &FieldDef, input: &ValueInput) -> Result<Option<Value
     match (field.kind, input) {
         (FieldType::Calculated, _) => Ok(None),
         (FieldType::String, ValueInput::String(value)) => optional_text(field, value),
+        (FieldType::Date, ValueInput::String(value)) => {
+            if !value.is_empty() && !vulse_model::is_date(value) {
+                return Err(format!("{} must be a date", field.display_label()));
+            }
+            optional_text(field, value)
+        }
         (FieldType::Number, ValueInput::Number(value)) => parse_number(field, value),
         (FieldType::Boolean, ValueInput::Boolean(value)) => Ok(Some(Value::Bool(*value))),
         (FieldType::Json, ValueInput::Json(value)) => parse_json(field, value),
@@ -309,6 +315,13 @@ fn control(props: &FieldControlProps) -> Html {
         (FieldType::String, ValueInput::String(value)) => {
             let on_change = props.on_change.clone();
             html! { <input placeholder={props.field.example.clone().unwrap_or_default()} aria-label={props.field.display_label().to_string()} value={value.clone()} oninput={Callback::from(move |event: InputEvent| {
+                let element: HtmlInputElement = event.target_unchecked_into();
+                on_change.emit(ValueInput::String(element.value()));
+            })} /> }
+        }
+        (FieldType::Date, ValueInput::String(value)) => {
+            let on_change = props.on_change.clone();
+            html! { <input type="date" aria-label={props.field.display_label().to_string()} value={value.clone()} oninput={Callback::from(move |event: InputEvent| {
                 let element: HtmlInputElement = event.target_unchecked_into();
                 on_change.emit(ValueInput::String(element.value()));
             })} /> }

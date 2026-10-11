@@ -2745,3 +2745,463 @@ async fn migrations_backfill_legacy_history_search_and_relationships() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn date_fields_validate_filter_sort_calculate_and_import() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "dates@example.com", "dates").await;
+    let tasks = create_collection(
+        &app,
+        &cookie,
+        "tasks",
+        "public",
+        json!({"title_field":"due","fields":[
+            {"name":"title","type":"string"},
+            {"name":"due","type":"date"},
+            {"name":"due_year","type":"calculated","formula":"=YEAR([due])"}
+        ]}),
+    )
+    .await;
+    let documents = format!("/api/v1/collections/{}/documents", tasks.id);
+    for (title, due) in [
+        ("late", "2026-03-01"),
+        ("early", "2025-12-31"),
+        ("leap", "2024-02-29"),
+    ] {
+        let made =
+            create_document(&app, &cookie, &tasks.id, json!({"title":title,"due":due})).await;
+        assert_eq!(made.body["due"], due);
+    }
+    let undated = create_document(&app, &cookie, &tasks.id, json!({"title":"undated"})).await;
+    assert!(undated.body.get("due").is_none_or(Value::is_null));
+    for bad in [
+        json!("2025-02-29"),
+        json!("31.12.2025"),
+        json!("2025-12-31T10:00:00"),
+        json!(45000),
+    ] {
+        assert_eq!(
+            app.call(
+                "POST",
+                &documents,
+                Some(&cookie),
+                None,
+                Some(json!({"body":{"title":"bad","due":bad}}))
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+
+    // Range filters compare calendar order and skip records without a date.
+    let query = |filters: Value, descending: bool| {
+        let app = &app;
+        let cookie = cookie.clone();
+        let endpoint = format!("/api/v1/collections/{}/query", tasks.id);
+        async move {
+            let response = app
+                .call(
+                    "POST",
+                    &endpoint,
+                    Some(&cookie),
+                    None,
+                    Some(json!({"filters":filters,"sort_field":"due","descending":descending})),
+                )
+                .await;
+            let status = response.status();
+            if status != StatusCode::OK {
+                return (status, vec![]);
+            }
+            let (_, page) = json_of::<vulse_model::RecordPage>(response).await;
+            let titles = page
+                .items
+                .iter()
+                .map(|d| d.body["title"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            (status, titles)
+        }
+    };
+    assert_eq!(
+        query(
+            json!([{"field":"due","op":"gte","value":"2025-01-01"}]),
+            false
+        )
+        .await
+        .1,
+        vec!["early", "late"]
+    );
+    assert_eq!(
+        query(
+            json!([{"field":"due","op":"lt","value":"2026-03-01"}]),
+            true
+        )
+        .await
+        .1,
+        vec!["early", "leap"]
+    );
+    assert_eq!(
+        query(
+            json!([{"field":"due","op":"eq","value":"2024-02-29"}]),
+            false
+        )
+        .await
+        .1,
+        vec!["leap"]
+    );
+    assert_eq!(
+        query(json!([{"field":"due","op":"not_empty","value":""}]), false)
+            .await
+            .1,
+        vec!["leap", "early", "late"]
+    );
+    for bad in [json!("2025"), json!(2025), json!("2025-02-30")] {
+        assert_eq!(
+            query(json!([{"field":"due","op":"gt","value":bad}]), false)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    // Formulas read the stored ISO text; public reads return it unchanged.
+    let (_, public) = json_of::<Page<DocumentView>>(
+        app.call("GET", "/api/v1/public/tasks?limit=10", None, None, None)
+            .await,
+    )
+    .await;
+    let leap = public
+        .items
+        .iter()
+        .find(|d| d.body["title"] == "leap")
+        .unwrap();
+    assert_eq!(leap.body["due"], "2024-02-29");
+    assert_eq!(leap.body["due_year"], 2024);
+
+    let (status, result) = json_of::<vulse_model::ImportResult>(
+        import_csv(
+            &app,
+            Some(&cookie),
+            &tasks.id,
+            "title,due\nimported,2027-01-02\n",
+            true,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let (_, result) = json_of::<vulse_model::ImportResult>(
+        import_csv(
+            &app,
+            Some(&cookie),
+            &tasks.id,
+            "title,due\nbad,02/01/2027\n",
+            true,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(result.imported, 0);
+    assert!(format!("{:?}", result.errors).contains("YYYY-MM-DD"));
+}
+
+#[tokio::test]
+async fn removing_fields_with_values_needs_confirmation_and_keeps_history() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "fields@example.com", "fields").await;
+    let notes = create_collection(
+        &app,
+        &cookie,
+        "notes",
+        "private",
+        json!({"fields":[
+            {"name":"title","type":"string"},
+            {"name":"memo","type":"string"},
+            {"name":"count","type":"number"}
+        ]}),
+    )
+    .await;
+    let kept = create_document(
+        &app,
+        &cookie,
+        &notes.id,
+        json!({"title":"A","memo":"keep me","count":1}),
+    )
+    .await;
+    let plain = create_document(&app, &cookie, &notes.id, json!({"title":"B"})).await;
+    let collection = format!("/api/v1/collections/{}", notes.id);
+    let without_memo =
+        json!({"fields":[{"name":"title","type":"string"},{"name":"count","type":"number"}]});
+
+    // Refused by default, naming the field and the records holding values.
+    let refused = app
+        .call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":without_memo})),
+        )
+        .await;
+    let (status, error) = json_of::<ApiErrorBody>(refused).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(error.error.contains("'memo' (1 record)"), "{}", error.error);
+    assert_eq!(error.document_ids, Some(vec![kept.id.clone()]));
+
+    // Other incompatible changes explain themselves.
+    let (status, error) = json_of::<ApiErrorBody>(
+        app.call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":{"fields":[{"name":"title","type":"string"},{"name":"memo","type":"string"},{"name":"count","type":"string"}]}})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        error.error.contains("count must be a string"),
+        "{}",
+        error.error
+    );
+
+    let (status, saved) = json_of::<CollectionView>(
+        app.call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":without_memo,"remove_field_data":true})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved.blueprint.fields.len(), 2);
+    let (_, doc) = json_of::<DocumentView>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}", kept.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(doc.body.get("memo").is_none());
+    assert_eq!(doc.body["count"], 1);
+    assert_ne!(doc.updated_at, kept.updated_at);
+    let (_, untouched) = json_of::<DocumentView>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}", plain.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(untouched.updated_at, plain.updated_at);
+
+    let (_, revisions) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}/revisions", kept.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(revisions.items[0].action, "fields removed");
+    assert!(
+        revisions.items[1..]
+            .iter()
+            .any(|r| r.body["memo"] == "keep me")
+    );
+    // The search index no longer finds the removed value.
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &format!("{collection}/query"),
+            Some(&cookie),
+            None,
+            Some(json!({"search":"keep me"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 0);
+}
+
+#[tokio::test]
+async fn renaming_fields_moves_values_formulas_titles_and_views() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "rename@example.com", "rename").await;
+    let items = create_collection(
+        &app,
+        &cookie,
+        "items",
+        "private",
+        json!({"title_field":"name","fields":[
+            {"name":"name","type":"string"},
+            {"name":"price","type":"number"},
+            {"name":"memo","type":"string"},
+            {"name":"double","type":"calculated","formula":"=[price]*2"}
+        ]}),
+    )
+    .await;
+    let collection = format!("/api/v1/collections/{}", items.id);
+    let doc = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"name":"Saw","price":10,"memo":"m"}),
+    )
+    .await;
+    let (status, _) = json_of::<vulse_model::SavedView>(
+        app.call(
+            "POST",
+            &format!("{collection}/views"),
+            Some(&cookie),
+            None,
+            Some(json!({"name":"Pricey","query":{"filters":[{"field":"price","op":"gt","value":5}],"sort_field":"price","group_field":"name"},"columns":["name","price"]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A rename needs no data-removal confirmation; a removal in the same save still does.
+    let renamed = json!({"title_field":"title","fields":[
+        {"name":"title","type":"string","renamed_from":"name"},
+        {"name":"unit_price","type":"number","renamed_from":"price"},
+        {"name":"double","type":"calculated","formula":"=[price]*2"}
+    ]});
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":renamed}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let (status, saved) = json_of::<CollectionView>(
+        app.call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":renamed,"remove_field_data":true})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        saved.blueprint.fields[2].formula.as_deref(),
+        Some("=[unit_price]*2")
+    );
+    assert_eq!(saved.blueprint.title_field.as_deref(), Some("title"));
+    assert!(
+        saved
+            .blueprint
+            .fields
+            .iter()
+            .all(|f| f.renamed_from.is_none())
+    );
+    let raw = serde_json::to_string(&saved).unwrap();
+    assert!(!raw.contains("renamed_from"));
+
+    let (_, moved) = json_of::<DocumentView>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}", doc.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(moved.body["title"], "Saw");
+    assert_eq!(moved.body["unit_price"], 10);
+    assert_eq!(moved.body["double"].as_f64(), Some(20.0));
+    assert!(moved.body.get("price").is_none() && moved.body.get("memo").is_none());
+
+    let (_, views) = json_of::<Vec<vulse_model::SavedView>>(
+        app.call(
+            "GET",
+            &format!("{collection}/views"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let view = &views[0].config;
+    assert_eq!(view.query.filters[0].field, "unit_price");
+    assert_eq!(view.query.sort_field, "unit_price");
+    assert_eq!(view.query.group_field, "title");
+    assert_eq!(view.columns, vec!["title", "unit_price"]);
+    let (status, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &format!("{collection}/query"),
+            Some(&cookie),
+            None,
+            Some(json!(view.query)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.total, 1);
+
+    let (_, revisions) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}/revisions", doc.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(revisions.items[0].action, "fields renamed");
+
+    // Invalid renames are refused before anything changes.
+    for bad in [
+        json!({"fields":[{"name":"x","type":"string","renamed_from":"missing"}]}),
+        json!({"fields":[{"name":"title","type":"string"},{"name":"copy","type":"string","renamed_from":"title"}]}),
+    ] {
+        assert_eq!(
+            app.call(
+                "PATCH",
+                &collection,
+                Some(&cookie),
+                None,
+                Some(json!({"blueprint":bad,"remove_field_data":true}))
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+}

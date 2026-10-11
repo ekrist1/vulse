@@ -7,18 +7,18 @@ pub use query::{
 mod formula;
 pub use formula::{
     Expr as FormulaExpression, FUNCTIONS, calculate_document, formula_dependencies,
-    inspect_formula, source_document, text_value, validate_formulas,
+    inspect_formula, rename_formula_fields, source_document, text_value, validate_formulas,
 };
 mod identity;
 mod portable_text;
 
 pub use blueprint::{
     ArrayItems, Blueprint, CheckedDocument, DocumentRef, FieldDef, FieldType, record_title,
-    reference_collections, validate_blueprint, validate_document,
+    reference_collections, take_field_renames, validate_blueprint, validate_document,
 };
 pub use identity::{
-    check_collection_name, check_email, check_handle, check_key_name, check_password, is_uuid,
-    page_bounds,
+    check_collection_name, check_email, check_handle, check_key_name, check_password, is_date,
+    is_uuid, page_bounds,
 };
 pub use portable_text::{
     BlockStyle, EditorBlock, ListItem, Mark, MarkRange, clamp_marks, editor_blocks_from_json,
@@ -205,6 +205,10 @@ pub struct UpdateCollection {
     pub visibility: Option<Visibility>,
     #[serde(default)]
     pub blueprint: Option<Blueprint>,
+    /// Delete the stored values of fields the new blueprint no longer has.
+    /// Without it, removing a field that holds values is refused.
+    #[serde(default)]
+    pub remove_field_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

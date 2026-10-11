@@ -4361,8 +4361,10 @@ dependencies = [
 name = "vulse-web"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "gloo-net 0.6.0",
  "gloo-timers",
+ "js-sys",
  "serde",
  "serde_json",
  "uuid",

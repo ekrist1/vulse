@@ -642,6 +642,7 @@ fn type_label(f: &FieldDef) -> &'static str {
         FieldType::Number => "Number",
         FieldType::String => "Text",
         FieldType::Boolean => "True / false",
+        FieldType::Date => "Date",
         FieldType::Calculated => "Calculated",
         FieldType::Array => "List",
         FieldType::Json => "JSON",
@@ -669,7 +670,10 @@ fn compatible(kind: Kind, f: &FieldDef) -> bool {
     match kind {
         Kind::Number => f.kind == FieldType::Number,
         Kind::Text => f.kind == FieldType::String,
-        Kind::Date => matches!(f.kind, FieldType::String | FieldType::Number),
+        Kind::Date => matches!(
+            f.kind,
+            FieldType::Date | FieldType::String | FieldType::Number
+        ),
         Kind::Boolean => f.kind == FieldType::Boolean,
         Kind::Values => {
             f.kind == FieldType::Number
@@ -1142,6 +1146,7 @@ fn sample_default(field: &FieldDef) -> String {
     match field.kind {
         FieldType::Number => "10".into(),
         FieldType::Boolean => "true".into(),
+        FieldType::Date => "2026-01-15".into(),
         FieldType::Array => {
             if field.items == Some(ArrayItems::Number) {
                 "[1, 2, 3]".into()
@@ -1272,7 +1277,7 @@ fn calculation_preview(props: &PreviewProps) -> Html {
     html! {<div class="calculation-preview"><div class="preview-heading"><div><h4>{"Try your calculation"}</h4><p class="muted">{"Preview changes stay here. They never change a saved record."}</p></div><label>{"Preview values"}<select aria-label="Preview values" value={(*source).clone()} onchange={Callback::from({let source=source.clone();let overrides=overrides.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();source.set(select.value());overrides.set(BTreeMap::new());}})}><option value="" selected={source.is_empty()}>{"Sample values"}</option>{for props.records.iter().map(|r|html!{<option value={r.id.clone()} selected={*source==r.id}>{format!("Record {}{}",r.id.chars().take(8).collect::<String>(),r.body.get("title").or_else(||r.body.get("name")).and_then(Value::as_str).map(|s|format!(" · {s}")).unwrap_or_default())}</option>})}</select></label></div>
         <div class="preview-inputs">{for samples.iter().map(|(field,value)|{let change={let overrides=overrides.clone();let name=field.name.clone();Callback::from(move |value:String|{let mut next=(*overrides).clone();next.insert(name.clone(),value);overrides.set(next);})};html!{<label>{format!("{} · {}",field.display_label(),type_label(field))}
         if field.kind==FieldType::Boolean {<select aria-label={format!("Preview {}",field.name)} value={value.clone()} onchange={Callback::from(move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();change.emit(select.value());})}><option value="true" selected={value=="true"}>{"True"}</option><option value="false" selected={value=="false"}>{"False"}</option></select>}
-        else {<input aria-label={format!("Preview {}",field.name)} type={if field.kind==FieldType::Number{"number"}else{"text"}} step="any" value={value.clone()} oninput={Callback::from(move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();change.emit(input.value());})}/>}
+        else {<input aria-label={format!("Preview {}",field.name)} type={match field.kind{FieldType::Number=>"number",FieldType::Date=>"date",_=>"text"}} step="any" value={value.clone()} oninput={Callback::from(move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();change.emit(input.value());})}/>}
         </label>}})}</div>
         if let Some(error)=preview_error {<p class="calculation-feedback incomplete" role="status">{error}</p>}
         else {<p class="syntax-status">{"✓ Formula syntax and field references are valid"}</p>
@@ -1297,6 +1302,7 @@ mod tests {
             required: false,
             collection: None,
             items: None,
+            renamed_from: None,
         }
     }
     #[test]

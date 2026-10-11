@@ -83,14 +83,35 @@ button.cell-edit{background:transparent;color:var(--ink);border:0;padding:5px 0;
 .import-summary { border: 1px solid #c8e7dd; background: #effaf5; padding: 1rem; border-radius: 8px; }
 @media(max-width: 700px) { .export-toolbar { margin-inline: 12px; } }
 .draft-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
-.records-search { margin: 0 20px 12px; }
-.view-options,.export-options { margin: 12px 20px; border: 1px solid var(--line); border-radius: 8px; }
-.view-options>summary,.export-options>summary { cursor: pointer; padding: 12px; font-weight: 600; }
-.view-options>summary .muted { display: block; margin: 4px 0 0 15px; font-weight: 400; font-size: .85rem; }
-.view-options[open]>summary,.export-options[open]>summary { border-bottom: 1px solid var(--line); }
-.view-options>.view-toolbar { padding: 12px; margin: 0; border: 0; }
-.view-options>.records-controls { padding: 0 12px; grid-template-columns: repeat(3,minmax(0,1fr)); }
-.view-options>.record-filters { padding: 0 12px; margin: 0 0 12px; }
-.export-options .export-toolbar { margin: 12px; }
-@media(max-width:700px){.view-options>.records-controls { grid-template-columns: 1fr; }}
-@media(max-width:600px){.records-search { margin-inline: 12px; }.view-options,.export-options { margin-inline: 12px; }}
+.confirm-dialog{width:min(460px,calc(100vw - 32px));border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:0 16px 70px #122d3630;color:var(--ink)}
+.confirm-dialog::backdrop{background:#173c4a66}
+.confirm-dialog h2{font-size:1.2rem;margin:0 0 .6rem}
+.confirm-dialog p{line-height:1.55;color:var(--muted);margin:0 0 1.4rem;white-space:pre-line}
+.confirm-actions{display:flex;justify-content:flex-end;gap:.7rem;flex-wrap:wrap}
+button.danger-solid{background:var(--danger);color:white}
+button.danger-solid:hover{background:#9f1f2b}
+.records-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.records-search{flex:1 1 240px;min-width:200px}
+.records-search input{min-height:38px;padding-left:36px;background:white url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%237b8f95' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='7' cy='7' r='5'/%3E%3Cpath d='m11 11 3.5 3.5'/%3E%3C/svg%3E") no-repeat 12px center}
+.records-toolbar>select{width:auto;min-width:140px;max-width:220px;min-height:38px;padding:.45rem .7rem;font-weight:600}
+button.toolbar-toggle{background:white;color:var(--ink);border-color:var(--line);min-height:38px;padding:.45rem .8rem;font-size:.88rem;white-space:nowrap}
+button.toolbar-toggle:hover{background:#eef4f5;box-shadow:none}
+button.toolbar-toggle.active{background:#e7f4f1;border-color:#9ccfc4;color:var(--accent)}
+.records-count{margin-left:auto;font-size:.85rem;white-space:nowrap;padding-left:4px}
+.filter-chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:12px 20px}
+.filter-chip{display:inline-flex;align-items:center;border:1px solid #c6e2db;background:#eef8f5;border-radius:999px;overflow:hidden}
+.filter-chip button{background:transparent;color:var(--accent);border:0;border-radius:0;min-height:28px;padding:.2rem .3rem .2rem .75rem;font-size:.8rem;box-shadow:none}
+.filter-chip button:hover{background:#dff1ec;box-shadow:none}
+.filter-chip .chip-remove{padding:.2rem .65rem .2rem .35rem;font-size:1rem;line-height:1}
+.filter-chips .text-button{min-height:28px;font-size:.8rem;padding:.2rem .5rem}
+.records-panel{margin:12px 20px 16px;padding:14px;border:1px solid var(--line);border-radius:10px;background:#fafcfc}
+.records-panel label{margin-bottom:0}
+.records-panel .record-filters{margin:0}
+.records-panel .record-filters .row{margin:4px 0 0}
+.records-panel .records-controls{grid-template-columns:repeat(3,minmax(0,1fr))}
+.records-panel .view-toolbar{border:0;padding:0;margin:0}
+.records-panel .export-toolbar{margin:0}
+.records-panel .column-picker{display:flex;flex-wrap:wrap;gap:6px 20px;border:0;padding:0;min-width:0}
+.records-panel .column-picker p{flex-basis:100%;margin:0 0 4px}
+.records-panel .column-picker label{margin:0}
+@media(max-width:600px){.records-toolbar{padding:12px}.records-search{flex-basis:100%}.records-toolbar>select{flex:1 1 100%;max-width:none}.records-count{margin-left:0;flex-basis:100%}.records-panel{margin-inline:12px}.filter-chips{padding-inline:12px}.records-panel .records-controls{grid-template-columns:1fr}}

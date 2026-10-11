@@ -3,6 +3,7 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::api;
+use crate::confirm::ConfirmProvider;
 use crate::pages::{
     AcceptPage, AccountPage, CollectionPage, CollectionsPage, DocumentPage, KeysPage, LoginPage,
     PeoplePage, SetupPage,
@@ -90,9 +91,11 @@ pub fn app() -> Html {
     };
     html! {
         <ContextProvider<SessionCtx> context={ctx}>
-            <BrowserRouter>
-                <Switch<Route> render={switch} />
-            </BrowserRouter>
+            <ConfirmProvider>
+                <BrowserRouter>
+                    <Switch<Route> render={switch} />
+                </BrowserRouter>
+            </ConfirmProvider>
         </ContextProvider<SessionCtx>>
     }
 }
@@ -175,10 +178,4 @@ pub fn signed_out(session: &SessionCtx) -> Option<Html> {
     } else {
         None
     }
-}
-
-pub fn confirm(message: &str) -> bool {
-    web_sys::window()
-        .and_then(|w| w.confirm_with_message(message).ok())
-        .unwrap_or(false)
 }

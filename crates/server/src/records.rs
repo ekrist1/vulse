@@ -110,6 +110,10 @@ pub(crate) fn query_sql(
         conditions.push(format!("(lower(d.id) LIKE {p} ESCAPE '\\' OR EXISTS(SELECT 1 FROM document_cells c WHERE c.document_id=d.id AND c.text_value LIKE {p} ESCAPE '\\'))"));
     }
     for filter in &query.filters {
+        let is_date = blueprint
+            .fields
+            .iter()
+            .any(|f| f.name == filter.field && f.kind == FieldType::Date);
         let field = parameter(&mut params, text(&filter.field));
         let predicate = if ["empty", "not_empty"].contains(&filter.op.as_str()) {
             "c.text_value<>'' AND c.raw_value<>'[]' AND c.raw_value<>'{}'".into()
@@ -126,6 +130,16 @@ pub(crate) fn query_sql(
                     "c.number_value IS NOT NULL AND CAST(c.number_value AS REAL)=CAST({p} AS REAL)"
                 ),
                 "eq" | "neq" => format!("c.text_value={p}"),
+                // ISO dates order correctly as text.
+                op if is_date => format!(
+                    "c.text_value<>'' AND c.text_value{}{p}",
+                    match op {
+                        "gt" => ">",
+                        "gte" => ">=",
+                        "lt" => "<",
+                        _ => "<=",
+                    }
+                ),
                 op => format!(
                     "c.number_value IS NOT NULL AND CAST(c.number_value AS REAL){}CAST({p} AS REAL)",
                     match op {
@@ -286,4 +300,44 @@ pub async fn delete_view(
         return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Points saved views' filters, sorting, grouping and columns at renamed fields.
+pub async fn rename_view_fields(
+    conn: &Conn,
+    collection: &str,
+    renames: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let rename = |name: &mut String| {
+        if let Some(next) = renames.get(name.as_str()) {
+            *name = next.clone();
+        }
+    };
+    for row in conn
+        .query(
+            "SELECT id,config FROM collection_views WHERE collection_id=?1",
+            &[text(collection)],
+        )
+        .await?
+    {
+        let mut config: SavedViewWrite = serde_json::from_str(&text_at(&row, 1)?)?;
+        let original = config.clone();
+        for filter in &mut config.query.filters {
+            rename(&mut filter.field);
+        }
+        rename(&mut config.query.sort_field);
+        rename(&mut config.query.group_field);
+        config.columns.iter_mut().for_each(rename);
+        if config != original {
+            conn.execute(
+                "UPDATE collection_views SET config=?1 WHERE id=?2",
+                &[
+                    text(&serde_json::to_string(&config)?),
+                    text(&text_at(&row, 0)?),
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }

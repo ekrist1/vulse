@@ -363,6 +363,7 @@ fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
             }
             Ok(n)
         }
+        FieldType::Date => import_date(cell.trim()).map(Value::String),
         FieldType::Boolean => match cell.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" => Ok(Value::Bool(true)),
             "false" | "0" | "no" => Ok(Value::Bool(false)),
@@ -372,6 +373,30 @@ fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
             serde_json::from_str(cell).map_err(|_| "Expected valid JSON".into())
         }
         FieldType::Calculated => Err("Calculated fields are read-only".into()),
+    }
+}
+/// Accepts `YYYY-MM-DD`, or a date and time at exactly midnight as written
+/// for spreadsheet date cells. Other times are refused rather than dropped.
+fn import_date(cell: &str) -> Result<String, String> {
+    let error = || "Expected a date as YYYY-MM-DD".to_string();
+    let date = cell.get(..10).ok_or_else(error)?;
+    if !vulse_model::is_date(date) {
+        return Err(error());
+    }
+    let time = cell[10..].trim_start_matches(['T', ' ']);
+    if time.is_empty() || time.trim_end_matches(['0', ':', '.']).is_empty() {
+        Ok(date.to_string())
+    } else {
+        Err("Expected a date without a time of day".into())
+    }
+}
+/// Date-formatted spreadsheet cells become ISO text, date-only at midnight.
+fn excel_datetime(dt: &calamine::ExcelDateTime) -> String {
+    let (y, mo, d, h, mi, s, ms) = dt.to_ymd_hms_milli();
+    if (h, mi, s, ms) == (0, 0, 0, 0) {
+        format!("{y:04}-{mo:02}-{d:02}")
+    } else {
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}")
     }
 }
 fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
@@ -446,6 +471,7 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
                         Err(format!("Row {}: spreadsheet error {e:?}", first_row + i))
                     }
                     Data::DateTimeIso(s) => Ok(s.clone()),
+                    Data::DateTime(dt) if dt.is_datetime() => Ok(excel_datetime(dt)),
                     _ => Ok(c.to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -584,6 +610,67 @@ mod tests {
                 .unwrap_err()
                 .contains("Row 2")
         );
+    }
+    /// One sheet whose second row holds a date cell (built-in format 14) and
+    /// a date-time cell (format 22) for the same serial day.
+    fn dated_workbook() -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let entries = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Dates" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/styles.xml",
+                r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/><xf numFmtId="22" applyNumberFormat="1"/></cellXfs></styleSheet>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>due</t></is></c><c r="B1" t="inlineStr"><is><t>at</t></is></c></row><row r="2"><c r="A2" s="1"><v>45943</v></c><c r="B2" s="2"><v>45943.5</v></c></row></sheetData></worksheet>"#,
+            ),
+        ];
+        for (name, data) in entries {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+    #[test]
+    fn spreadsheet_and_text_dates_convert_to_iso_dates() {
+        let table = parse_file("dates.xlsx", &dated_workbook(), "").unwrap();
+        assert_eq!(table.rows[0], vec!["2025-10-13", "2025-10-13T12:00:00"]);
+        assert_eq!(
+            convert(FieldType::Date, &table.rows[0][0]).unwrap(),
+            "2025-10-13"
+        );
+        assert!(convert(FieldType::Date, &table.rows[0][1]).is_err());
+        assert_eq!(
+            convert(FieldType::Date, " 2024-02-29T00:00:00 ").unwrap(),
+            "2024-02-29"
+        );
+        for bad in [
+            "2023-02-29",
+            "13/10/2025",
+            "2025-1-5",
+            "45943",
+            "2025-10-13Z",
+            "",
+        ] {
+            assert!(convert(FieldType::Date, bad).is_err(), "{bad}");
+        }
     }
     #[test]
     fn rejects_sparse_workbooks_and_invalid_csv() {

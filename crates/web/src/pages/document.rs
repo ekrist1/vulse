@@ -5,6 +5,7 @@ use yew_router::prelude::*;
 
 use crate::api;
 use crate::app::{Route, SessionCtx, Shell, signed_out};
+use crate::confirm::{ConfirmRequest, use_confirm};
 use crate::form::{DocumentForm, ValueInput, body_from_inputs, inputs_from_body};
 
 #[derive(Properties, PartialEq)]
@@ -15,6 +16,7 @@ pub struct DocumentPageProps {
 
 #[function_component(DocumentPage)]
 pub fn document_page(props: &DocumentPageProps) -> Html {
+    let confirm = use_confirm();
     let session = use_context::<SessionCtx>().expect("session");
     let collection = use_state(|| None::<CollectionView>);
     let collections = use_state(Vec::<CollectionView>::new);
@@ -150,12 +152,29 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
         let pending = pending.clone();
         let key = draft_key.clone();
         let storage_error = storage_error.clone();
-        move |_| match crate::drafts::clear(&key) {
-            Ok(()) => {
-                pending.set(None);
-                storage_error.set(String::new());
-            }
-            Err(e) => storage_error.set(e),
+        let confirm = confirm.clone();
+        move |_| {
+            let pending = pending.clone();
+            let key = key.clone();
+            let storage_error = storage_error.clone();
+            let confirm = confirm.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let request = ConfirmRequest::danger(
+                    "Discard this draft?",
+                    "The unsaved changes stored on this device are deleted. The saved record is not affected.",
+                    "Discard draft",
+                );
+                if !confirm.ask(request).await {
+                    return;
+                }
+                match crate::drafts::clear(&key) {
+                    Ok(()) => {
+                        pending.set(None);
+                        storage_error.set(String::new());
+                    }
+                    Err(e) => storage_error.set(e),
+                }
+            });
         }
     });
     let recover = Callback::from({
@@ -197,34 +216,44 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
         let inputs = inputs.clone();
         let collection = collection.clone();
         let error = error.clone();
+        let confirm = confirm.clone();
         move |_| {
             let (Some(draft), Some(collection)) = ((*pending).clone(), (*collection).clone())
             else {
                 return;
             };
-            if !crate::app::confirm(
-                "Apply your changed draft fields to the latest record? Where both changed the same field, your draft value will win.",
-            ) {
-                return;
-            }
-            let mut next = (*inputs).clone();
-            for (index, field) in collection.blueprint.fields.iter().enumerate() {
-                if let Some(old) = draft.blueprint.fields.iter().position(|f| {
-                    f.name == field.name
-                        && f.kind == field.kind
-                        && f.items == field.items
-                        && f.collection == field.collection
-                }) {
-                    if draft.inputs.get(old) != draft.baseline.get(old) {
-                        if let Some(value) = draft.inputs.get(old) {
-                            next[index] = value.clone();
+            let pending = pending.clone();
+            let inputs = inputs.clone();
+            let error = error.clone();
+            let confirm = confirm.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let request = ConfirmRequest::new(
+                    "Merge your draft?",
+                    "Your changed draft fields are applied to the latest record. Where both changed the same field, your draft value wins. Review, then save.",
+                    "Merge draft",
+                );
+                if !confirm.ask(request).await {
+                    return;
+                }
+                let mut next = (*inputs).clone();
+                for (index, field) in collection.blueprint.fields.iter().enumerate() {
+                    if let Some(old) = draft.blueprint.fields.iter().position(|f| {
+                        f.name == field.name
+                            && f.kind == field.kind
+                            && f.items == field.items
+                            && f.collection == field.collection
+                    }) {
+                        if draft.inputs.get(old) != draft.baseline.get(old) {
+                            if let Some(value) = draft.inputs.get(old) {
+                                next[index] = value.clone();
+                            }
                         }
                     }
                 }
-            }
-            inputs.set(next);
-            pending.set(None);
-            error.set(String::new());
+                inputs.set(next);
+                pending.set(None);
+                error.set(String::new());
+            });
         }
     });
     let navigator = use_navigator();
@@ -318,17 +347,22 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
         let doc_id = props.doc_id.clone();
         let error = error.clone();
         let navigator = navigator.clone();
+        let confirm = confirm.clone();
         Callback::from(move |_| {
-            if !crate::app::confirm(
-                "Delete this record? You can restore it from the collection’s Trash.",
-            ) {
-                return;
-            }
             let id = id.clone();
             let doc_id = doc_id.clone();
             let error = error.clone();
             let navigator = navigator.clone();
+            let confirm = confirm.clone();
             wasm_bindgen_futures::spawn_local(async move {
+                let request = ConfirmRequest::danger(
+                    "Delete this record?",
+                    "You can restore it later from the collection’s Trash.",
+                    "Delete record",
+                );
+                if !confirm.ask(request).await {
+                    return;
+                }
                 match api::delete_document(&id, &doc_id).await {
                     Ok(()) => {
                         if let Some(navigator) = navigator {

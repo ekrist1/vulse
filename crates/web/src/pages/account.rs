@@ -4,10 +4,12 @@ use yew_router::prelude::*;
 
 use crate::api;
 use crate::app::{Route, SessionCtx, SessionState, Shell, signed_out};
+use crate::confirm::{ConfirmRequest, use_confirm};
 use crate::pages::auth::{error_line, text_input};
 
 #[function_component(AccountPage)]
 pub fn account_page() -> Html {
+    let confirm = use_confirm();
     let session = use_context::<SessionCtx>().expect("session");
     let navigator = use_navigator().unwrap();
     let current = use_state(String::new);
@@ -54,13 +56,19 @@ pub fn account_page() -> Html {
         let session = session.clone();
         let error = error.clone();
         Callback::from(move |_| {
-            if !crate::app::confirm("Sign out of every browser and device, including this one?") {
-                return;
-            }
             let session = session.clone();
             let error = error.clone();
             let navigator = navigator.clone();
+            let confirm = confirm.clone();
             wasm_bindgen_futures::spawn_local(async move {
+                let request = ConfirmRequest::danger(
+                    "Sign out everywhere?",
+                    "Every browser and device signed in to this account is signed out, including this one. API keys keep working.",
+                    "Sign out everywhere",
+                );
+                if !confirm.ask(request).await {
+                    return;
+                }
                 match api::logout_everywhere().await {
                     Ok(()) => {
                         session.set.emit(SessionState {

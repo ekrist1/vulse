@@ -2,6 +2,7 @@ use crate::{
     api,
     app::{Route, SessionCtx, Shell, signed_out},
     collection_api::CollectionApi,
+    confirm::{ConfirmRequest, use_confirm},
     formula_builder::FormulaEditor,
     import::ImportPanel,
 };
@@ -21,6 +22,9 @@ pub struct CollectionPageProps {
 #[function_component(CollectionPage)]
 pub fn collection_page(props: &CollectionPageProps) -> Html {
     let session = use_context::<SessionCtx>().expect("session");
+    let confirm = use_confirm();
+    // Saved fields whose removal was confirmed with the Remove button.
+    let confirmed_removals = use_state(Vec::<String>::new);
     let collection = use_state(|| None::<CollectionView>);
     let collections = use_state(Vec::<CollectionView>::new);
     let documents = use_state(Vec::<DocumentView>::new);
@@ -173,23 +177,49 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let pending = pending.clone();
         let key = draft_key.clone();
         let draft_error = draft_error.clone();
-        move |_| match crate::drafts::clear(&key) {
-            Ok(()) => {
-                pending.set(None);
-                draft_error.set(String::new());
-            }
-            Err(e) => draft_error.set(e),
+        let confirm = confirm.clone();
+        move |_| {
+            let pending = pending.clone();
+            let key = key.clone();
+            let draft_error = draft_error.clone();
+            let confirm = confirm.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let request = ConfirmRequest::danger(
+                    "Discard this collection draft?",
+                    "The unsaved field and setting changes stored on this device are deleted. The saved collection is not affected.",
+                    "Discard draft",
+                );
+                if !confirm.ask(request).await {
+                    return;
+                }
+                match crate::drafts::clear(&key) {
+                    Ok(()) => {
+                        pending.set(None);
+                        draft_error.set(String::new());
+                    }
+                    Err(e) => draft_error.set(e),
+                }
+            });
         }
     });
     let use_latest_version = Callback::from({
         let collection = collection.clone();
         let draft_version = draft_version.clone();
+        let confirm = confirm.clone();
         move |_| {
-            if crate::app::confirm(
-                "Save these draft fields against the latest collection? Review all fields first; existing records will be validated before any change.",
-            ) {
-                draft_version.set(collection.as_ref().map(|c| c.updated_at.clone()));
-            }
+            let collection = collection.clone();
+            let draft_version = draft_version.clone();
+            let confirm = confirm.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let request = ConfirmRequest::new(
+                    "Use the latest collection version?",
+                    "Your draft fields will be saved against the latest collection. Review all fields first; existing records are validated before any change.",
+                    "Use latest version",
+                );
+                if confirm.ask(request).await {
+                    draft_version.set(collection.as_ref().map(|c| c.updated_at.clone()));
+                }
+            });
         }
     });
     let on_save = {
@@ -208,10 +238,35 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let key = draft_key.clone();
         let latest = latest.clone();
         let draft_error = draft_error.clone();
+        let confirm = confirm.clone();
+        let confirmed_removals = confirmed_removals.clone();
         Callback::from(move |_| {
             if *busy {
                 return;
             }
+            // Saved fields missing from the draft lose their stored values.
+            let removed: Vec<String> = collection
+                .as_ref()
+                .map(|c| {
+                    c.blueprint
+                        .fields
+                        .iter()
+                        .filter(|f| f.kind != FieldType::Calculated)
+                        .filter(|f| !fields.iter().any(|next| next.name == f.name))
+                        .filter(|f| {
+                            !fields
+                                .iter()
+                                .any(|next| next.renamed_from.as_deref() == Some(f.name.as_str()))
+                        })
+                        .map(|f| f.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let unconfirmed: Vec<String> = removed
+                .iter()
+                .filter(|name| !confirmed_removals.contains(name))
+                .cloned()
+                .collect();
             busy.set(true);
             status.set(String::new());
             error.set(String::new());
@@ -227,6 +282,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                     },
                     fields: (*fields).clone(),
                 }),
+                remove_field_data: !removed.is_empty(),
             };
             let name = name.clone();
             let fields = fields.clone();
@@ -250,9 +306,27 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             let status = status.clone();
             let busy = busy.clone();
             let documents = documents.clone();
+            let confirm = confirm.clone();
+            let confirmed_removals = confirmed_removals.clone();
             wasm_bindgen_futures::spawn_local(async move {
+                // Renamed fields count as removed: their values do not move.
+                if !unconfirmed.is_empty() {
+                    let request = ConfirmRequest::danger(
+                        "Delete data in removed fields?",
+                        format!(
+                            "These saved fields are no longer in the collection: {}. Saving deletes their values from every record. Each record's previous version stays in its history.",
+                            unconfirmed.join(", ")
+                        ),
+                        "Delete field data and save",
+                    );
+                    if !confirm.ask(request).await {
+                        busy.set(false);
+                        return;
+                    }
+                }
                 match api::update_collection(&id, &body).await {
                     Ok(item) => {
+                        confirmed_removals.set(Vec::new());
                         draft_version.set(Some(item.updated_at.clone()));
                         if *latest.borrow() == submitted {
                             name.set(item.name.clone());
@@ -284,20 +358,30 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let id = props.id.clone();
         let error = error.clone();
         let busy = busy.clone();
+        let confirm = confirm.clone();
+        let collection_name = collection
+            .as_ref()
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
         Callback::from(move |_| {
-            if *busy
-                || !crate::app::confirm(
-                    "Delete this collection and all its documents and files? This cannot be undone.",
-                )
-            {
+            if *busy {
                 return;
             }
-            busy.set(true);
             let id = id.clone();
             let error = error.clone();
             let navigator = navigator.clone();
             let busy = busy.clone();
+            let confirm = confirm.clone();
+            let request = ConfirmRequest::danger(
+                format!("Delete the collection “{collection_name}”?"),
+                "All its records, fields, saved views and attached files are permanently deleted. This cannot be undone.",
+                "Delete collection",
+            );
             wasm_bindgen_futures::spawn_local(async move {
+                if !confirm.ask(request).await {
+                    return;
+                }
+                busy.set(true);
                 match api::delete_collection(&id).await {
                     Ok(()) => {
                         if let Some(n) = navigator {
@@ -334,7 +418,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 if *tab=="data" {<crate::records::RecordsPanel key={item.id.clone()} collection={item.clone()} collections={(*collections).clone()}/>}
                 if *tab=="fields" {<fieldset class="draft-fields" disabled={*busy||pending.is_some()}>
                     <div class="section-heading"><div><h2>{"Shape your collection"}</h2><p class="muted">{"Choose the fields each record contains. Calculated fields update automatically."}</p></div><button disabled={*busy} onclick={on_save.clone()}>{if *busy{"Saving…"}else{"Save fields"}}</button></div>
-                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
+                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
                 </fieldset>}
                 if *tab=="import" {<ImportPanel key={props.id.clone()} collection={item.clone()} on_import={Callback::from({let refresh=refresh.clone();move |_|refresh.set(*refresh+1)})}/>}
                 if *tab=="api" {<CollectionApi collection={item.clone()}/>}
@@ -353,6 +437,12 @@ struct BlueprintEditorProps {
     fields: Vec<FieldDef>,
     collections: Vec<CollectionView>,
     current: String,
+    /// Field names in the saved collection.
+    saved_fields: Vec<String>,
+    /// A saved field was removed after confirmation.
+    on_removed: Callback<String>,
+    /// A field name was committed: (previous name, new name).
+    on_renamed: Callback<(String, String)>,
     on_change: Callback<Vec<FieldDef>>,
 }
 
@@ -377,6 +467,7 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                 collection: None,
                 items: None,
                 formula: None,
+                renamed_from: None,
             });
             on_change.emit(next);
         })
@@ -398,6 +489,14 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                         collections={props.collections.clone()}
                         current={props.current.clone()}
                         fields={props.fields.clone()}
+                        origin={field.renamed_from.clone().or_else(|| {
+                            // A saved name claimed by a renamed row belongs to that row.
+                            (props.saved_fields.contains(&field.name)
+                                && !props.fields.iter().any(|f| f.renamed_from.as_deref() == Some(field.name.as_str())))
+                            .then(|| field.name.clone())
+                        })}
+                        on_removed={props.on_removed.clone()}
+                        on_renamed={props.on_renamed.clone()}
                         on_change={props.on_change.clone()}
                     />
                 }
@@ -416,11 +515,16 @@ struct FieldRowProps {
     collections: Vec<CollectionView>,
     current: String,
     fields: Vec<FieldDef>,
+    /// The saved field this row edits, under its saved name, if any.
+    origin: Option<String>,
+    on_removed: Callback<String>,
+    on_renamed: Callback<(String, String)>,
     on_change: Callback<Vec<FieldDef>>,
 }
 
 #[function_component(FieldRow)]
 fn field_row(props: &FieldRowProps) -> Html {
+    let confirm = use_confirm();
     let patch = {
         let fields = props.fields.clone();
         let index = props.index;
@@ -450,28 +554,116 @@ fn field_row(props: &FieldRowProps) -> Html {
         let fields = props.fields.clone();
         let index = props.index;
         let on_change = props.on_change.clone();
+        let on_removed = props.on_removed.clone();
+        // Calculated fields store nothing, so only stored saved fields ask.
+        let saved = props
+            .origin
+            .clone()
+            .filter(|_| props.field.kind != FieldType::Calculated);
+        let label = props.field.display_label().to_string();
+        let has_values = saved.as_ref().is_some_and(|origin| {
+            props
+                .records
+                .iter()
+                .any(|r| r.body.get(origin).is_some_and(|v| !v.is_null()))
+        });
         Callback::from(move |_| {
             let mut fields = fields.clone();
-            if index < fields.len() {
-                fields.remove(index);
-                on_change.emit(fields);
+            if index >= fields.len() {
+                return;
             }
+            fields.remove(index);
+            // A field that was never saved holds no data.
+            let Some(name) = saved.clone() else {
+                on_change.emit(fields);
+                return;
+            };
+            let (confirm, on_change, on_removed) =
+                (confirm.clone(), on_change.clone(), on_removed.clone());
+            let message = format!(
+                "“{label}” is removed from the form now. When you save the fields, {} Each record's previous version stays in its history.",
+                if has_values {
+                    "its values are deleted from every record that has one."
+                } else {
+                    "any values stored in it are deleted from every record."
+                }
+            );
+            let request = ConfirmRequest::danger(
+                format!("Remove the field “{label}”?"),
+                message,
+                "Remove field",
+            );
+            wasm_bindgen_futures::spawn_local(async move {
+                if confirm.ask(request).await {
+                    on_change.emit(fields);
+                    on_removed.emit(name);
+                }
+            });
+        })
+    };
+    // Formulas follow a committed name change. Done on commit, not per
+    // keystroke, so intermediate names never capture other fields' references.
+    let focused_name = use_mut_ref(|| None::<String>);
+    let commit_name = {
+        let fields = props.fields.clone();
+        let index = props.index;
+        let on_change = props.on_change.clone();
+        let on_renamed = props.on_renamed.clone();
+        let focused = focused_name.clone();
+        Callback::from(move |_: Event| {
+            let Some(old) = focused.borrow_mut().take() else {
+                return;
+            };
+            let Some(new) = fields.get(index).map(|f| f.name.clone()) else {
+                return;
+            };
+            *focused.borrow_mut() = Some(new.clone());
+            let others = |name: &str| {
+                fields
+                    .iter()
+                    .enumerate()
+                    .any(|(i, f)| i != index && f.name == name)
+            };
+            if old == new || new.is_empty() || others(&old) || others(&new) {
+                return;
+            }
+            let renames = std::collections::BTreeMap::from([(old.clone(), new.clone())]);
+            let mut next = fields.clone();
+            for field in &mut next {
+                if let Some(formula) = &field.formula {
+                    field.formula = Some(vulse_model::rename_formula_fields(formula, &renames));
+                }
+            }
+            if next != fields {
+                on_change.emit(next);
+            }
+            on_renamed.emit((old, new));
         })
     };
     let field = props.field.clone();
     html! {
         <div class="field-row">
             <label>{"Name"}
-                <input value={field.name.clone()} oninput={Callback::from({
+                <input aria-label="Name" value={field.name.clone()} onfocus={Callback::from({
+                    let focused = focused_name.clone();
+                    let name = field.name.clone();
+                    move |_| *focused.borrow_mut() = Some(name.clone())
+                })} oninput={Callback::from({
                     let patch = patch.clone();
                     let field = field.clone();
+                    let origin = props.origin.clone();
                     move |event: InputEvent| {
                         let element: HtmlInputElement = event.target_unchecked_into();
                         let mut next = field.clone();
                         next.name = element.value().to_ascii_lowercase();
+                        // Renaming a saved field moves its data on save.
+                        next.renamed_from = origin.clone().filter(|o| *o != next.name);
                         patch.emit(next);
                     }
-                })} />
+                })} onchange={commit_name} />
+                if let Some(from) = &field.renamed_from {
+                    <span class="field-help">{format!("Renamed from “{from}”. Values, formulas and saved views follow the new name when you save.")}</span>
+                }
             </label>
             <label>{"Type"}
                 <select aria-label="Type" onchange={Callback::from({
@@ -587,6 +779,7 @@ fn field_types() -> Vec<(&'static str, &'static str)> {
         ("string", "Text"),
         ("number", "Number"),
         ("boolean", "Boolean"),
+        ("date", "Date"),
         ("json", "JSON"),
         ("portable_text", "Portable Text"),
         ("asset", "Asset"),
@@ -601,6 +794,7 @@ fn type_value(kind: FieldType) -> &'static str {
         FieldType::String => "string",
         FieldType::Number => "number",
         FieldType::Boolean => "boolean",
+        FieldType::Date => "date",
         FieldType::Json => "json",
         FieldType::PortableText => "portable_text",
         FieldType::Asset => "asset",
@@ -614,6 +808,7 @@ fn parse_type(value: &str) -> FieldType {
         "calculated" => FieldType::Calculated,
         "number" => FieldType::Number,
         "boolean" => FieldType::Boolean,
+        "date" => FieldType::Date,
         "json" => FieldType::Json,
         "portable_text" => FieldType::PortableText,
         "asset" => FieldType::Asset,

@@ -4,9 +4,11 @@ use yew::prelude::*;
 
 use crate::api;
 use crate::app::{SessionCtx, Shell, signed_out};
+use crate::confirm::{ConfirmRequest, use_confirm};
 
 #[function_component(KeysPage)]
 pub fn keys_page() -> Html {
+    let confirm = use_confirm();
     let session = use_context::<SessionCtx>().expect("session");
     let keys = use_state(Vec::<ApiKeyView>::new);
     let collections = use_state(Vec::<CollectionView>::new);
@@ -140,11 +142,22 @@ pub fn keys_page() -> Html {
                     let id = key.id.clone();
                     let keys = keys.clone();
                     let error = error.clone();
+                    let confirm = confirm.clone();
+                    let name = key.name.clone();
                     let on_delete = Callback::from(move |_| {
                         let id = id.clone();
                         let keys = keys.clone();
                         let error = error.clone();
+                        let confirm = confirm.clone();
+                        let request = ConfirmRequest::danger(
+                            format!("Revoke the key “{name}”?"),
+                            "Anything using this key stops working immediately. A revoked key cannot be restored; you would need to create a new one.",
+                            "Revoke key",
+                        );
                         wasm_bindgen_futures::spawn_local(async move {
+                            if !confirm.ask(request).await {
+                                return;
+                            }
                             match api::delete_key(&id).await {
                                 Ok(()) => keys.set((*keys).iter().filter(|key| key.id != id).cloned().collect()),
                                 Err(err) => error.set(err),

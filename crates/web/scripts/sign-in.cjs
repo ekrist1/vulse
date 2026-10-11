@@ -25,4 +25,12 @@ async function signInFreshAdmin(page, base, prefix) {
   return { handle, run };
 }
 
-module.exports = { signInFreshAdmin };
+// Accepts the in-app confirmation modal, optionally checking its button label.
+async function confirmModal(page, label) {
+  const dialog = page.getByRole("dialog");
+  const accept = label ? dialog.getByRole("button", { name: label, exact: true }) : dialog.locator(".confirm-accept");
+  await accept.click();
+  await dialog.waitFor({ state: "detached" });
+}
+
+module.exports = { signInFreshAdmin, confirmModal };

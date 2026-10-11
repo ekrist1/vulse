@@ -5,11 +5,13 @@ use web_sys::HtmlSelectElement;
 use yew::prelude::*;
 
 use crate::api;
-use crate::app::{SessionCtx, Shell, confirm, signed_out};
+use crate::app::{SessionCtx, Shell, signed_out};
+use crate::confirm::{ConfirmRequest, use_confirm};
 
 /// Admin-only: workspace members, roles, invites and reset links.
 #[function_component(PeoplePage)]
 pub fn people_page() -> Html {
+    let confirm = use_confirm();
     let session = use_context::<SessionCtx>().expect("session");
     let users = use_state(Vec::<ManagedUser>::new);
     let invites = use_state(Vec::<InviteView>::new);
@@ -194,10 +196,24 @@ pub fn people_page() -> Html {
                                 let update = update.clone();
                                 let id = id.clone();
                                 let email = user.email.clone();
+                                let confirm = confirm.clone();
                                 Callback::from(move |_| {
-                                    if disabled || confirm(&format!("Disable {email}? Their sessions end and their API keys stop working.")) {
-                                        update.emit((id.clone(), UpdateUser { role: None, disabled: Some(!disabled) }));
+                                    let change = (id.clone(), UpdateUser { role: None, disabled: Some(!disabled) });
+                                    if disabled {
+                                        update.emit(change);
+                                        return;
                                     }
+                                    let (update, confirm) = (update.clone(), confirm.clone());
+                                    let request = ConfirmRequest::danger(
+                                        format!("Disable {email}?"),
+                                        "Their sessions end and their API keys stop working at once. You can enable the account again later.",
+                                        "Disable account",
+                                    );
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        if confirm.ask(request).await {
+                                            update.emit(change);
+                                        }
+                                    });
                                 })
                             };
                             let on_reset = {
@@ -235,11 +251,22 @@ pub fn people_page() -> Html {
                             let id = invite.id.clone();
                             let error = error.clone();
                             let reload = reload.clone();
+                            let confirm = confirm.clone();
+                            let email = invite.email.clone();
                             let on_revoke = Callback::from(move |_| {
                                 let id = id.clone();
                                 let error = error.clone();
                                 let reload = reload.clone();
+                                let confirm = confirm.clone();
+                                let request = ConfirmRequest::danger(
+                                    format!("Revoke the link for {email}?"),
+                                    "The link stops working immediately. You can create a new one later.",
+                                    "Revoke link",
+                                );
                                 wasm_bindgen_futures::spawn_local(async move {
+                                    if !confirm.ask(request).await {
+                                        return;
+                                    }
                                     if let Err(err) = api::delete_invite(&id).await {
                                         error.set(err);
                                     }

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::identity::{check_collection_name, is_field_name, is_uuid};
+use crate::identity::{check_collection_name, is_date, is_field_name, is_uuid};
 use crate::portable_text::validate_portable_text;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,6 +34,11 @@ pub struct FieldDef {
     pub collection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<ArrayItems>,
+    /// Only in schema updates: the saved field this one renames. Its values,
+    /// formula references, title setting and saved views move to `name`.
+    /// Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +48,8 @@ pub enum FieldType {
     String,
     Number,
     Boolean,
+    /// A calendar date stored as `YYYY-MM-DD`, without time or time zone.
+    Date,
     Json,
     PortableText,
     Asset,
@@ -146,15 +153,67 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
                     FieldType::String
                         | FieldType::Number
                         | FieldType::Boolean
+                        | FieldType::Date
                         | FieldType::Calculated
                 )
         }) {
             return Err(
-                "record title must select a text, number, boolean or calculated field".into(),
+                "record title must select a text, number, boolean, date or calculated field".into(),
             );
         }
     }
     crate::validate_formulas(blueprint)
+}
+
+/// Takes the `renamed_from` markers out of an updated blueprint and returns
+/// the renames as old name → new name. Formula references and the title field
+/// in `blueprint` follow the renames.
+///
+/// A rename must come from a field in `saved` whose name the updated blueprint
+/// no longer uses, and each saved field can be renamed only once.
+pub fn take_field_renames(
+    blueprint: &mut Blueprint,
+    saved: &Blueprint,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut renames = std::collections::BTreeMap::new();
+    let names: HashSet<String> = blueprint.fields.iter().map(|f| f.name.clone()).collect();
+    for field in &mut blueprint.fields {
+        let Some(old) = field.renamed_from.take() else {
+            continue;
+        };
+        if old == field.name {
+            continue;
+        }
+        if !saved.fields.iter().any(|f| f.name == old) {
+            return Err(format!(
+                "field '{}' is renamed from '{old}', which is not a saved field",
+                field.name
+            ));
+        }
+        if names.contains(&old) {
+            return Err(format!(
+                "field '{old}' cannot be renamed to '{}' while a field named '{old}' remains",
+                field.name
+            ));
+        }
+        if renames.insert(old.clone(), field.name.clone()).is_some() {
+            return Err(format!("field '{old}' is renamed more than once"));
+        }
+    }
+    if renames.is_empty() {
+        return Ok(renames);
+    }
+    for field in &mut blueprint.fields {
+        if let Some(formula) = &field.formula {
+            field.formula = Some(crate::rename_formula_fields(formula, &renames));
+        }
+    }
+    if let Some(title) = &blueprint.title_field {
+        if let Some(next) = renames.get(title) {
+            blueprint.title_field = Some(next.clone());
+        }
+    }
+    Ok(renames)
 }
 
 impl FieldDef {
@@ -264,6 +323,13 @@ fn validate_field(
                 Err(format!("{} must be a boolean", field.name))
             }
         }
+        FieldType::Date => {
+            if value.as_str().is_some_and(is_date) {
+                Ok(())
+            } else {
+                Err(format!("{} must be a date as YYYY-MM-DD", field.name))
+            }
+        }
         FieldType::Json => Ok(()),
         FieldType::PortableText => {
             let assets =
@@ -354,6 +420,62 @@ fn expect_id_at(name: &str, index: usize, value: &Value) -> Result<String, Strin
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn renames_move_formula_references_and_titles() {
+        let renames = std::collections::BTreeMap::from([
+            ("price".to_string(), "unit_price".to_string()),
+            ("qty".to_string(), "price".to_string()),
+        ]);
+        assert_eq!(
+            crate::rename_formula_fields(r#"=[price]*[qty]&"[price]""ok"&[other]"#, &renames),
+            r#"=[unit_price]*[price]&"[price]""ok"&[other]"#
+        );
+        assert_eq!(
+            crate::rename_formula_fields("=[price", &renames),
+            "=[unit_price"
+        );
+
+        let saved: Blueprint = serde_json::from_value(serde_json::json!({
+            "title_field": "price",
+            "fields": [
+                {"name": "price", "type": "number"},
+                {"name": "name", "type": "string"},
+                {"name": "double", "type": "calculated", "formula": "=[price]*2"}
+            ]
+        }))
+        .unwrap();
+        let mut next = saved.clone();
+        next.fields[0].name = "unit_price".into();
+        next.fields[0].renamed_from = Some("price".into());
+        let renames = take_field_renames(&mut next, &saved).unwrap();
+        assert_eq!(renames.get("price").map(String::as_str), Some("unit_price"));
+        assert!(next.fields.iter().all(|f| f.renamed_from.is_none()));
+        assert_eq!(next.fields[2].formula.as_deref(), Some("=[unit_price]*2"));
+        assert_eq!(next.title_field.as_deref(), Some("unit_price"));
+        assert!(validate_blueprint(&next).is_ok());
+
+        // Renaming back to the saved name is not a rename.
+        let mut same = saved.clone();
+        same.fields[0].renamed_from = Some("price".into());
+        assert!(take_field_renames(&mut same, &saved).unwrap().is_empty());
+
+        for (from, keep_old) in [("missing", false), ("price", true)] {
+            let mut bad = saved.clone();
+            bad.fields[1].name = "label".into();
+            bad.fields[1].renamed_from = Some(from.into());
+            if !keep_old {
+                bad.fields[0].name = "price".into();
+            }
+            assert!(take_field_renames(&mut bad, &saved).is_err(), "{from}");
+        }
+        let mut twice = saved.clone();
+        twice.fields[0].name = "a".into();
+        twice.fields[0].renamed_from = Some("price".into());
+        twice.fields[1].name = "b".into();
+        twice.fields[1].renamed_from = Some("price".into());
+        assert!(take_field_renames(&mut twice, &saved).is_err());
+    }
     use super::*;
     use serde_json::json;
 
@@ -400,6 +522,7 @@ mod tests {
             kind: FieldType::String,
             collection: None,
             items: None,
+            renamed_from: None,
         }
     }
 
@@ -449,6 +572,7 @@ mod tests {
                     kind: FieldType::Asset,
                     collection: None,
                     items: None,
+                    renamed_from: None,
                 },
                 FieldDef {
                     label: None,
@@ -460,6 +584,7 @@ mod tests {
                     kind: FieldType::Reference,
                     collection: Some("authors".into()),
                     items: None,
+                    renamed_from: None,
                 },
             ],
         };

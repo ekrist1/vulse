@@ -625,6 +625,18 @@ pub async fn update_document(
     body: &serde_json::Value,
     updated_at: &str,
 ) -> anyhow::Result<()> {
+    update_document_as(conn, collection_id, id, body, updated_at, "update").await
+}
+
+/// Like `update_document`, recording `action` in the record's history.
+pub async fn update_document_as(
+    conn: &Conn,
+    collection_id: &str,
+    id: &str,
+    body: &serde_json::Value,
+    updated_at: &str,
+    action: &str,
+) -> anyhow::Result<()> {
     let previous = find_document(conn, collection_id, id).await?;
     conn.execute(
         "UPDATE documents SET body = ?1, updated_at = ?2 WHERE id = ?3 AND collection_id = ?4",
@@ -638,7 +650,7 @@ pub async fn update_document(
     .await?;
     crate::records::sync_stored_document(conn, collection_id, id, body).await?;
     if previous.as_ref().is_some_and(|old| old.body != *body) {
-        crate::history::snapshot(conn, collection_id, id, "update").await?;
+        crate::history::snapshot(conn, collection_id, id, action).await?;
     }
     Ok(())
 }

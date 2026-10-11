@@ -2,8 +2,10 @@ use gloo_net::http::{Request, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vulse_model::{
-    ApiKeyView, AssetView, CollectionView, CreateApiKey, CreateCollection, CreatedApiKey,
-    DocumentView, DocumentWrite, LoginRequest, Page, RegisterRequest, UpdateCollection, UserView,
+    AcceptLink, ApiKeyView, AssetView, ChangePassword, CollectionView, CreateApiKey,
+    CreateCollection, CreateInvite, CreatedApiKey, CreatedInvite, DocumentView, DocumentWrite,
+    InviteView, LinkInfo, LinkTokenRequest, LoginRequest, ManagedUser, Page, SetupRequest,
+    SetupStatus, UpdateCollection, UpdateUser, UserView,
 };
 use web_sys::{File, FormData, RequestCredentials};
 
@@ -11,8 +13,62 @@ pub async fn me() -> Result<UserView, String> {
     get_json("/api/v1/me").await
 }
 
-pub async fn register(body: &RegisterRequest) -> Result<UserView, String> {
-    send_json(Request::post("/api/v1/auth/register"), body).await
+pub async fn setup_status() -> Result<SetupStatus, String> {
+    get_json("/api/v1/auth/setup").await
+}
+
+pub async fn setup(body: &SetupRequest) -> Result<UserView, String> {
+    send_json(Request::post("/api/v1/auth/setup"), body).await
+}
+
+pub async fn inspect_link(token: &str) -> Result<LinkInfo, String> {
+    send_json(
+        Request::post("/api/v1/auth/links/inspect"),
+        &LinkTokenRequest {
+            token: token.to_string(),
+        },
+    )
+    .await
+}
+
+pub async fn accept_link(body: &AcceptLink) -> Result<UserView, String> {
+    send_json(Request::post("/api/v1/auth/links/accept"), body).await
+}
+
+pub async fn change_password(body: &ChangePassword) -> Result<(), String> {
+    send_empty(Request::post("/api/v1/auth/password"), Some(body)).await
+}
+
+pub async fn logout_everywhere() -> Result<(), String> {
+    send_empty::<()>(Request::post("/api/v1/auth/logout-everywhere"), None).await
+}
+
+pub async fn users() -> Result<Vec<ManagedUser>, String> {
+    get_json("/api/v1/users").await
+}
+
+pub async fn update_user(id: &str, body: &UpdateUser) -> Result<ManagedUser, String> {
+    send_json(Request::patch(&format!("/api/v1/users/{id}")), body).await
+}
+
+pub async fn reset_password(id: &str) -> Result<CreatedInvite, String> {
+    send_json(
+        Request::post(&format!("/api/v1/users/{id}/password-reset")),
+        &serde_json::json!({}),
+    )
+    .await
+}
+
+pub async fn invites() -> Result<Vec<InviteView>, String> {
+    get_json("/api/v1/invites").await
+}
+
+pub async fn create_invite(body: &CreateInvite) -> Result<CreatedInvite, String> {
+    send_json(Request::post("/api/v1/invites"), body).await
+}
+
+pub async fn delete_invite(id: &str) -> Result<(), String> {
+    delete(&format!("/api/v1/invites/{id}")).await
 }
 
 pub async fn login(body: &LoginRequest) -> Result<UserView, String> {
@@ -20,10 +76,26 @@ pub async fn login(body: &LoginRequest) -> Result<UserView, String> {
 }
 
 pub async fn logout() -> Result<(), String> {
-    let response = with_credentials(Request::post("/api/v1/auth/logout"))
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+    send_empty::<()>(Request::post("/api/v1/auth/logout"), None).await
+}
+
+/// Sends a request whose successful response has no body.
+async fn send_empty<T: Serialize>(
+    builder: gloo_net::http::RequestBuilder,
+    body: Option<&T>,
+) -> Result<(), String> {
+    let builder = with_credentials(builder);
+    let response = match body {
+        Some(body) => {
+            builder
+                .json(body)
+                .map_err(|err| err.to_string())?
+                .send()
+                .await
+        }
+        None => builder.send().await,
+    }
+    .map_err(|err| err.to_string())?;
     if response.ok() {
         Ok(())
     } else {

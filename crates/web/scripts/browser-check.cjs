@@ -1,5 +1,6 @@
 const { chromium } = require("playwright-core");
 const assert = require("node:assert/strict");
+const { signInFreshAdmin } = require("./sign-in.cjs");
 (async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1e3 } });
@@ -7,13 +8,8 @@ const assert = require("node:assert/strict");
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   try {
-    await page.goto(base + "/register");
-    await page.getByLabel("Email").fill("editor" + Date.now() + "@example.com");
-    await page.getByLabel("Handle").fill("editor" + Date.now());
-    await page.getByLabel("Password").fill("test-password");
-    await page.getByRole("button", { name: "Create account", exact: true }).click();
-    await page.getByRole("heading", { name: "A home for your data." }).waitFor();
-    const created = await page.request.post(base + "/api/v1/collections", { data: { name: "articles", visibility: "private", blueprint: { fields: [{ name: "title", type: "string" }, { name: "content", type: "portable_text" }, { name: "price", type: "number" }, { name: "total", type: "calculated", formula: "=[price]*2" }] } } });
+    const { run } = await signInFreshAdmin(page, base, "editor");
+    const created = await page.request.post(base + "/api/v1/collections", { data: { name: "articles-" + run, visibility: "private", blueprint: { fields: [{ name: "title", type: "string" }, { name: "content", type: "portable_text" }, { name: "price", type: "number" }, { name: "total", type: "calculated", formula: "=[price]*2" }] } } });
     assert.equal(created.status(), 201);
     const collection = await created.json();
     const id = collection.id;

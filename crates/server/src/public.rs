@@ -13,20 +13,17 @@ use crate::store;
 
 #[derive(Debug, Deserialize)]
 pub struct PublicCollectionPath {
-    pub handle: String,
     pub collection: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PublicDocumentPath {
-    pub handle: String,
     pub collection: String,
     pub doc_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PublicAssetPath {
-    pub handle: String,
     pub collection: String,
     pub asset_id: String,
 }
@@ -76,7 +73,7 @@ async fn list_documents_inner(
 ) -> Result<Json<Page<DocumentView>>, AppError> {
     let (limit, offset) = page_query(&query)?;
     let conn = state.db.connect().await?;
-    let collection = public_collection(&conn, &path.handle, &path.collection).await?;
+    let collection = public_collection(&conn, &path.collection).await?;
     let mut items = store::list_documents(&conn, &collection.id, limit, offset).await?;
     for document in &mut items {
         crate::content::materialize(&collection.blueprint, document);
@@ -93,7 +90,7 @@ async fn get_document_inner(
     path: PublicDocumentPath,
 ) -> Result<Json<DocumentView>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = public_collection(&conn, &path.handle, &path.collection).await?;
+    let collection = public_collection(&conn, &path.collection).await?;
     let mut document = store::find_document(&conn, &collection.id, &path.doc_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -103,7 +100,7 @@ async fn get_document_inner(
 
 async fn get_asset_inner(state: AppState, path: PublicAssetPath) -> Result<Response, AppError> {
     let conn = state.db.connect().await?;
-    let collection = public_collection(&conn, &path.handle, &path.collection).await?;
+    let collection = public_collection(&conn, &path.collection).await?;
     let asset = store::find_asset(&conn, &collection.id, &path.asset_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -112,15 +109,10 @@ async fn get_asset_inner(state: AppState, path: PublicAssetPath) -> Result<Respo
 
 async fn public_collection(
     conn: &crate::db::Conn,
-    handle: &str,
     name: &str,
 ) -> Result<vulse_model::CollectionView, AppError> {
-    let handle = handle.trim().to_ascii_lowercase();
     let name = name.trim().to_ascii_lowercase();
-    let Some(user) = store::find_user_by_handle(conn, &handle).await? else {
-        return Err(AppError::NotFound);
-    };
-    let Some(collection) = store::find_collection_by_name(conn, &user.id, &name).await? else {
+    let Some(collection) = store::find_collection_by_name(conn, &name).await? else {
         return Err(AppError::NotFound);
     };
     if collection.visibility != Visibility::Public {

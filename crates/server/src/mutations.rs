@@ -1,6 +1,6 @@
 use crate::{
-    auth::{AuthUser, Principal},
-    content::{check_body, materialize, owned_collection},
+    auth::{Editor, Principal},
+    content::{check_body, materialize, workspace_collection},
     db::{Conn, SqlValue, text_at},
     error::AppError,
     state::AppState,
@@ -79,7 +79,7 @@ async fn snapshot(
 }
 pub async fn patch_document(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, doc_id)): Path<(String, String)>,
     Json(body): Json<DocumentPatch>,
 ) -> Result<Json<MutationResult>, AppError> {
@@ -104,7 +104,7 @@ pub async fn patch_document(
 }
 pub async fn bulk_records(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path(id): Path<String>,
     Json(body): Json<BulkWrite>,
 ) -> Result<Json<MutationResult>, AppError> {
@@ -132,7 +132,7 @@ pub(crate) async fn run_bulk(
     }
     let conn = state.db.connect().await?;
     conn.with_app_tx(async |conn| {
-        let collection = owned_collection(conn, principal, id).await?;
+        let collection = workspace_collection(conn, principal, id).await?;
         let mut before = vec![];
         for doc_id in &body.ids {
             let doc = store::find_document(conn, id, doc_id)
@@ -152,15 +152,7 @@ pub(crate) async fn run_bulk(
                 } else {
                     doc.body.clone()
                 };
-                check_body(
-                    conn,
-                    &principal.user_id,
-                    id,
-                    &collection.name,
-                    &collection.blueprint,
-                    &next,
-                )
-                .await?;
+                check_body(conn, id, &collection.name, &collection.blueprint, &next).await?;
                 writes.push((
                     if body.action == "duplicate" {
                         crate::auth::new_id()
@@ -214,12 +206,12 @@ pub(crate) async fn run_bulk(
 }
 pub async fn undo_action(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, action_id)): Path<(String, String)>,
 ) -> Result<Json<MutationResult>, AppError> {
     let conn = state.db.connect().await?;
     let result=conn.with_app_tx(async |conn|{
-        let collection=owned_collection(conn,&principal,&id).await?;
+        let collection=workspace_collection(conn,&principal,&id).await?;
         let rows=conn.query("SELECT snapshot,created_at FROM record_actions WHERE id=?1 AND collection_id=?2",&[text(&action_id),text(&id)]).await?;let row=rows.first().ok_or(AppError::NotFound)?;
         let time=chrono::DateTime::parse_from_rfc3339(&text_at(row,1)?).map_err(anyhow::Error::from)?;
         if chrono::Utc::now().signed_duration_since(time).num_hours()>=24{return Err(AppError::conflict("This undo action has expired."));}
@@ -231,7 +223,7 @@ pub async fn undo_action(
         let now=timeutil::now_rfc3339();
         for doc in &snapshot.after {if !snapshot.before.iter().any(|before|before.id==doc.id){store::delete_document(conn,&id,&doc.id).await?;}}
         for doc in &snapshot.before {if !store::document_exists(conn,&id,&doc.id).await?{store::insert_document(conn,&doc.id,&id,&doc.body,&doc.created_at).await?;}store::update_document(conn,&id,&doc.id,&doc.body,&now).await?;}
-        for doc in &snapshot.before {check_body(conn,&principal.user_id,&id,&collection.name,&collection.blueprint,&doc.body).await?;}
+        for doc in &snapshot.before {check_body(conn,&id,&collection.name,&collection.blueprint,&doc.body).await?;}
         conn.execute("DELETE FROM record_actions WHERE id=?1",&[text(&action_id)]).await?;
         let mut documents=vec![];for doc in &snapshot.before {let mut current=store::find_document(conn,&id,&doc.id).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&mut current);documents.push(current);}
         Ok(MutationResult{affected:snapshot.before.len().max(snapshot.after.len()),documents,undo_id:String::new()})

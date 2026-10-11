@@ -1,5 +1,6 @@
 const { chromium } = require("playwright-core");
 const assert = require("node:assert/strict");
+const { signInFreshAdmin } = require("./sign-in.cjs");
 (async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -7,14 +8,8 @@ const assert = require("node:assert/strict");
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   try {
-    await page.goto(base + "/register");
-    const handle = "blocks" + Date.now();
-    await page.getByLabel("Email").fill(handle + "@example.com");
-    await page.getByLabel("Handle").fill(handle);
-    await page.getByLabel("Password").fill("test-password");
-    await page.getByRole("button", { name: "Create account", exact: true }).click();
-    await page.getByRole("heading", { name: "A home for your data." }).waitFor();
-    const response = await page.request.post(base + "/api/v1/collections", { data: { name: "articles", visibility: "public", blueprint: { fields: [{ name: "content", type: "portable_text" }] } } });
+    const { run } = await signInFreshAdmin(page, base, "blocks");
+    const response = await page.request.post(base + "/api/v1/collections", { data: { name: "articles-" + run, visibility: "public", blueprint: { fields: [{ name: "content", type: "portable_text" }] } } });
     assert.equal(response.status(), 201);
     const { id } = await response.json();
     await page.goto(base + `/collections/${id}/documents/new`);
@@ -105,7 +100,7 @@ const assert = require("node:assert/strict");
     assert.deepEqual(repeat.items.map((item) => item.label), ["Second", "First"]);
     assert(repeat.items[0].content.find((block) => block._type === "accordion").content.some((block) => block._type === "image"));
     assert(content.some((block) => block._type === "iframe" && block.height === 400));
-    const publicDoc = await (await page.request.get(base + `/api/v1/public/${handle}/articles/${recordId}`)).json();
+    const publicDoc = await (await page.request.get(base + `/api/v1/public/articles-${run}/${recordId}`)).json();
     assert.deepEqual(publicDoc.body.content, content);
     await page.reload();
     await editor.waitFor();

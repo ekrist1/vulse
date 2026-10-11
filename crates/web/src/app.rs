@@ -1,10 +1,11 @@
-use vulse_model::UserView;
+use vulse_model::{Role, UserView};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::api;
 use crate::pages::{
-    CollectionPage, CollectionsPage, DocumentPage, KeysPage, LoginPage, RegisterPage,
+    AcceptPage, AccountPage, CollectionPage, CollectionsPage, DocumentPage, KeysPage, LoginPage,
+    PeoplePage, SetupPage,
 };
 
 #[derive(Clone, PartialEq)]
@@ -19,14 +20,40 @@ pub struct SessionCtx {
     pub set: Callback<SessionState>,
 }
 
+impl SessionCtx {
+    /// The signed-in role, or viewer while signed out. The server enforces
+    /// roles; the UI only hides controls that would be refused.
+    pub fn role(&self) -> Role {
+        self.state
+            .user
+            .as_ref()
+            .map(|user| user.role)
+            .unwrap_or(Role::Viewer)
+    }
+
+    pub fn can_edit(&self) -> bool {
+        self.role() >= Role::Editor
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.role() == Role::Admin
+    }
+}
+
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
     #[at("/")]
     Home,
     #[at("/login")]
     Login,
-    #[at("/register")]
-    Register,
+    #[at("/setup")]
+    Setup,
+    #[at("/accept")]
+    Accept,
+    #[at("/account")]
+    Account,
+    #[at("/people")]
+    People,
     #[at("/keys")]
     Keys,
     #[at("/collections/:id")]
@@ -74,7 +101,10 @@ fn switch(route: Route) -> Html {
     match route {
         Route::Home => html! { <CollectionsPage /> },
         Route::Login => html! { <LoginPage /> },
-        Route::Register => html! { <RegisterPage /> },
+        Route::Setup => html! { <SetupPage /> },
+        Route::Accept => html! { <AcceptPage /> },
+        Route::Account => html! { <AccountPage /> },
+        Route::People => html! { <PeoplePage /> },
         Route::Keys => html! { <KeysPage /> },
         Route::Collection { id } => html! { <CollectionPage key={id.clone()} id={id.clone()} /> },
         Route::Document { id, doc_id } => {
@@ -124,7 +154,10 @@ pub fn shell(props: &ShellProps) -> Html {
                     <nav>
                         <Link<Route> to={Route::Home}>{"Collections"}</Link<Route>>
                         <Link<Route> to={Route::Keys}>{"API keys"}</Link<Route>>
-                        <span class="handle">{format!("@{}", user.handle)}</span>
+                        if user.role == Role::Admin {
+                            <Link<Route> to={Route::People}>{"People"}</Link<Route>>
+                        }
+                        <Link<Route> classes="handle" to={Route::Account}>{format!("@{}", user.handle)}</Link<Route>>
                         <button type="button" onclick={logout}>{"Log out"}</button>
                     </nav>
                 }

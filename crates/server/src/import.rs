@@ -1,6 +1,6 @@
 use crate::{
-    auth::AuthUser,
-    content::{check_body, owned_collection},
+    auth::Editor,
+    content::{check_body, workspace_collection},
     error::AppError,
     state::AppState,
     store,
@@ -28,12 +28,12 @@ struct Table {
 
 pub async fn import_file(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<ImportResult>, AppError> {
     let conn = state.db.connect().await?;
-    owned_collection(&conn, &principal, &id).await?;
+    workspace_collection(&conn, &principal, &id).await?;
     let mut file = None;
     let mut mapping = None::<Vec<Option<String>>>;
     let mut sheet = String::new();
@@ -111,7 +111,7 @@ pub async fn import_file(
     // Re-read and validate inside the write transaction so schema changes cannot bypass validation.
     let result = conn
         .with_app_tx(async |conn| {
-            let collection = owned_collection(conn, &principal, &id).await?;
+            let collection = workspace_collection(conn, &principal, &id).await?;
             let mapping = match mapping {
                 Some(m) => m,
                 None => table
@@ -209,7 +209,6 @@ pub async fn import_file(
                 if !failed {
                     match check_body(
                         conn,
-                        &principal.user_id,
                         &id,
                         &collection.name,
                         &collection.blueprint,

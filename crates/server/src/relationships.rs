@@ -1,6 +1,6 @@
 use crate::{
     auth::AuthUser,
-    content::{PageQuery, owned_collection, page_query},
+    content::{PageQuery, page_query, workspace_collection},
     db::{Conn, SqlValue, text_at},
     error::AppError,
     state::AppState,
@@ -14,10 +14,10 @@ use vulse_model::{Blueprint, CollectionView, Page, ReferenceView};
 fn text(v: &str) -> SqlValue {
     SqlValue::Text(v.into())
 }
-pub async fn owner_collections(conn: &Conn, owner: &str) -> anyhow::Result<Vec<CollectionView>> {
+pub async fn all_collections(conn: &Conn) -> anyhow::Result<Vec<CollectionView>> {
     let mut all = vec![];
     loop {
-        let page = store::list_collections(conn, owner, 100, all.len() as u32).await?;
+        let page = store::list_collections(conn, 100, all.len() as u32).await?;
         let done = page.len() < 100;
         all.extend(page);
         if done {
@@ -39,15 +39,14 @@ pub async fn sync(
     .await?;
     let rows = conn
         .query(
-            "SELECT owner_id,name FROM collections WHERE id=?1",
+            "SELECT name FROM collections WHERE id=?1",
             &[text(collection)],
         )
         .await?;
     let row = rows
         .first()
         .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
-    let owner = text_at(row, 0)?;
-    let name = text_at(row, 1)?;
+    let name = text_at(row, 0)?;
     for field in &blueprint.fields {
         if !matches!(
             field.kind,
@@ -79,7 +78,7 @@ pub async fn sync(
             let target = if reference.collection == name {
                 Some(collection.into())
             } else {
-                store::find_collection_by_name(conn, &owner, &reference.collection)
+                store::find_collection_by_name(conn, &reference.collection)
                     .await?
                     .map(|c| c.id)
             };
@@ -147,12 +146,12 @@ pub async fn backlinks(
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page<ReferenceView>>, AppError> {
     let conn = state.db.connect().await?;
-    owned_collection(&conn, &principal, &id).await?;
+    workspace_collection(&conn, &principal, &id).await?;
     if !store::document_exists(&conn, &id, &doc).await? {
         return Err(AppError::NotFound);
     }
     let (limit, offset) = page_query(&query)?;
-    let rows=conn.query("SELECT c.id,c.name,d.id,d.body,c.blueprint,l.field FROM document_links l JOIN documents d ON d.id=l.source_id JOIN collections c ON c.id=d.collection_id WHERE l.kind='document' AND l.target_collection=?1 AND l.target_id=?2 AND c.owner_id=?3 AND (?4 IS NULL OR c.id=?4) ORDER BY c.name,d.id,l.field LIMIT ?5 OFFSET ?6",&[text(&id),text(&doc),text(&principal.user_id),principal.collection_scope.as_deref().map(text).unwrap_or(SqlValue::Null),SqlValue::Integer(limit as i64),SqlValue::Integer(offset as i64)]).await?;
+    let rows=conn.query("SELECT c.id,c.name,d.id,d.body,c.blueprint,l.field FROM document_links l JOIN documents d ON d.id=l.source_id JOIN collections c ON c.id=d.collection_id WHERE l.kind='document' AND l.target_collection=?1 AND l.target_id=?2 AND (?3 IS NULL OR c.id=?3) ORDER BY c.name,d.id,l.field LIMIT ?4 OFFSET ?5",&[text(&id),text(&doc),principal.collection_scope.as_deref().map(text).unwrap_or(SqlValue::Null),SqlValue::Integer(limit as i64),SqlValue::Integer(offset as i64)]).await?;
     let items = rows
         .iter()
         .map(|row| -> anyhow::Result<ReferenceView> {

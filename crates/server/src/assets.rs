@@ -8,8 +8,8 @@ use axum::http::header::{self, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use vulse_model::{AssetView, Page, is_uuid};
 
-use crate::auth::AuthUser;
-use crate::content::{PageQuery, owned_collection, page_query};
+use crate::auth::{AuthUser, Editor};
+use crate::content::{PageQuery, page_query, workspace_collection};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::store;
@@ -25,7 +25,7 @@ pub async fn list_assets(
 ) -> Result<Json<Page<AssetView>>, AppError> {
     let (limit, offset) = page_query(&query)?;
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     let items = store::list_assets(&conn, &collection.id, limit, offset).await?;
     Ok(Json(Page {
         items,
@@ -36,12 +36,12 @@ pub async fn list_assets(
 
 pub async fn upload_asset(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     AxumPath(id): AxumPath<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<AssetView>), AppError> {
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     let mut file: Option<(String, String, Vec<u8>)> = None;
     while let Some(field) = multipart
         .next_field()
@@ -115,7 +115,7 @@ pub async fn get_asset(
     AxumPath((id, asset_id)): AxumPath<(String, String)>,
 ) -> Result<Json<AssetView>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     let asset = store::find_asset(&conn, &collection.id, &asset_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -128,7 +128,7 @@ pub async fn get_asset_content(
     AxumPath((id, asset_id)): AxumPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     let asset = store::find_asset(&conn, &collection.id, &asset_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -137,13 +137,13 @@ pub async fn get_asset_content(
 
 pub async fn delete_asset(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     AxumPath((id, asset_id)): AxumPath<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let conn = state.db.connect().await?;
     let asset = conn
         .with_app_tx(async |conn| {
-            let collection = owned_collection(conn, &principal, &id).await?;
+            let collection = workspace_collection(conn, &principal, &id).await?;
             let asset = store::find_asset(conn, &collection.id, &asset_id)
                 .await?
                 .ok_or(AppError::NotFound)?;

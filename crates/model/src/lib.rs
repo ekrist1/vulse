@@ -35,18 +35,141 @@ pub enum Visibility {
     Private,
 }
 
+/// Workspace roles, ordered from least to most access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Reads collections, records and assets.
+    Viewer,
+    /// Also writes records, assets, imports and saved views.
+    Editor,
+    /// Also changes collection schemas and manages users.
+    Admin,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Viewer, Role::Editor, Role::Admin];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Editor => "editor",
+            Role::Admin => "admin",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|role| role.as_str() == value)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Viewer => "Viewer",
+            Role::Editor => "Editor",
+            Role::Admin => "Admin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserView {
     pub id: String,
     pub email: String,
     pub handle: String,
+    pub role: Role,
 }
 
+/// A workspace account as seen by admins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedUser {
+    pub id: String,
+    pub email: String,
+    pub handle: String,
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateUser {
+    #[serde(default)]
+    pub role: Option<Role>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupStatus {
+    pub needs_setup: bool,
+}
+
+/// Creates the first admin. Only accepted while the workspace has no accounts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
+pub struct SetupRequest {
+    pub token: String,
     pub email: String,
     pub handle: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkPurpose {
+    Invite,
+    Reset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvite {
+    pub email: String,
+    pub role: Role,
+}
+
+/// A pending single-use invite or password reset link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InviteView {
+    pub id: String,
+    pub purpose: LinkPurpose,
+    pub email: String,
+    pub role: Role,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// The raw token is returned once. The admin shares `path` with the recipient.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatedInvite {
+    #[serde(flatten)]
+    pub invite: InviteView,
+    pub token: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkTokenRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkInfo {
+    pub purpose: LinkPurpose,
+    pub email: String,
+}
+
+/// Completes an invite (handle required) or a password reset (handle ignored).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptLink {
+    pub token: String,
+    #[serde(default)]
+    pub handle: Option<String>,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangePassword {
+    pub current_password: String,
+    pub new_password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +264,7 @@ pub struct ApiKeyView {
     pub prefix: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collection_id: Option<String>,
+    pub role: Role,
     pub created_at: String,
 }
 
@@ -149,6 +273,9 @@ pub struct CreateApiKey {
     pub name: String,
     #[serde(default)]
     pub collection_id: Option<String>,
+    /// Defaults to the creator's role and may not exceed it.
+    #[serde(default)]
+    pub role: Option<Role>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

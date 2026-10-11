@@ -12,20 +12,25 @@ mod mutations;
 mod public;
 mod records;
 mod relationships;
+mod security;
 mod state;
 mod store;
 mod timeutil;
+mod users;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::security::Throttle;
+use crate::state::{AppState, AuthSettings};
 
 const JSON_BODY_LIMIT: usize = 1024 * 1024;
 
@@ -41,36 +46,78 @@ pub async fn run() -> anyhow::Result<()> {
     let db = config.open_db().await?;
     let conn = db.connect().await?;
     migrate::migrate(&conn).await?;
+    store::purge_expired(&conn, &timeutil::now_secs()).await?;
+    let setup_token = config.setup_token.clone().unwrap_or_else(auth::new_token);
+    if store::count_users(&conn).await? == 0 {
+        let base = config
+            .public_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}", config.bind));
+        tracing::warn!(
+            "No accounts exist yet. Open {base}/setup and enter this setup token to create the first admin: {setup_token}"
+        );
+    }
+    security::spawn_cleanup(db.clone());
     let bind = config.bind.clone();
     let app = app(AppState {
         db,
-        password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        password_work: Arc::new(tokio::sync::Semaphore::new(4)),
         asset_dir: config.asset_dir,
         web_dist: config.web_dist,
+        auth: Arc::new(AuthSettings {
+            cookie_secure: config.cookie_secure,
+            setup_token_hash: auth::hash_secret(&setup_token),
+            trust_proxy: config.trust_proxy,
+            public_origin: config.public_url,
+            password_wait: Duration::from_secs(10),
+        }),
+        throttle: Arc::new(Throttle::default()),
     });
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
 pub fn app(state: AppState) -> Router {
     let web_dist = state.web_dist.clone();
-    let mut router = Router::new().nest("/api/v1", api());
+    let api = api().layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        security::same_origin_writes,
+    ));
+    let mut router = Router::new().nest("/api/v1", api);
     if web_dist.join("index.html").is_file() {
         let index = web_dist.join("index.html");
         let serve = ServeDir::new(&web_dist).fallback(ServeFile::new(index));
         router = router.fallback_service(serve);
     }
-    router.with_state(state)
+    router
+        .layer(axum::middleware::from_fn(security::page_headers))
+        .with_state(state)
 }
 
 fn api() -> Router<AppState> {
     let json_limit = Router::new()
-        .route("/auth/register", post(auth::register))
+        .route("/auth/setup", get(auth::setup_status).post(auth::setup))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/logout-everywhere", post(auth::logout_everywhere))
+        .route("/auth/password", post(auth::change_password))
+        .route("/auth/links/inspect", post(auth::link_info))
+        .route("/auth/links/accept", post(auth::accept_link))
         .route("/me", get(auth::me))
+        .route("/users", get(users::list_users))
+        .route("/users/{id}", patch(users::update_user))
+        .route("/users/{id}/password-reset", post(users::reset_password))
+        .route(
+            "/invites",
+            get(users::list_invites).post(users::create_invite),
+        )
+        .route("/invites/{id}", delete(users::delete_invite))
         .route("/api-keys", get(auth::list_keys).post(auth::create_key))
         .route("/api-keys/{id}", delete(auth::delete_key))
         .route(
@@ -123,15 +170,15 @@ fn api() -> Router<AppState> {
                 .delete(content::delete_document),
         )
         .route(
-            "/public/{handle}/{collection}",
+            "/public/{collection}",
             get(public::list_documents).options(public::options),
         )
         .route(
-            "/public/{handle}/{collection}/{doc_id}",
+            "/public/{collection}/{doc_id}",
             get(public::get_document).options(public::options),
         )
         .route(
-            "/public/{handle}/{collection}/assets/{asset_id}",
+            "/public/{collection}/assets/{asset_id}",
             get(public::get_asset).options(public::options),
         )
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT));
@@ -164,6 +211,8 @@ async fn not_found() -> AppError {
     AppError::NotFound
 }
 
+pub const TEST_SETUP_TOKEN: &str = "test-setup-token-0123456789";
+
 pub async fn test_state(root: PathBuf) -> anyhow::Result<AppState> {
     let asset_dir = root.join("assets");
     tokio::fs::create_dir_all(&asset_dir).await?;
@@ -172,9 +221,17 @@ pub async fn test_state(root: PathBuf) -> anyhow::Result<AppState> {
     migrate::migrate(&conn).await?;
     Ok(AppState {
         db,
-        password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        password_work: Arc::new(tokio::sync::Semaphore::new(4)),
         asset_dir,
         web_dist: root.join("missing-dist"),
+        auth: Arc::new(AuthSettings {
+            cookie_secure: false,
+            setup_token_hash: auth::hash_secret(TEST_SETUP_TOKEN),
+            trust_proxy: false,
+            public_origin: None,
+            password_wait: Duration::from_millis(50),
+        }),
+        throttle: Arc::new(Throttle::default()),
     })
 }
 

@@ -8,7 +8,7 @@ use vulse_model::{
     validate_blueprint, validate_document,
 };
 
-use crate::auth::{AccountOnly, AuthUser, Principal, require_collection};
+use crate::auth::{AuthUser, Editor, Principal, SchemaAdmin, require_collection};
 use crate::db::Conn;
 use crate::error::{AppError, unique_message};
 use crate::state::AppState;
@@ -33,14 +33,14 @@ pub async fn list_collections(
     let (limit, offset) = page_query(&query)?;
     let conn = state.db.connect().await?;
     let items = if let Some(scope) = &principal.collection_scope {
-        store::find_collection(&conn, &principal.user_id, scope)
+        store::find_collection(&conn, scope)
             .await?
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
             .collect()
     } else {
-        store::list_collections(&conn, &principal.user_id, limit, offset).await?
+        store::list_collections(&conn, limit, offset).await?
     };
     Ok(Json(Page {
         items,
@@ -51,7 +51,7 @@ pub async fn list_collections(
 
 pub async fn create_collection(
     State(state): State<AppState>,
-    AccountOnly(principal): AccountOnly,
+    SchemaAdmin(principal): SchemaAdmin,
     Json(body): Json<CreateCollection>,
 ) -> Result<(StatusCode, Json<CollectionView>), AppError> {
     let name = body.name.trim().to_ascii_lowercase();
@@ -61,7 +61,7 @@ pub async fn create_collection(
     let id = crate::auth::new_id();
     let created_at = timeutil::now_rfc3339();
     conn.with_app_tx(async |conn| {
-        ensure_targets(conn, &principal.user_id, &body.blueprint, &name).await?;
+        ensure_targets(conn, &body.blueprint, &name).await?;
         store::insert_collection(
             conn,
             &id,
@@ -76,7 +76,7 @@ pub async fn create_collection(
         Ok(())
     })
     .await?;
-    let collection = store::find_collection(&conn, &principal.user_id, &id)
+    let collection = store::find_collection(&conn, &id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("created collection disappeared"))?;
     Ok((StatusCode::CREATED, Json(collection)))
@@ -88,20 +88,20 @@ pub async fn get_collection(
     Path(id): Path<String>,
 ) -> Result<Json<CollectionView>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     Ok(Json(collection))
 }
 
 pub async fn update_collection(
     State(state): State<AppState>,
-    AccountOnly(principal): AccountOnly,
+    SchemaAdmin(principal): SchemaAdmin,
     Path(id): Path<String>,
     Json(body): Json<UpdateCollection>,
 ) -> Result<Json<CollectionView>, AppError> {
     let conn = state.db.connect().await?;
     let collection = conn
         .with_app_tx(async |conn| {
-            let current = owned_collection(conn, &principal, &id).await?;
+            let current = workspace_collection(conn, &principal, &id).await?;
             if body
                 .expected_updated_at
                 .as_ref()
@@ -121,10 +121,10 @@ pub async fn update_collection(
             let mut blueprint = body.blueprint.clone().unwrap_or(current.blueprint.clone());
             retarget_self(&mut blueprint, &current.name, &name);
             prepare_blueprint(&blueprint, &name)?;
-            ensure_targets(conn, &principal.user_id, &blueprint, &name).await?;
+            ensure_targets(conn, &blueprint, &name).await?;
             let mut failing = Vec::new();
             for (doc, body) in store::list_document_bodies(conn, &id).await? {
-                match check_body(conn, &principal.user_id, &id, &name, &blueprint, &body).await {
+                match check_body(conn, &id, &name, &blueprint, &body).await {
                     Ok(()) => {}
                     Err(AppError::BadRequest(_)) => failing.push(doc),
                     Err(err) => return Err(err),
@@ -138,7 +138,6 @@ pub async fn update_collection(
             }
             store::update_collection(
                 conn,
-                &principal.user_id,
                 &id,
                 &name,
                 visibility,
@@ -148,9 +147,7 @@ pub async fn update_collection(
             .await
             .map_err(|err| unique_message(err, "a collection with that name already exists"))?;
             if name != current.name {
-                for mut related in
-                    crate::relationships::owner_collections(conn, &principal.user_id).await?
-                {
+                for mut related in crate::relationships::all_collections(conn).await? {
                     if related.id == id {
                         continue;
                     }
@@ -159,7 +156,6 @@ pub async fn update_collection(
                     if original != related.blueprint {
                         store::update_collection(
                             conn,
-                            &principal.user_id,
                             &related.id,
                             &related.name,
                             related.visibility,
@@ -170,7 +166,7 @@ pub async fn update_collection(
                     }
                 }
             }
-            store::find_collection(conn, &principal.user_id, &id)
+            store::find_collection(conn, &id)
                 .await?
                 .ok_or(AppError::NotFound)
         })
@@ -180,19 +176,19 @@ pub async fn update_collection(
 
 pub async fn delete_collection(
     State(state): State<AppState>,
-    AccountOnly(principal): AccountOnly,
+    SchemaAdmin(principal): SchemaAdmin,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let conn = state.db.connect().await?;
     let keys=conn.with_app_tx(async |conn| {
-        let current=owned_collection(conn,&principal,&id).await?;
-        for related in crate::relationships::owner_collections(conn,&principal.user_id).await?{
+        let current=workspace_collection(conn,&principal,&id).await?;
+        for related in crate::relationships::all_collections(conn).await?{
             if related.id!=id && reference_collections(&related.blueprint).contains(&current.name.as_str()){
                 return Err(AppError::conflict(format!("Collection '{}' has fields referencing this collection. Remove those fields first.",related.name)));
             }
         }
         let keys=store::asset_keys(conn,&id).await?;
-        store::delete_collection(conn,&principal.user_id,&id).await?;
+        store::delete_collection(conn,&id).await?;
         Ok(keys)
     }).await?;
     for key in keys {
@@ -211,7 +207,7 @@ pub async fn list_documents(
 ) -> Result<Json<Page<DocumentView>>, AppError> {
     let (limit, offset) = page_query(&query)?;
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     let mut items = store::list_documents(&conn, &id, limit, offset).await?;
     for document in &mut items {
         materialize(&collection.blueprint, document);
@@ -225,24 +221,16 @@ pub async fn list_documents(
 
 pub async fn create_document(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path(id): Path<String>,
     Json(body): Json<DocumentWrite>,
 ) -> Result<(StatusCode, Json<DocumentView>), AppError> {
     let conn = state.db.connect().await?;
     let document = conn
         .with_app_tx(async |conn| {
-            let collection = owned_collection(conn, &principal, &id).await?;
+            let collection = workspace_collection(conn, &principal, &id).await?;
             let source = vulse_model::source_document(&collection.blueprint, &body.body);
-            check_body(
-                conn,
-                &principal.user_id,
-                &id,
-                &collection.name,
-                &collection.blueprint,
-                &source,
-            )
-            .await?;
+            check_body(conn, &id, &collection.name, &collection.blueprint, &source).await?;
             let document_id = crate::auth::new_id();
             store::insert_document(conn, &document_id, &id, &source, &timeutil::now_rfc3339())
                 .await?;
@@ -262,7 +250,7 @@ pub async fn get_document(
     Path((id, doc_id)): Path<(String, String)>,
 ) -> Result<Json<DocumentView>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     let mut document = store::find_document(&conn, &collection.id, &doc_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -272,28 +260,20 @@ pub async fn get_document(
 
 pub async fn update_document(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, doc_id)): Path<(String, String)>,
     Json(body): Json<DocumentWrite>,
 ) -> Result<Json<DocumentView>, AppError> {
     let conn = state.db.connect().await?;
     let document = conn
         .with_app_tx(async |conn| {
-            let collection = owned_collection(conn, &principal, &id).await?;
+            let collection = workspace_collection(conn, &principal, &id).await?;
             let current = store::find_document(conn, &id, &doc_id)
                 .await?
                 .ok_or(AppError::NotFound)?;
             crate::mutations::check_version(&current, body.expected_updated_at.as_deref())?;
             let source = vulse_model::source_document(&collection.blueprint, &body.body);
-            check_body(
-                conn,
-                &principal.user_id,
-                &id,
-                &collection.name,
-                &collection.blueprint,
-                &source,
-            )
-            .await?;
+            check_body(conn, &id, &collection.name, &collection.blueprint, &source).await?;
             store::update_document(conn, &id, &doc_id, &source, &timeutil::now_rfc3339()).await?;
             let mut document = store::find_document(conn, &id, &doc_id)
                 .await?
@@ -307,7 +287,7 @@ pub async fn update_document(
 
 pub async fn delete_document(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, doc_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     crate::mutations::run_bulk(
@@ -325,12 +305,13 @@ pub async fn delete_document(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn owned_collection(
+/// Looks up a collection and applies an API key's collection scope.
+pub async fn workspace_collection(
     conn: &Conn,
     principal: &Principal,
     id: &str,
 ) -> Result<CollectionView, AppError> {
-    let collection = store::find_collection(conn, &principal.user_id, id)
+    let collection = store::find_collection(conn, id)
         .await?
         .ok_or(AppError::NotFound)?;
     require_collection(principal, &collection.id)?;
@@ -339,7 +320,6 @@ pub async fn owned_collection(
 
 pub(crate) async fn check_body(
     conn: &Conn,
-    owner_id: &str,
     collection_id: &str,
     collection_name: &str,
     blueprint: &Blueprint,
@@ -355,7 +335,7 @@ pub(crate) async fn check_body(
         let target_id = if reference.collection == collection_name {
             collection_id.to_string()
         } else {
-            store::find_collection_by_name(conn, owner_id, &reference.collection)
+            store::find_collection_by_name(conn, &reference.collection)
                 .await?
                 .ok_or_else(|| {
                     AppError::bad(format!("unknown collection '{}'", reference.collection))
@@ -384,7 +364,6 @@ fn prepare_blueprint(blueprint: &Blueprint, self_name: &str) -> Result<(), AppEr
 
 async fn ensure_targets(
     conn: &Conn,
-    owner_id: &str,
     blueprint: &Blueprint,
     self_name: &str,
 ) -> Result<(), AppError> {
@@ -392,10 +371,7 @@ async fn ensure_targets(
         if name == self_name {
             continue;
         }
-        if store::find_collection_by_name(conn, owner_id, name)
-            .await?
-            .is_none()
-        {
+        if store::find_collection_by_name(conn, name).await?.is_none() {
             return Err(AppError::bad(format!("unknown collection '{name}'")));
         }
     }

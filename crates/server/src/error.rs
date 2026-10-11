@@ -10,7 +10,12 @@ pub enum AppError {
     Forbidden(String),
     NotFound,
     PayloadTooLarge,
+    /// Password hashing capacity is exhausted.
     TooManyRequests,
+    /// Too many failed attempts from one address or for one account.
+    RateLimited {
+        retry_after: u64,
+    },
     Conflict {
         message: String,
         document_ids: Vec<String>,
@@ -46,6 +51,7 @@ impl std::fmt::Display for AppError {
             AppError::Forbidden(message) => write!(f, "{message}"),
             AppError::NotFound => write!(f, "not found"),
             AppError::TooManyRequests => write!(f, "Authentication is busy. Try again shortly."),
+            AppError::RateLimited { retry_after } => write!(f, "{}", rate_limited(*retry_after)),
             AppError::PayloadTooLarge => write!(f, "payload too large"),
             AppError::Conflict { message, .. } => write!(f, "{message}"),
             AppError::Internal(err) => write!(f, "{err}"),
@@ -97,6 +103,21 @@ impl IntoResponse for AppError {
                     document_ids: None,
                 },
             ),
+            AppError::RateLimited { retry_after } => {
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ApiErrorBody {
+                        error: rate_limited(retry_after),
+                        document_ids: None,
+                    }),
+                )
+                    .into_response();
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(retry_after),
+                );
+                return response;
+            }
             AppError::PayloadTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ApiErrorBody {
@@ -139,7 +160,10 @@ pub fn unique_message(err: anyhow::Error, fallback: &str) -> AppError {
         AppError::conflict("email already registered")
     } else if text.contains("users.handle") {
         AppError::conflict("handle already registered")
-    } else if text.contains("collections.owner_id") || text.contains("owner_id, name") {
+    } else if text.contains("collections.name")
+        || text.contains("collections.owner_id")
+        || text.contains("owner_id, name")
+    {
         AppError::conflict("a collection with that name already exists")
     } else if text.contains("unique") {
         AppError::conflict(fallback)
@@ -149,3 +173,12 @@ pub fn unique_message(err: anyhow::Error, fallback: &str) -> AppError {
 }
 
 impl std::error::Error for AppError {}
+
+fn rate_limited(retry_after: u64) -> String {
+    let minutes = retry_after.div_ceil(60);
+    if minutes <= 1 {
+        "Too many attempts. Try again in a minute.".into()
+    } else {
+        format!("Too many attempts. Try again in {minutes} minutes.")
+    }
+}

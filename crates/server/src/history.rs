@@ -1,6 +1,6 @@
 use crate::{
-    auth::AuthUser,
-    content::{PageQuery, check_body, materialize, owned_collection, page_query},
+    auth::{AuthUser, Editor},
+    content::{PageQuery, check_body, materialize, page_query, workspace_collection},
     db::{Conn, text_at},
     error::AppError,
     state::AppState,
@@ -41,7 +41,7 @@ pub async fn list(
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page<DocumentRevision>>, AppError> {
     let conn = state.db.connect().await?;
-    owned_collection(&conn, &principal, &id).await?;
+    workspace_collection(&conn, &principal, &id).await?;
     let (limit, offset) = page_query(&query)?;
     let rows=conn.query(&format!("SELECT {COLUMNS} FROM record_revisions r WHERE r.collection_id=?1 AND r.document_id=?2 ORDER BY r.created_at DESC,r.id DESC LIMIT ?3 OFFSET ?4"),&[text(&id),text(&doc),crate::db::SqlValue::Integer(limit as i64),crate::db::SqlValue::Integer(offset as i64)]).await?;
     Ok(Json(Page {
@@ -57,7 +57,7 @@ pub async fn deleted(
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Page<DocumentRevision>>, AppError> {
     let conn = state.db.connect().await?;
-    owned_collection(&conn, &principal, &id).await?;
+    workspace_collection(&conn, &principal, &id).await?;
     let (limit, offset) = page_query(&query)?;
     let rows=conn.query(&format!("SELECT {COLUMNS} FROM record_revisions r WHERE r.collection_id=?1 AND r.action='delete' AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.id=r.document_id AND d.collection_id=r.collection_id) AND r.id=(SELECT h.id FROM record_revisions h WHERE h.collection_id=r.collection_id AND h.document_id=r.document_id ORDER BY h.created_at DESC,h.id DESC LIMIT 1) ORDER BY r.created_at DESC,r.id DESC LIMIT ?2 OFFSET ?3"),&[text(&id),crate::db::SqlValue::Integer(limit as i64),crate::db::SqlValue::Integer(offset as i64)]).await?;
     Ok(Json(Page {
@@ -68,13 +68,13 @@ pub async fn deleted(
 }
 pub async fn restore(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, doc, revision)): Path<(String, String, String)>,
     Json(write): Json<RestoreRevision>,
 ) -> Result<Json<DocumentView>, AppError> {
     let conn = state.db.connect().await?;
     let result=conn.with_app_tx(async |conn|{
- let collection=owned_collection(conn,&principal,&id).await?;
+ let collection=workspace_collection(conn,&principal,&id).await?;
  let rows=conn.query(&format!("SELECT {COLUMNS} FROM record_revisions r WHERE r.id=?1 AND r.collection_id=?2 AND r.document_id=?3"),&[text(&revision),text(&id),text(&doc)]).await?;
  let revision=rows.first().map(decode).transpose()?.ok_or(AppError::NotFound)?;
  let current=store::find_document(conn,&id,&doc).await?;
@@ -83,7 +83,7 @@ pub async fn restore(
  let source=vulse_model::source_document(&collection.blueprint,&revision.body);
  // Insert first to permit a deleted record's self reference; the transaction rolls back on validation errors.
  if current.is_none(){store::insert_document(conn,&doc,&id,&source,&revision.record_created_at).await?;}
- check_body(conn,&principal.user_id,&id,&collection.name,&collection.blueprint,&source).await?;
+ check_body(conn,&id,&collection.name,&collection.blueprint,&source).await?;
  store::update_document(conn,&id,&doc,&source,&timeutil::now_rfc3339()).await?;
  snapshot(conn,&id,&doc,"restore").await?;
  let mut result=store::find_document(conn,&id,&doc).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&mut result);Ok(result)

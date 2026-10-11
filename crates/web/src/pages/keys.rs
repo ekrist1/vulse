@@ -1,4 +1,4 @@
-use vulse_model::{ApiKeyView, CollectionView, CreateApiKey};
+use vulse_model::{ApiKeyView, CollectionView, CreateApiKey, Role};
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
@@ -12,6 +12,7 @@ pub fn keys_page() -> Html {
     let collections = use_state(Vec::<CollectionView>::new);
     let name = use_state(|| "website".to_string());
     let collection_id = use_state(String::new);
+    let role = use_state(|| None::<Role>);
     let secret = use_state(String::new);
     let error = use_state(String::new);
     {
@@ -40,6 +41,7 @@ pub fn keys_page() -> Html {
     let onsubmit = {
         let name = name.clone();
         let collection_id = collection_id.clone();
+        let role = role.clone();
         let keys = keys.clone();
         let secret = secret.clone();
         let error = error.clone();
@@ -52,6 +54,7 @@ pub fn keys_page() -> Html {
                 } else {
                     Some((*collection_id).clone())
                 },
+                role: *role,
             };
             let keys = keys.clone();
             let secret = secret.clone();
@@ -73,10 +76,11 @@ pub fn keys_page() -> Html {
     if let Some(redirect) = signed_out(&session) {
         return redirect;
     }
+    let my_role = session.role();
     html! {
         <Shell>
             <h1>{"API keys"}</h1>
-            <p class="muted">{"A key can reach every collection you own, or just one. The secret is shown once."}</p>
+            <p class="muted">{"A key can reach every collection in the workspace, or just one. Its role can be lower than yours, never higher, and drops if your role is lowered. Disabling your account stops all your keys. The secret is shown once."}</p>
             if !secret.is_empty() {
                 <p class="secret" role="status">
                     {"Copy this secret now: "}
@@ -107,6 +111,25 @@ pub fn keys_page() -> Html {
                         }) }
                     </select>
                 </label>
+                <label>{"Role"}
+                    <select onchange={Callback::from({
+                        let role = role.clone();
+                        move |event: Event| {
+                            let element: HtmlSelectElement = event.target_unchecked_into();
+                            role.set(Role::parse(&element.value()));
+                        }
+                    })}>
+                        { for Role::ALL.into_iter().filter(|option| *option <= my_role).rev().map(|option| html! {
+                            <option value={option.as_str()} selected={role.unwrap_or(my_role) == option}>
+                                {match option {
+                                    Role::Viewer => "Viewer — read only",
+                                    Role::Editor => "Editor — read and write records and files",
+                                    Role::Admin => "Admin — also change collection schemas",
+                                }}
+                            </option>
+                        }) }
+                    </select>
+                </label>
                 if !error.is_empty() {
                     <p class="error" role="alert">{(*error).clone()}</p>
                 }
@@ -132,7 +155,7 @@ pub fn keys_page() -> Html {
                         <li key={key.id.clone()}>
                             <div>
                                 <strong>{key.name.clone()}</strong>
-                                <span class="muted">{format!(" {}", key.prefix)}</span>
+                                <span class="muted">{format!(" {} · {}", key.prefix, key.role.label())}</span>
                             </div>
                             <button type="button" class="danger" onclick={on_delete}>{"Revoke"}</button>
                         </li>

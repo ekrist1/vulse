@@ -10,6 +10,11 @@ pub struct Config {
     pub db_path: PathBuf,
     pub asset_dir: PathBuf,
     pub web_dist: PathBuf,
+    /// External address of the admin, such as `https://cms.example.com`.
+    pub public_url: Option<String>,
+    pub cookie_secure: bool,
+    pub setup_token: Option<String>,
+    pub trust_proxy: bool,
 }
 
 impl Config {
@@ -25,6 +30,27 @@ impl Config {
             }
             _ => {}
         }
+        let public_url =
+            nonempty("VULSE_PUBLIC_URL").map(|url| url.trim_end_matches('/').to_string());
+        if let Some(url) = &public_url {
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                anyhow::bail!("VULSE_PUBLIC_URL must start with https:// or http://");
+            }
+        }
+        let cookie_secure = match nonempty("VULSE_COOKIE_SECURE") {
+            Some(value) => flag("VULSE_COOKIE_SECURE", &value)?,
+            None => public_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://")),
+        };
+        let trust_proxy = match nonempty("VULSE_TRUST_PROXY") {
+            Some(value) => flag("VULSE_TRUST_PROXY", &value)?,
+            None => false,
+        };
+        let setup_token = nonempty("VULSE_SETUP_TOKEN");
+        if setup_token.as_ref().is_some_and(|token| token.len() < 16) {
+            anyhow::bail!("VULSE_SETUP_TOKEN must be at least 16 characters");
+        }
         Ok(Self {
             bind: std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8080".into()),
             turso_url,
@@ -38,6 +64,10 @@ impl Config {
             web_dist: std::env::var("VULSE_WEB_DIST")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("crates/web/dist")),
+            public_url,
+            cookie_secure,
+            setup_token,
+            trust_proxy,
         })
     }
 
@@ -64,4 +94,12 @@ fn nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn flag(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("{name} must be true or false"),
+    }
 }

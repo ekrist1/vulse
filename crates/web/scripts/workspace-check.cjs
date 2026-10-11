@@ -1,19 +1,15 @@
 const { chromium } = require("playwright-core");
 const assert = require("node:assert/strict");
+const { signInFreshAdmin } = require("./sign-in.cjs");
 (async () => {
   const browser = await chromium.launch({executablePath:process.env.CHROMIUM_PATH||"/usr/bin/chromium",headless:true,args:["--no-sandbox","--disable-dev-shm-usage"]});
   const page = await browser.newPage({viewport:{width:1440,height:1000}});
   const base=process.env.VULSE_TEST_URL||"http://127.0.0.1:8098";
   const errors=[]; page.on("pageerror",e=>errors.push(e.message));
   try {
-    await page.goto(base+"/register");
-    const handle="workspace"+Date.now();
-    await page.getByLabel("Email").fill(handle+"@example.com");
-    await page.getByLabel("Handle").fill(handle);
-    await page.getByLabel("Password").fill("test-password");
-    await page.getByRole("button",{name:"Create account",exact:true}).click();
-    await page.getByRole("heading",{name:"A home for your data."}).waitFor();
-    const created=await page.request.post(base+"/api/v1/collections",{data:{name:"products",visibility:"public",blueprint:{fields:[{name:"sku",type:"string",required:true},{name:"name",type:"string"},{name:"price",type:"number"},{name:"active",type:"boolean"},{name:"total",type:"calculated",formula:"=[price]*2"}]}}});
+    const {run}=await signInFreshAdmin(page,base,"workspace");
+    const products="products-"+run;
+    const created=await page.request.post(base+"/api/v1/collections",{data:{name:products,visibility:"public",blueprint:{fields:[{name:"sku",type:"string",required:true},{name:"name",type:"string"},{name:"price",type:"number"},{name:"active",type:"boolean"},{name:"total",type:"calculated",formula:"=[price]*2"}]}}});
     assert.equal(created.status(),201);const collection=await created.json();const id=collection.id;
     const made=await page.request.post(base+`/api/v1/collections/${id}/documents`,{data:{body:{sku:"A001",name:"Notebook",price:12,active:true}}});
     assert.equal(made.status(),201);const document=await made.json();
@@ -144,14 +140,14 @@ const assert = require("node:assert/strict");
     await page.getByRole("button",{name:"Records",exact:true}).click();
     for(let n=0;n<26;n++){assert.equal((await page.request.post(base+`/api/v1/collections/${id}/documents`,{data:{body:{sku:"EXTRA"+n,name:"Extra "+n,price:0}}})).status(),201);}
 
-    const orderResponse=await page.request.post(base+"/api/v1/collections",{data:{name:"orders",visibility:"private",blueprint:{title_field:"name",fields:[{name:"name",type:"string"},{name:"product",type:"reference",collection:"products"}]}}});assert.equal(orderResponse.status(),201);const orders=await orderResponse.json();
+    const orderResponse=await page.request.post(base+"/api/v1/collections",{data:{name:"orders-"+run,visibility:"private",blueprint:{title_field:"name",fields:[{name:"name",type:"string"},{name:"product",type:"reference",collection:products}]}}});assert.equal(orderResponse.status(),201);const orders=await orderResponse.json();
     await page.goto(base+`/collections/${orders.id}/documents/new`);
     await page.getByLabel("name",{exact:true}).fill("First order");
-    await page.getByLabel("Search products records",{exact:true}).fill("Notebook");
+    await page.getByLabel(`Search ${products} records`,{exact:true}).fill("Notebook");
     await page.getByText("1 matching records",{exact:true}).waitFor();
-    await page.getByLabel("Choose products record",{exact:true}).selectOption(document.id);
+    await page.getByLabel(`Choose ${products} record`,{exact:true}).selectOption(document.id);
     await page.getByRole("link",{name:"Open Notebook →",exact:true}).waitFor();
-    await page.getByRole("button",{name:"Save record",exact:true}).click();await page.getByRole("heading",{name:"First order",exact:true}).waitFor();await page.reload();await page.getByLabel("Choose products record",{exact:true}).waitFor();assert.equal(await page.getByLabel("Choose products record",{exact:true}).inputValue(),document.id);await page.getByRole("link",{name:"Open Notebook →",exact:true}).waitFor();
+    await page.getByRole("button",{name:"Save record",exact:true}).click();await page.getByRole("heading",{name:"First order",exact:true}).waitFor();await page.reload();await page.getByLabel(`Choose ${products} record`,{exact:true}).waitFor();assert.equal(await page.getByLabel(`Choose ${products} record`,{exact:true}).inputValue(),document.id);await page.getByRole("link",{name:"Open Notebook →",exact:true}).waitFor();
     await page.goto(base+`/collections/${orders.id}`);await page.getByRole("link",{name:"Notebook →",exact:true}).click();
     await page.getByRole("heading",{name:"Referenced by",exact:true}).waitFor();await page.locator(".backlinks").getByRole("link",{name:"First order",exact:true}).waitFor();
     assert.equal((await page.request.delete(base+`/api/v1/collections/${id}/documents/${document.id}`)).status(),409);
@@ -169,7 +165,7 @@ const assert = require("node:assert/strict");
     await page.getByRole("button",{name:"+ Add filter",exact:true}).click();await page.getByLabel("Filter 1 field",{exact:true}).selectOption("price");await page.getByLabel("Filter 1 operator",{exact:true}).selectOption("gt");await page.getByLabel("Filter 1 value",{exact:true}).fill("5");await page.getByText("2 matching records",{exact:true}).waitFor();
     await page.locator(".export-options > summary").click();
     let downloading=page.waitForEvent("download");await page.getByRole("button",{name:"Export current view",exact:true}).click();let download=await downloading;
-    assert.equal(download.suggestedFilename(),"products.csv");const csv=require("node:fs").readFileSync(await download.path(),"utf8");assert(csv.includes("A001")&&csv.includes("C003")&&!csv.includes("B002"));
+    assert.equal(download.suggestedFilename(),products+".csv");const csv=require("node:fs").readFileSync(await download.path(),"utf8");assert(csv.includes("A001")&&csv.includes("C003")&&!csv.includes("B002"));
     await page.getByLabel("Select record "+document.id,{exact:true}).check();await page.getByLabel("Export format",{exact:true}).selectOption("json");
     downloading=page.waitForEvent("download");await page.getByRole("button",{name:"Export selected",exact:true}).click();download=await downloading;const exported=JSON.parse(require("node:fs").readFileSync(await download.path(),"utf8"));assert.equal(exported.length,1);assert.equal(exported[0].id,document.id);assert.equal(exported[0].body.total,20);
     if(await page.locator(".view-options").evaluate(node=>node.open))await page.locator(".view-options > summary").click();

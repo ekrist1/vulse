@@ -1,6 +1,6 @@
 # Vulse
 
-Vulse stores JSON documents in named collections. Each collection has a blueprint that describes its fields, and each document is checked against that blueprint. A collection is either public or private. Public documents can be read without an account. Private ones need a signed-in session or an API key.
+Vulse stores JSON documents in named collections. Each collection has a blueprint that describes its fields, and each document is checked against that blueprint. All collections live in one shared workspace. People get access through an admin invite and have a role: viewer, editor or admin. A collection is either public or private. Public documents can be read without an account. Private ones need a signed-in session or an API key.
 
 Longer text fields use a small subset of [Portable Text](https://portabletext.org/). Images, video, audio, and PDFs can be attached to a collection and referenced from documents.
 
@@ -21,7 +21,7 @@ trunk build --config crates/web/Trunk.toml
 cargo run -p vulse-server
 ```
 
-The server listens on `127.0.0.1:8080`. Open that address in a browser. The admin is served from `crates/web/dist`. If that directory is missing, the API still runs and the site routes are absent.
+The server listens on `127.0.0.1:8080`. On first start with an empty database it logs a one-time setup token. Open `/setup` in a browser and use that token to create the first admin (see [Accounts and access](#accounts-and-access)). The admin is served from `crates/web/dist`. If that directory is missing, the API still runs and the site routes are absent.
 
 While changing the UI, run Trunk's dev server in another terminal. It serves the admin on `127.0.0.1:8081` and proxies `/api` to the Axum process:
 
@@ -39,32 +39,106 @@ With no Turso URL set, data is stored in `./vulse.db` and uploaded files in `./s
 | `VULSE_WEB_DIST` | `crates/web/dist` | Built admin files |
 | `TURSO_DATABASE_URL` | unset | Remote Turso database |
 | `TURSO_AUTH_TOKEN` | unset | Token for that database |
+| `VULSE_PUBLIC_URL` | unset | External address, such as `https://cms.example.com`. An `https://` value turns on secure cookies. Also accepted as the origin for signed-in writes |
+| `VULSE_COOKIE_SECURE` | from `VULSE_PUBLIC_URL` | `true` adds `Secure` and the `__Host-` prefix to the session cookie. Set it when TLS ends at a proxy and `VULSE_PUBLIC_URL` is unset |
+| `VULSE_SETUP_TOKEN` | random | Fixed first-run setup token, at least 16 characters. Only used while no accounts exist |
+| `VULSE_TRUST_PROXY` | `false` | Take the client address from the last `X-Forwarded-For` entry. Enable only behind a proxy that sets it |
 
 Set both Turso variables, or neither. The remote database should be created with `turso db create --tursodb`, because the server uses the current Turso Rust engine.
 
-## Adding users
+In production, serve Vulse over HTTPS and set `VULSE_PUBLIC_URL`.
 
-There is no seeded account. Create the first one from the admin at [http://127.0.0.1:8080/register](http://127.0.0.1:8080/register), or with the API:
+## Accounts and access
+
+There is no public sign-up. All accounts belong to one shared workspace, and an admin decides who joins.
+
+### First admin
+
+When the database has no accounts, the server logs a setup token at startup:
+
+```text
+WARN No accounts exist yet. Open http://127.0.0.1:8080/setup and enter this setup token to create the first admin: …
+```
+
+Open `/setup` (the login page redirects there on a fresh install), enter the token, and choose an email, handle and password. Set `VULSE_SETUP_TOKEN` to use a fixed token instead of a random one. After the first account exists, setup is refused. With the API:
 
 ```bash
 curl -c cookies.txt -H 'content-type: application/json' \
-  -d '{"email":"ada@example.com","handle":"ada","password":"correct-horse"}' \
-  http://127.0.0.1:8080/api/v1/auth/register
+  -d '{"token":"…","email":"ada@example.com","handle":"ada","password":"correct-horse"}' \
+  http://127.0.0.1:8080/api/v1/auth/setup
 ```
 
-The handle is 2–32 characters of lowercase letters, digits, or hyphens. The password is 8–128 characters. Email and handle must be unique. Register and login set an HttpOnly `vulse_session` cookie that the admin uses.
+The handle is 2–32 characters of lowercase letters, digits, or hyphens and is shown to other members. The password is 8–128 characters. Email and handle must be unique.
 
-API keys are created while signed in, from the API keys page or `POST /api/v1/api-keys`. The raw secret (`vulse_…`) is returned once. Send it as `Authorization: Bearer vulse_…`. A key can cover the whole account or a single collection.
+### Roles
+
+| Role | Can |
+| --- | --- |
+| Viewer | Read every collection, record, asset, saved view, history entry and backlink; query and export |
+| Editor | Everything a viewer can, plus create, edit, delete, bulk-edit, undo and restore records; upload and delete assets; import; manage saved views |
+| Admin | Everything an editor can, plus create, change and delete collections, and manage people |
+
+The server enforces roles on every request. The admin hides controls your role cannot use. The workspace always keeps at least one active admin: demoting or disabling the last one is refused.
+
+### Inviting people
+
+Admins manage members on the **People** page or with the API (an admin session is required; API keys cannot manage people):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/users` | List members, roles and status |
+| `PATCH` | `/api/v1/users/{id}` | `{"role":"editor"}` and/or `{"disabled":true}` |
+| `POST` | `/api/v1/users/{id}/password-reset` | Issue a password reset link |
+| `GET` | `/api/v1/invites` | List pending invite and reset links |
+| `POST` | `/api/v1/invites` | `{"email":"grace@example.com","role":"editor"}` |
+| `DELETE` | `/api/v1/invites/{id}` | Revoke a pending link |
+
+Creating an invite or a reset returns a single-use link such as `/accept#token=…`. Vulse does not send email. The admin copies the link and sends it privately. The token is in the URL fragment, so it is not sent to the server in requests or in `Referer` headers, and the accept page removes it from the address bar. Invites expire after 72 hours and reset links after 24 hours. A new link for the same address replaces the previous one. The recipient opens the link, chooses a handle (for invites) and a password, and is signed in.
+
+Disabling a member ends their sessions and stops their API keys at once. Enabling them restores the keys. Accounts are disabled, not deleted. Collections and uploads keep a reference to the account that created them.
+
+### Your account
+
+The **Account** page (click your handle) changes your password and signs out everywhere. Changing the password requires the current one and signs out your other sessions. A reset link also signs out every session of that account. The API equivalents are `POST /api/v1/auth/password` with `{"current_password":"…","new_password":"…"}` and `POST /api/v1/auth/logout-everywhere`.
+
+### Sessions
+
+Login, setup and accepting a link set an HttpOnly, `SameSite=Lax` session cookie that lasts 14 days. It is named `vulse_session`, or `__Host-vulse_session` with `Secure` when secure cookies are on. The database stores only a SHA-256 hash of each session token, so a copy of the database cannot be used to sign in. Expired sessions and links are deleted hourly.
+
+Writes signed in with the cookie are refused when the browser reports a cross-site request: `Sec-Fetch-Site` of `cross-site` or `same-site`, or, in older browsers, an `Origin` that matches neither the `Host` header nor `VULSE_PUBLIC_URL`. Requests with an `Authorization` header are not affected. Admin pages are served with `X-Frame-Options: DENY`.
+
+### Sign-in limits
+
+Failed sign-ins are counted for 15 minutes: after 5 for one account, or 30 from one address (which also covers setup tokens and link lookups), further attempts get `429` with a `Retry-After` header, even with the right password. A successful sign-in clears the account's count. Unknown addresses go through the same password check as real ones, so response times do not reveal which accounts exist. Password hashing runs on four shared workers. A sign-in waits up to 10 seconds for one before answering `429`.
+
+These counters are kept in memory for one server process. If you run several instances, also rate-limit `/api/v1/auth/` at your proxy. Behind a proxy, set `VULSE_TRUST_PROXY=true` so limits apply per client rather than to the proxy's address.
+
+### API keys
+
+API keys are created while signed in, from the API keys page or `POST /api/v1/api-keys`. The raw secret (`vulse_…`) is returned once and stored as a SHA-256 hash. Send it as `Authorization: Bearer vulse_…`.
+
+A key has a role of its own, which defaults to yours and cannot be higher. Use `{"name":"site","role":"viewer"}` for a read-only key. A key never has more access than its owner: if the owner's role is lowered, the key's effective role is lowered too. A disabled owner's keys stop working. A key can cover the whole workspace or a single collection with `collection_id`. Collection-scoped keys cannot reach other collections or change schemas, and no key can manage people or other keys.
+
+### Public reads
 
 Public reads do not use the cookie or the key:
 
 ```text
-GET /api/v1/public/{handle}/{collection}
-GET /api/v1/public/{handle}/{collection}/{document_id}
-GET /api/v1/public/{handle}/{collection}/assets/{asset_id}
+GET /api/v1/public/{collection}
+GET /api/v1/public/{collection}/{document_id}
+GET /api/v1/public/{collection}/assets/{asset_id}
 ```
 
-A missing collection and a private collection both respond with 404.
+A missing collection and a private collection both respond with 404. Collection names are unique in the workspace.
+
+### Upgrading an existing database
+
+Migration 6 converts a database from the earlier one-workspace-per-account model:
+
+- Every existing account becomes an admin, and every existing API key gets the admin role, so nobody loses access.
+- Collection names become unique across the workspace. If two accounts used the same name, the oldest collection keeps it and later ones get the creator's handle appended (`posts` → `posts-grace`). Reference fields in that creator's other collections are updated to match. Each rename is logged as a warning.
+- Existing sessions are dropped, because they were stored in plaintext. Everyone signs in once more.
+- Public URLs no longer include a handle: `/api/v1/public/{handle}/{collection}` becomes `/api/v1/public/{collection}`.
 
 ## Architecture
 
@@ -78,7 +152,7 @@ The admin and other clients talk to Axum. Axum writes rows to Turso and file byt
 
 A blueprint is an ordered field list: string, number, boolean, free-form JSON, Portable Text, asset, reference, or an array of string, number, asset, or reference. The server rejects unknown document keys and checks that references and assets exist. Saving a blueprint rechecks every document already in the collection. If any would become invalid, the change is refused and the response lists those document ids.
 
-Passwords are hashed with Argon2id. API key secrets are stored as SHA-256 hashes. Collection-scoped keys can read and write documents and assets in that collection only.
+Collections belong to the workspace, not to the account that created it. Passwords are hashed with Argon2id. Session tokens, API key secrets and invite/reset tokens are stored as SHA-256 hashes. Role checks happen in Axum extractors (`AuthUser`, `Editor`, `SchemaAdmin`, `SessionOnly`, `AdminSession` in `crates/server/src/auth.rs`); sign-in throttling and the cross-site write check are in `crates/server/src/security.rs`.
 
 ## Collection workspace
 
@@ -113,13 +187,14 @@ Verify the editor adapter with `npm --prefix crates/web test`, and shared/server
 The browser regression check uses a system Chromium (`CHROMIUM_PATH` overrides `/usr/bin/chromium`) and an isolated server on port 8098. Start it in one terminal after building the UI:
 
 ```bash
-BIND=127.0.0.1:8098 VULSE_DB_PATH=/tmp/vulse-editor-tests.db ASSET_DIR=/tmp/vulse-editor-tests-assets cargo run -p vulse-server
+BIND=127.0.0.1:8098 VULSE_DB_PATH=/tmp/vulse-editor-tests.db ASSET_DIR=/tmp/vulse-editor-tests-assets \
+  VULSE_SETUP_TOKEN=vulse-browser-tests-setup cargo run -p vulse-server
 ```
 
-Then run `npm --prefix crates/web run test:browser`. This creates a test account and checks existing content preservation, formatting, keyboard navigation, nested lists, pending uploads, save/reload, API examples, clipboard copying, public reads and mobile layout. `VULSE_TEST_URL` can override the test address.
+Then run `npm --prefix crates/web run test:browser`. The first suite against a fresh database uses the setup token to create a bootstrap admin (`admin@vulse.test`). Each suite then invites its own admin account through the accept page, and appends a run suffix to its collection names because names are shared across the workspace. If you pass a different `VULSE_SETUP_TOKEN` to the server, export the same value for the test command. The suite checks existing content preservation, formatting, keyboard navigation, nested lists, pending uploads, save/reload, API examples, clipboard copying, public reads and mobile layout. `VULSE_TEST_URL` can override the test address.
 
 Run `npm --prefix crates/web run test:blocks` against the same isolated server to check structured block editing, nesting, nested image uploads, iframe previews, history, API round trips and mobile layout.
 
 Calculated fields now start in a guided builder with named, typed inputs and a live preview. Choose sample values or an existing record without modifying saved data. The advanced editor supports field suggestions, function help, insertion at the cursor, and wrapping selected expressions. Run `npm --prefix crates/web run test:calculations` against the isolated test server above to check this workflow.
 
-Run `npm --prefix crates/web run test:workspace` against the isolated server to verify the six usability priorities, draft recovery, revision restore, relationship navigation, import updates, downloads and mobile layout. Each suite creates its own account; none should run against a production database.
+Run `npm --prefix crates/web run test:workspace` against the isolated server to verify the six usability priorities, draft recovery, revision restore, relationship navigation, import updates, downloads and mobile layout. Each suite creates its own account and collections; none should run against a production database.

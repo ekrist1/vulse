@@ -1,4 +1,7 @@
-use vulse_model::{ApiKeyView, AssetView, Blueprint, CollectionView, DocumentView, Visibility};
+use vulse_model::{
+    ApiKeyView, AssetView, Blueprint, CollectionView, DocumentView, InviteView, LinkPurpose,
+    ManagedUser, Role, Visibility,
+};
 
 use crate::db::{Conn, SqlRow, SqlValue, int_at, opt_text_at, text_at};
 
@@ -7,12 +10,15 @@ pub struct UserRecord {
     pub handle: String,
     pub email: String,
     pub password_hash: String,
+    pub role: Role,
+    pub disabled: bool,
 }
 
 pub struct SessionRecord {
     pub user_id: String,
     pub email: String,
     pub handle: String,
+    pub role: Role,
     pub expires_at: String,
 }
 
@@ -20,7 +26,18 @@ pub struct ApiKeyRecord {
     pub user_id: String,
     pub email: String,
     pub handle: String,
+    pub user_role: Role,
+    pub key_role: Role,
     pub collection_id: Option<String>,
+}
+
+pub struct LinkRecord {
+    pub id: String,
+    pub purpose: LinkPurpose,
+    pub email: String,
+    pub role: Role,
+    pub user_id: Option<String>,
+    pub expires_at: String,
 }
 
 pub struct AssetRecord {
@@ -34,15 +51,18 @@ pub async fn insert_user(
     handle: &str,
     email: &str,
     password_hash: &str,
+    role: Role,
     created_at: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO users (id, handle, email, password_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO users (id, handle, email, password_hash, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         &[
             text(id),
             text(handle),
             text(email),
             text(password_hash),
+            text(role.as_str()),
             text(created_at),
         ],
     )
@@ -50,47 +70,126 @@ pub async fn insert_user(
     Ok(())
 }
 
+pub async fn count_users(conn: &Conn) -> anyhow::Result<i64> {
+    let rows = conn.query("SELECT COUNT(*) FROM users", &[]).await?;
+    rows.first().map(|row| int_at(row, 0)).unwrap_or(Ok(0))
+}
+
+const USER_COLUMNS: &str = "id, handle, email, password_hash, role, disabled_at";
+
 pub async fn find_user_by_email(conn: &Conn, email: &str) -> anyhow::Result<Option<UserRecord>> {
     let rows = conn
         .query(
-            "SELECT id, handle, email, password_hash FROM users WHERE email = ?1",
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?1"),
             &[text(email)],
         )
         .await?;
     optional_row(rows, user_from_row)
 }
 
-pub async fn find_user_by_handle(conn: &Conn, handle: &str) -> anyhow::Result<Option<UserRecord>> {
+pub async fn find_user(conn: &Conn, id: &str) -> anyhow::Result<Option<UserRecord>> {
     let rows = conn
         .query(
-            "SELECT id, handle, email, password_hash FROM users WHERE handle = ?1",
-            &[text(handle)],
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"),
+            &[text(id)],
         )
         .await?;
     optional_row(rows, user_from_row)
 }
 
-pub async fn insert_session(
-    conn: &Conn,
-    token: &str,
-    user_id: &str,
-    expires_at: &str,
-) -> anyhow::Result<()> {
+pub async fn list_users(conn: &Conn) -> anyhow::Result<Vec<ManagedUser>> {
+    let rows = conn
+        .query(
+            "SELECT id, email, handle, role, disabled_at, created_at
+             FROM users ORDER BY created_at, id",
+            &[],
+        )
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(ManagedUser {
+                id: text_at(row, 0)?,
+                email: text_at(row, 1)?,
+                handle: text_at(row, 2)?,
+                role: role_at(row, 3)?,
+                disabled_at: opt_text_at(row, 4)?,
+                created_at: text_at(row, 5)?,
+            })
+        })
+        .collect()
+}
+
+/// Admins that can still sign in. The workspace must always keep one.
+pub async fn count_active_admins(conn: &Conn) -> anyhow::Result<i64> {
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL",
+            &[],
+        )
+        .await?;
+    rows.first().map(|row| int_at(row, 0)).unwrap_or(Ok(0))
+}
+
+pub async fn set_user_role(conn: &Conn, id: &str, role: Role) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO sessions (token, user_id, expires_at) VALUES (?1, ?2, ?3)",
-        &[text(token), text(user_id), text(expires_at)],
+        "UPDATE users SET role = ?1 WHERE id = ?2",
+        &[text(role.as_str()), text(id)],
     )
     .await?;
     Ok(())
 }
 
-pub async fn find_session(conn: &Conn, token: &str) -> anyhow::Result<Option<SessionRecord>> {
+pub async fn set_user_disabled(
+    conn: &Conn,
+    id: &str,
+    disabled_at: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE users SET disabled_at = ?1 WHERE id = ?2",
+        &[disabled_at.map(text).unwrap_or(SqlValue::Null), text(id)],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn set_password_hash(conn: &Conn, id: &str, password_hash: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+        &[text(password_hash), text(id)],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn insert_session(
+    conn: &Conn,
+    token_hash: &str,
+    user_id: &str,
+    created_at: &str,
+    expires_at: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        &[
+            text(token_hash),
+            text(user_id),
+            text(created_at),
+            text(expires_at),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Finds a session whose account is still enabled.
+pub async fn find_session(conn: &Conn, token_hash: &str) -> anyhow::Result<Option<SessionRecord>> {
     let rows = conn
         .query(
-            "SELECT s.user_id, s.expires_at, u.email, u.handle
-             FROM sessions s JOIN users u ON u.id = s.user_id
-             WHERE s.token = ?1",
-            &[text(token)],
+            "SELECT s.user_id, s.expires_at, u.email, u.handle, u.role
+             FROM auth_sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1 AND u.disabled_at IS NULL",
+            &[text(token_hash)],
         )
         .await?;
     optional_row(rows, |row| {
@@ -99,16 +198,150 @@ pub async fn find_session(conn: &Conn, token: &str) -> anyhow::Result<Option<Ses
             expires_at: text_at(row, 1)?,
             email: text_at(row, 2)?,
             handle: text_at(row, 3)?,
+            role: role_at(row, 4)?,
         })
     })
 }
 
-pub async fn delete_session(conn: &Conn, token: &str) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM sessions WHERE token = ?1", &[text(token)])
-        .await?;
+pub async fn delete_session(conn: &Conn, token_hash: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM auth_sessions WHERE token_hash = ?1",
+        &[text(token_hash)],
+    )
+    .await?;
     Ok(())
 }
 
+/// Ends every session of a user except `keep`, if given.
+pub async fn delete_user_sessions(
+    conn: &Conn,
+    user_id: &str,
+    keep: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM auth_sessions WHERE user_id = ?1 AND (?2 IS NULL OR token_hash <> ?2)",
+        &[text(user_id), keep.map(text).unwrap_or(SqlValue::Null)],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Removes expired sessions and account links. Timestamps share one
+/// fixed-width UTC format, so text comparison orders them correctly.
+pub async fn purge_expired(conn: &Conn, now: &str) -> anyhow::Result<u64> {
+    let sessions = conn
+        .execute(
+            "DELETE FROM auth_sessions WHERE expires_at < ?1",
+            &[text(now)],
+        )
+        .await?;
+    let links = conn
+        .execute(
+            "DELETE FROM account_links WHERE expires_at < ?1",
+            &[text(now)],
+        )
+        .await?;
+    Ok(sessions + links)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_link(
+    conn: &Conn,
+    id: &str,
+    token_hash: &str,
+    purpose: LinkPurpose,
+    email: &str,
+    role: Role,
+    user_id: Option<&str>,
+    created_by: &str,
+    created_at: &str,
+    expires_at: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO account_links
+         (id, token_hash, purpose, email, role, user_id, created_by, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        &[
+            text(id),
+            text(token_hash),
+            text(purpose_str(purpose)),
+            text(email),
+            text(role.as_str()),
+            user_id.map(text).unwrap_or(SqlValue::Null),
+            text(created_by),
+            text(created_at),
+            text(expires_at),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn find_link(conn: &Conn, token_hash: &str) -> anyhow::Result<Option<LinkRecord>> {
+    let rows = conn
+        .query(
+            "SELECT id, purpose, email, role, user_id, expires_at
+             FROM account_links WHERE token_hash = ?1",
+            &[text(token_hash)],
+        )
+        .await?;
+    optional_row(rows, |row| {
+        Ok(LinkRecord {
+            id: text_at(row, 0)?,
+            purpose: purpose_at(row, 1)?,
+            email: text_at(row, 2)?,
+            role: role_at(row, 3)?,
+            user_id: opt_text_at(row, 4)?,
+            expires_at: text_at(row, 5)?,
+        })
+    })
+}
+
+pub async fn list_links(conn: &Conn, now: &str) -> anyhow::Result<Vec<InviteView>> {
+    let rows = conn
+        .query(
+            "SELECT id, purpose, email, role, created_at, expires_at
+             FROM account_links WHERE expires_at >= ?1
+             ORDER BY created_at DESC, id DESC",
+            &[text(now)],
+        )
+        .await?;
+    rows.iter().map(link_view_from_row).collect()
+}
+
+pub async fn find_link_view(conn: &Conn, id: &str) -> anyhow::Result<Option<InviteView>> {
+    let rows = conn
+        .query(
+            "SELECT id, purpose, email, role, created_at, expires_at
+             FROM account_links WHERE id = ?1",
+            &[text(id)],
+        )
+        .await?;
+    optional_row(rows, link_view_from_row)
+}
+
+pub async fn delete_link(conn: &Conn, id: &str) -> anyhow::Result<bool> {
+    let changed = conn
+        .execute("DELETE FROM account_links WHERE id = ?1", &[text(id)])
+        .await?;
+    Ok(changed > 0)
+}
+
+/// A newer invite or reset for the same address replaces older ones.
+pub async fn delete_links_for_email(
+    conn: &Conn,
+    email: &str,
+    purpose: LinkPurpose,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM account_links WHERE email = ?1 AND purpose = ?2",
+        &[text(email), text(purpose_str(purpose))],
+    )
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_api_key(
     conn: &Conn,
     id: &str,
@@ -117,11 +350,12 @@ pub async fn insert_api_key(
     prefix: &str,
     key_hash: &str,
     collection_id: Option<&str>,
+    role: Role,
     created_at: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash, collection_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash, collection_id, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         &[
             text(id),
             text(user_id),
@@ -129,6 +363,7 @@ pub async fn insert_api_key(
             text(prefix),
             text(key_hash),
             collection_id.map(text).unwrap_or(SqlValue::Null),
+            text(role.as_str()),
             text(created_at),
         ],
     )
@@ -139,7 +374,7 @@ pub async fn insert_api_key(
 pub async fn list_api_keys(conn: &Conn, user_id: &str) -> anyhow::Result<Vec<ApiKeyView>> {
     let rows = conn
         .query(
-            "SELECT id, name, key_prefix, collection_id, created_at
+            "SELECT id, name, key_prefix, collection_id, role, created_at
              FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC, id DESC",
             &[text(user_id)],
         )
@@ -151,18 +386,20 @@ pub async fn list_api_keys(conn: &Conn, user_id: &str) -> anyhow::Result<Vec<Api
                 name: text_at(row, 1)?,
                 prefix: text_at(row, 2)?,
                 collection_id: opt_text_at(row, 3)?,
-                created_at: text_at(row, 4)?,
+                role: role_at(row, 4)?,
+                created_at: text_at(row, 5)?,
             })
         })
         .collect()
 }
 
+/// Finds a key whose owner is still enabled.
 pub async fn find_api_key(conn: &Conn, key_hash: &str) -> anyhow::Result<Option<ApiKeyRecord>> {
     let rows = conn
         .query(
-            "SELECT k.user_id, k.collection_id, u.email, u.handle
+            "SELECT k.user_id, k.collection_id, u.email, u.handle, u.role, k.role
              FROM api_keys k JOIN users u ON u.id = k.user_id
-             WHERE k.key_hash = ?1",
+             WHERE k.key_hash = ?1 AND u.disabled_at IS NULL",
             &[text(key_hash)],
         )
         .await?;
@@ -172,6 +409,8 @@ pub async fn find_api_key(conn: &Conn, key_hash: &str) -> anyhow::Result<Option<
             collection_id: opt_text_at(row, 1)?,
             email: text_at(row, 2)?,
             handle: text_at(row, 3)?,
+            user_role: role_at(row, 4)?,
+            key_role: role_at(row, 5)?,
         })
     })
 }
@@ -186,10 +425,11 @@ pub async fn delete_api_key(conn: &Conn, user_id: &str, id: &str) -> anyhow::Res
     Ok(changed > 0)
 }
 
+/// `created_by` is recorded for audit only; collections belong to the workspace.
 pub async fn insert_collection(
     conn: &Conn,
     id: &str,
-    owner_id: &str,
+    created_by: &str,
     name: &str,
     visibility: Visibility,
     blueprint: &Blueprint,
@@ -200,7 +440,7 @@ pub async fn insert_collection(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         &[
             text(id),
-            text(owner_id),
+            text(created_by),
             text(name),
             text(visibility_str(visibility)),
             text(&serde_json::to_string(blueprint)?),
@@ -214,7 +454,6 @@ pub async fn insert_collection(
 
 pub async fn update_collection(
     conn: &Conn,
-    owner_id: &str,
     id: &str,
     name: &str,
     visibility: Visibility,
@@ -224,14 +463,13 @@ pub async fn update_collection(
     conn.execute(
         "UPDATE collections
          SET name = ?1, visibility = ?2, blueprint = ?3, updated_at = ?4
-         WHERE id = ?5 AND owner_id = ?6",
+         WHERE id = ?5",
         &[
             text(name),
             text(visibility_str(visibility)),
             text(&serde_json::to_string(blueprint)?),
             text(updated_at),
             text(id),
-            text(owner_id),
         ],
     )
     .await?;
@@ -239,29 +477,24 @@ pub async fn update_collection(
     Ok(())
 }
 
-pub async fn delete_collection(conn: &Conn, owner_id: &str, id: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "DELETE FROM collections WHERE id = ?1 AND owner_id = ?2",
-        &[text(id), text(owner_id)],
-    )
-    .await?;
+pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM collections WHERE id = ?1", &[text(id)])
+        .await?;
     Ok(())
 }
 
 pub async fn list_collections(
     conn: &Conn,
-    owner_id: &str,
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<CollectionView>> {
     let rows = conn
         .query(
             "SELECT id, name, visibility, blueprint, created_at, updated_at
-             FROM collections WHERE owner_id = ?1
+             FROM collections
              ORDER BY created_at DESC, id DESC
-             LIMIT ?2 OFFSET ?3",
+             LIMIT ?1 OFFSET ?2",
             &[
-                text(owner_id),
                 SqlValue::Integer(limit as i64),
                 SqlValue::Integer(offset as i64),
             ],
@@ -270,16 +503,12 @@ pub async fn list_collections(
     rows.iter().map(collection_from_row).collect()
 }
 
-pub async fn find_collection(
-    conn: &Conn,
-    owner_id: &str,
-    id: &str,
-) -> anyhow::Result<Option<CollectionView>> {
+pub async fn find_collection(conn: &Conn, id: &str) -> anyhow::Result<Option<CollectionView>> {
     let rows = conn
         .query(
             "SELECT id, name, visibility, blueprint, created_at, updated_at
-             FROM collections WHERE id = ?1 AND owner_id = ?2",
-            &[text(id), text(owner_id)],
+             FROM collections WHERE id = ?1",
+            &[text(id)],
         )
         .await?;
     optional_row(rows, |row| collection_from_row(row))
@@ -287,14 +516,13 @@ pub async fn find_collection(
 
 pub async fn find_collection_by_name(
     conn: &Conn,
-    owner_id: &str,
     name: &str,
 ) -> anyhow::Result<Option<CollectionView>> {
     let rows = conn
         .query(
             "SELECT id, name, visibility, blueprint, created_at, updated_at
-             FROM collections WHERE owner_id = ?1 AND name = ?2",
-            &[text(owner_id), text(name)],
+             FROM collections WHERE name = ?1",
+            &[text(name)],
         )
         .await?;
     optional_row(rows, |row| collection_from_row(row))
@@ -429,7 +657,7 @@ pub async fn delete_document(conn: &Conn, collection_id: &str, id: &str) -> anyh
 pub async fn insert_asset(
     conn: &Conn,
     id: &str,
-    owner_id: &str,
+    uploaded_by: &str,
     collection_id: &str,
     filename: &str,
     content_type: &str,
@@ -443,7 +671,7 @@ pub async fn insert_asset(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         &[
             text(id),
-            text(owner_id),
+            text(uploaded_by),
             text(collection_id),
             text(filename),
             text(content_type),
@@ -531,6 +759,39 @@ fn user_from_row(row: &SqlRow) -> anyhow::Result<UserRecord> {
         handle: text_at(row, 1)?,
         email: text_at(row, 2)?,
         password_hash: text_at(row, 3)?,
+        role: role_at(row, 4)?,
+        disabled: opt_text_at(row, 5)?.is_some(),
+    })
+}
+
+fn role_at(row: &SqlRow, index: usize) -> anyhow::Result<Role> {
+    let value = text_at(row, index)?;
+    Role::parse(&value).ok_or_else(|| anyhow::anyhow!("unknown role {value:?}"))
+}
+
+fn purpose_str(purpose: LinkPurpose) -> &'static str {
+    match purpose {
+        LinkPurpose::Invite => "invite",
+        LinkPurpose::Reset => "reset",
+    }
+}
+
+fn purpose_at(row: &SqlRow, index: usize) -> anyhow::Result<LinkPurpose> {
+    match text_at(row, index)?.as_str() {
+        "invite" => Ok(LinkPurpose::Invite),
+        "reset" => Ok(LinkPurpose::Reset),
+        other => anyhow::bail!("unknown link purpose {other:?}"),
+    }
+}
+
+fn link_view_from_row(row: &SqlRow) -> anyhow::Result<InviteView> {
+    Ok(InviteView {
+        id: text_at(row, 0)?,
+        purpose: purpose_at(row, 1)?,
+        email: text_at(row, 2)?,
+        role: role_at(row, 3)?,
+        created_at: text_at(row, 4)?,
+        expires_at: text_at(row, 5)?,
     })
 }
 

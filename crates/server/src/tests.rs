@@ -6,8 +6,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use vulse_model::{
-    ApiErrorBody, ApiKeyView, AssetView, CollectionView, CreatedApiKey, DocumentView, Page,
-    UserView,
+    ApiErrorBody, ApiKeyView, AssetView, CollectionView, CreatedApiKey, CreatedInvite,
+    DocumentView, ManagedUser, Page, Role, UserView,
 };
 
 use crate::app;
@@ -15,17 +15,25 @@ use crate::app;
 struct TestApp {
     app: axum::Router,
     asset_dir: std::path::PathBuf,
+    db: crate::db::Db,
+    /// Session of the first admin, created on the first `register` call.
+    admin: tokio::sync::Mutex<Option<String>>,
     _dir: tempfile::TempDir,
 }
 
 impl TestApp {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let asset_dir = dir.path().join("assets");
         let state = crate::test_state(dir.path().to_path_buf()).await.unwrap();
+        Self::with_state(state, dir)
+    }
+
+    fn with_state(state: crate::state::AppState, dir: tempfile::TempDir) -> Self {
         Self {
+            asset_dir: dir.path().join("assets"),
+            db: state.db.clone(),
             app: app(state),
-            asset_dir,
+            admin: tokio::sync::Mutex::new(None),
             _dir: dir,
         }
     }
@@ -38,7 +46,22 @@ impl TestApp {
         bearer: Option<&str>,
         body: Option<Value>,
     ) -> axum::response::Response {
+        self.call_with(method, uri, cookie, bearer, body, &[]).await
+    }
+
+    async fn call_with(
+        &self,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        bearer: Option<&str>,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
         let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
         if body.is_some() {
             builder = builder.header("content-type", "application/json");
         }
@@ -84,20 +107,99 @@ fn session_of(response: &axum::response::Response) -> String {
         .to_string()
 }
 
+/// The first account becomes the admin through setup. Later accounts are
+/// invited as admins, so each test can manage its own collections.
 async fn register(app: &TestApp, email: &str, handle: &str) -> (String, UserView) {
-    let response = app
-        .call(
+    let mut admin = app.admin.lock().await;
+    if admin.is_none() {
+        let response = app
+            .call(
+                "POST",
+                "/api/v1/auth/setup",
+                None,
+                None,
+                Some(json!({"token": crate::TEST_SETUP_TOKEN, "email": email, "handle": handle, "password": "password123"})),
+            )
+            .await;
+        let cookie = session_of(&response);
+        let (status, user) = json_of::<UserView>(response).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(user.role, Role::Admin);
+        *admin = Some(cookie.clone());
+        return (cookie, user);
+    }
+    let admin = admin.clone().unwrap();
+    invite_and_accept(app, &admin, email, handle, Role::Admin).await
+}
+
+async fn register_as(app: &TestApp, email: &str, handle: &str, role: Role) -> (String, UserView) {
+    let admin = app
+        .admin
+        .lock()
+        .await
+        .clone()
+        .expect("register an admin first");
+    invite_and_accept(app, &admin, email, handle, role).await
+}
+
+async fn invite(app: &TestApp, admin: &str, email: &str, role: Role) -> CreatedInvite {
+    let (status, invite) = json_of::<CreatedInvite>(
+        app.call(
             "POST",
-            "/api/v1/auth/register",
+            "/api/v1/invites",
+            Some(admin),
             None,
-            None,
-            Some(json!({"email": email, "handle": handle, "password": "password123"})),
+            Some(json!({"email": email, "role": role})),
         )
-        .await;
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(invite.path, format!("/accept#token={}", invite.token));
+    invite
+}
+
+async fn accept(
+    app: &TestApp,
+    token: &str,
+    handle: Option<&str>,
+    password: &str,
+) -> axum::response::Response {
+    app.call(
+        "POST",
+        "/api/v1/auth/links/accept",
+        None,
+        None,
+        Some(json!({"token": token, "handle": handle, "password": password})),
+    )
+    .await
+}
+
+async fn invite_and_accept(
+    app: &TestApp,
+    admin: &str,
+    email: &str,
+    handle: &str,
+    role: Role,
+) -> (String, UserView) {
+    let invite = invite(app, admin, email, role).await;
+    let response = accept(app, &invite.token, Some(handle), "password123").await;
     let cookie = session_of(&response);
     let (status, user) = json_of::<UserView>(response).await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(user.role, role);
     (cookie, user)
+}
+
+async fn login(app: &TestApp, email: &str, password: &str) -> axum::response::Response {
+    app.call(
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        None,
+        Some(json!({"email": email, "password": password})),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -150,10 +252,10 @@ async fn session_and_api_keys() {
     let duplicate = app
         .call(
             "POST",
-            "/api/v1/auth/register",
+            "/api/v1/invites",
+            Some(&cookie),
             None,
-            None,
-            Some(json!({"email": "ada@example.com", "handle": "other", "password": "password123"})),
+            Some(json!({"email": "ada@example.com", "role": "editor"})),
         )
         .await;
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
@@ -237,7 +339,7 @@ async fn collections_visibility_and_blueprint_rules() {
     let public_doc = app
         .call(
             "GET",
-            &format!("/api/v1/public/ada/posts/{}", post.id),
+            &format!("/api/v1/public/posts/{}", post.id),
             None,
             None,
             None,
@@ -270,30 +372,31 @@ async fn collections_visibility_and_blueprint_rules() {
     )
     .await;
     let hidden = app
-        .call("GET", "/api/v1/public/ada/secrets", None, None, None)
+        .call("GET", "/api/v1/public/secrets", None, None, None)
         .await;
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
     let bytes = hidden.into_body().collect().await.unwrap().to_bytes();
     assert!(!String::from_utf8_lossy(&bytes).contains("top-secret-phrase"));
     assert_eq!(
-        app.call("GET", "/api/v1/public/ada/missing", None, None, None)
+        app.call("GET", "/api/v1/public/missing", None, None, None)
             .await
             .status(),
         StatusCode::NOT_FOUND
     );
 
-    let (_other_cookie, _) = register(&app, "grace@example.com", "grace").await;
+    // Private collections are shared with every workspace member.
+    let (viewer, _) = register_as(&app, "grace@example.com", "grace", Role::Viewer).await;
     assert_eq!(
         app.call(
             "GET",
             &format!("/api/v1/collections/{}", secrets.id),
-            Some(&_other_cookie),
+            Some(&viewer),
             None,
             None
         )
         .await
         .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
 
     let scoped = app
@@ -525,18 +628,18 @@ async fn patches_bulk_and_undo_are_atomic_and_conflict_aware() {
             .status(),
         StatusCode::CONFLICT
     );
-    let (other, _) = register(&app, "other-bulk@example.com", "otherbulk").await;
+    let (viewer, _) = register_as(&app, "other-bulk@example.com", "otherbulk", Role::Viewer).await;
     assert_eq!(
         app.call(
             "POST",
             &bulk,
-            Some(&other),
+            Some(&viewer),
             None,
             Some(json!({"action":"delete","ids":[first.id]}))
         )
         .await
         .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::FORBIDDEN
     );
 }
 
@@ -634,18 +737,32 @@ async fn saved_views_query_filter_sort_page_and_recalculate() {
     )
     .await;
     assert_eq!(seen, vec![saved.clone()]);
-    let (other, _) = register(&app, "other-views@example.com", "otherviews").await;
+    // Viewers can query and read saved views but not change them.
+    let (viewer, _) =
+        register_as(&app, "other-views@example.com", "otherviews", Role::Viewer).await;
     assert_eq!(
-        app.call("POST", &endpoint, Some(&other), None, Some(json!({})))
+        app.call("POST", &endpoint, Some(&viewer), None, Some(json!({})))
             .await
             .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     assert_eq!(
-        app.call("GET", &views, Some(&other), None, None)
+        app.call("GET", &views, Some(&viewer), None, None)
             .await
             .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            &views,
+            Some(&viewer),
+            None,
+            Some(json!({"name":"mine"}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
     );
     let mut blueprint = collection.blueprint.clone();
     blueprint.fields[3].formula = Some("=[price]*10".into());
@@ -724,7 +841,7 @@ async fn structured_portable_text_validates_nested_assets_and_public_round_trips
     let (_, public) = json_of::<DocumentView>(
         app.call(
             "GET",
-            &format!("/api/v1/public/blocks/articles/{}", document.id),
+            &format!("/api/v1/public/articles/{}", document.id),
             None,
             None,
             None,
@@ -833,7 +950,7 @@ async fn uploads_stay_inside_the_asset_directory() {
     let response = app
         .call(
             "GET",
-            &format!("/api/v1/public/ada/notes/assets/{}", asset.id),
+            &format!("/api/v1/public/notes/assets/{}", asset.id),
             None,
             None,
             None,
@@ -875,7 +992,7 @@ async fn uploads_stay_inside_the_asset_directory() {
     assert_eq!(
         app.call(
             "GET",
-            &format!("/api/v1/public/ada/secrets/assets/{}", private_asset.id),
+            &format!("/api/v1/public/secrets/assets/{}", private_asset.id),
             None,
             None,
             None
@@ -893,10 +1010,10 @@ async fn json_bodies_are_limited() {
     let response = app
         .call(
             "POST",
-            "/api/v1/auth/register",
+            "/api/v1/auth/login",
             None,
             None,
-            Some(json!({"email": huge, "handle": "ada", "password": "password123"})),
+            Some(json!({"email": huge, "password": "password123"})),
         )
         .await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -1056,7 +1173,7 @@ async fn calculated_fields_refresh_on_writes_schema_changes_and_public_reads() {
     let (status, public) = json_of::<DocumentView>(
         app.call(
             "GET",
-            &format!("/api/v1/public/calc/sales/{}", document.id),
+            &format!("/api/v1/public/sales/{}", document.id),
             None,
             None,
             None,
@@ -1210,12 +1327,12 @@ async fn imports_preview_validate_authorize_and_commit_atomically() {
             .status(),
         StatusCode::BAD_REQUEST
     );
-    let (other, _) = register(&app, "other@example.com", "other").await;
+    let (viewer, _) = register_as(&app, "other@example.com", "other", Role::Viewer).await;
     assert_eq!(
-        import_csv(&app, Some(&other), &c.id, csv, true, None)
+        import_csv(&app, Some(&viewer), &c.id, csv, true, None)
             .await
             .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::FORBIDDEN
     );
 }
 
@@ -1331,18 +1448,24 @@ async fn history_restore_deleted_records_and_schema_conflicts() {
         .status(),
         StatusCode::CONFLICT
     );
-    let (other, _) = register(&app, "historyother@example.com", "historyother").await;
+    let (viewer, _) = register_as(
+        &app,
+        "historyother@example.com",
+        "historyother",
+        Role::Viewer,
+    )
+    .await;
     assert_eq!(
         app.call(
             "GET",
             &format!("{endpoint}/revisions"),
-            Some(&other),
+            Some(&viewer),
             None,
             None
         )
         .await
         .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
 }
 
@@ -1725,18 +1848,19 @@ async fn upsert_imports_preview_counts_validate_keys_preserve_fields_and_export_
         .status(),
         StatusCode::BAD_REQUEST
     );
-    let (other, _) = register(&app, "upsertother@example.com", "upsertother").await;
+    let (viewer, _) =
+        register_as(&app, "upsertother@example.com", "upsertother", Role::Viewer).await;
     assert_eq!(
         app.call(
             "POST",
             &export,
-            Some(&other),
+            Some(&viewer),
             None,
             Some(json!({"format":"csv","columns":["sku"]}))
         )
         .await
         .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     // Numeric matching is canonical, while integers above 2^53 remain distinct.
     let nums = create_collection(
@@ -1783,24 +1907,15 @@ async fn authentication_work_is_bounded_and_releases_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let state = crate::test_state(dir.path().to_path_buf()).await.unwrap();
     let semaphore = state.password_work.clone();
+    let app = TestApp::with_state(state, dir);
+    register(&app, "busy@example.com", "busy").await;
     let permit = semaphore.clone().acquire_many_owned(4).await.unwrap();
-    let app = TestApp {
-        app: app(state),
-        asset_dir: dir.path().join("assets"),
-        _dir: dir,
-    };
-    let response = app
-        .call(
-            "POST",
-            "/api/v1/auth/register",
-            None,
-            None,
-            Some(json!({"email":"busy@example.com","handle":"busy","password":"password123"})),
-        )
-        .await;
+    let response = login(&app, "busy@example.com", "password123").await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     drop(permit);
-    let (cookie, _) = register(&app, "busy@example.com", "busy").await;
+    let response = login(&app, "busy@example.com", "password123").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_of(&response);
     assert_eq!(semaphore.available_permits(), 4);
     assert_eq!(
         app.call("GET", "/api/v1/me", Some(&cookie), None, None)
@@ -1809,18 +1924,728 @@ async fn authentication_work_is_bounded_and_releases_capacity() {
         StatusCode::OK
     );
     assert_eq!(
-        app.call(
-            "POST",
-            "/api/v1/auth/login",
-            None,
-            None,
-            Some(json!({"email":"busy@example.com","password":"wrongpassword"}))
-        )
-        .await
-        .status(),
+        login(&app, "busy@example.com", "wrongpassword")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(&app, "nobody@example.com", "wrongpassword")
+            .await
+            .status(),
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(semaphore.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn setup_creates_one_admin_with_the_token() {
+    let app = TestApp::new().await;
+    let (_, status) = json_of::<vulse_model::SetupStatus>(
+        app.call("GET", "/api/v1/auth/setup", None, None, None)
+            .await,
+    )
+    .await;
+    assert!(status.needs_setup);
+    let wrong = app
+        .call(
+            "POST",
+            "/api/v1/auth/setup",
+            None,
+            None,
+            Some(json!({"token":"wrong","email":"eve@example.com","handle":"eve","password":"password123"})),
+        )
+        .await;
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        app.call("POST", "/api/v1/auth/register", None, None, Some(json!({})))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let (admin, user) = register(&app, "ada@example.com", "ada").await;
+    assert_eq!(user.role, Role::Admin);
+    let again = app
+        .call(
+            "POST",
+            "/api/v1/auth/setup",
+            None,
+            None,
+            Some(json!({"token":crate::TEST_SETUP_TOKEN,"email":"eve@example.com","handle":"eve","password":"password123"})),
+        )
+        .await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+    let (_, status) = json_of::<vulse_model::SetupStatus>(
+        app.call("GET", "/api/v1/auth/setup", None, None, None)
+            .await,
+    )
+    .await;
+    assert!(!status.needs_setup);
+
+    // Sessions are stored as hashes, never as the cookie value.
+    let conn = app.db.connect().await.unwrap();
+    let rows = conn
+        .query("SELECT token_hash FROM auth_sessions", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let stored = crate::db::text_at(&rows[0], 0).unwrap();
+    assert_ne!(stored, admin);
+    assert_eq!(stored, crate::auth::hash_secret(&admin));
+}
+
+#[tokio::test]
+async fn invites_are_single_use_and_admin_only() {
+    let app = TestApp::new().await;
+    let (admin, _) = register(&app, "ada@example.com", "ada").await;
+    let created = invite(&app, &admin, "Grace@Example.com", Role::Editor).await;
+    assert_eq!(created.invite.email, "grace@example.com");
+    let (status, invites) = json_of::<Vec<vulse_model::InviteView>>(
+        app.call("GET", "/api/v1/invites", Some(&admin), None, None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(invites.len(), 1);
+    assert!(!format!("{invites:?}").contains(&created.token));
+
+    let (status, info) = json_of::<vulse_model::LinkInfo>(
+        app.call(
+            "POST",
+            "/api/v1/auth/links/inspect",
+            None,
+            None,
+            Some(json!({"token": created.token})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info.purpose, vulse_model::LinkPurpose::Invite);
+    assert_eq!(info.email, "grace@example.com");
+
+    assert_eq!(
+        accept(&app, &created.token, None, "password123")
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let response = accept(&app, &created.token, Some("grace"), "password123").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let editor = session_of(&response);
+    assert_eq!(
+        accept(&app, &created.token, Some("grace2"), "password123")
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Only admin sessions manage people; API keys never do.
+    assert_eq!(
+        app.call("GET", "/api/v1/users", Some(&editor), None, None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&admin),
+            None,
+            Some(json!({"name":"admin key"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(key.key.role, Role::Admin);
+    assert_eq!(
+        app.call(
+            "POST",
+            "/api/v1/invites",
+            None,
+            Some(&key.secret),
+            Some(json!({"email":"x@example.com","role":"viewer"}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A replaced or revoked invite stops working.
+    let first = invite(&app, &admin, "linus@example.com", Role::Viewer).await;
+    let second = invite(&app, &admin, "linus@example.com", Role::Viewer).await;
+    assert_eq!(
+        accept(&app, &first.token, Some("linus"), "password123")
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.call(
+            "DELETE",
+            &format!("/api/v1/invites/{}", second.invite.id),
+            Some(&admin),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        accept(&app, &second.token, Some("linus"), "password123")
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn roles_limit_reads_writes_and_schema_changes() {
+    let app = TestApp::new().await;
+    let (admin, _) = register(&app, "ada@example.com", "ada").await;
+    let (editor, _) = register_as(&app, "ed@example.com", "ed", Role::Editor).await;
+    let (viewer, _) = register_as(&app, "vi@example.com", "vi", Role::Viewer).await;
+    let posts = create_collection(
+        &app,
+        &admin,
+        "posts",
+        "private",
+        json!({"fields":[{"name":"title","type":"string"}]}),
+    )
+    .await;
+    let documents = format!("/api/v1/collections/{}/documents", posts.id);
+    let schema = json!({"name":"drafts","visibility":"private","blueprint":{"fields":[]}});
+
+    for cookie in [&admin, &editor, &viewer] {
+        assert_eq!(
+            app.call("GET", &documents, Some(cookie), None, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        app.call(
+            "POST",
+            &documents,
+            Some(&viewer),
+            None,
+            Some(json!({"body":{"title":"No"}}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let doc = create_document(&app, &editor, &posts.id, json!({"title":"Yes"})).await;
+    assert_eq!(
+        app.call(
+            "DELETE",
+            &format!("{documents}/{}", doc.id),
+            Some(&viewer),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    for cookie in [&editor, &viewer] {
+        assert_eq!(
+            app.call(
+                "POST",
+                "/api/v1/collections",
+                Some(cookie),
+                None,
+                Some(schema.clone())
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.call(
+                "DELETE",
+                &format!("/api/v1/collections/{}", posts.id),
+                Some(cookie),
+                None,
+                None
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    // Collection names are unique across the workspace.
+    let duplicate = app
+        .call(
+            "POST",
+            "/api/v1/collections",
+            Some(&admin),
+            None,
+            Some(json!({"name":"posts","visibility":"private","blueprint":{"fields":[]}})),
+        )
+        .await;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    // A key cannot exceed its creator, and follows the creator's current role.
+    assert_eq!(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&editor),
+            None,
+            Some(json!({"name":"too much","role":"admin"}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&editor),
+            None,
+            Some(json!({"name":"site"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(key.key.role, Role::Editor);
+    let (_, read_key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&editor),
+            None,
+            Some(json!({"name":"read","role":"viewer"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        app.call(
+            "POST",
+            &documents,
+            None,
+            Some(&read_key.secret),
+            Some(json!({"body":{"title":"No"}}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    create_document_with_key(&app, &key.secret, &posts.id).await;
+    let editor_id = user_id(&app, &admin, "ed@example.com").await;
+    let (status, _) = json_of::<ManagedUser>(
+        app.call(
+            "PATCH",
+            &format!("/api/v1/users/{editor_id}"),
+            Some(&admin),
+            None,
+            Some(json!({"role":"viewer"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, me) = json_of::<UserView>(
+        app.call("GET", "/api/v1/me", None, Some(&key.secret), None)
+            .await,
+    )
+    .await;
+    assert_eq!(me.role, Role::Viewer);
+    assert_eq!(
+        app.call(
+            "POST",
+            &documents,
+            None,
+            Some(&key.secret),
+            Some(json!({"body":{"title":"No"}}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+async fn create_document_with_key(app: &TestApp, secret: &str, collection: &str) {
+    assert_eq!(
+        app.call(
+            "POST",
+            &format!("/api/v1/collections/{collection}/documents"),
+            None,
+            Some(secret),
+            Some(json!({"body":{"title":"From key"}}))
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+}
+
+async fn user_id(app: &TestApp, admin: &str, email: &str) -> String {
+    let (_, users) = json_of::<Vec<ManagedUser>>(
+        app.call("GET", "/api/v1/users", Some(admin), None, None)
+            .await,
+    )
+    .await;
+    users
+        .into_iter()
+        .find(|user| user.email == email)
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn disabling_ends_access_and_one_admin_remains() {
+    let app = TestApp::new().await;
+    let (admin, admin_user) = register(&app, "ada@example.com", "ada").await;
+    let (editor, editor_user) = register_as(&app, "ed@example.com", "ed", Role::Editor).await;
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&editor),
+            None,
+            Some(json!({"name":"site"})),
+        )
+        .await,
+    )
+    .await;
+    let update = |id: String, body: Value| {
+        let admin = admin.clone();
+        let app = &app;
+        async move {
+            app.call(
+                "PATCH",
+                &format!("/api/v1/users/{id}"),
+                Some(&admin),
+                None,
+                Some(body),
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(
+        update(editor_user.id.clone(), json!({"disabled":true})).await,
+        StatusCode::OK
+    );
+    for (cookie, bearer) in [
+        (Some(editor.as_str()), None),
+        (None, Some(key.secret.as_str())),
+    ] {
+        assert_eq!(
+            app.call("GET", "/api/v1/me", cookie, bearer, None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        login(&app, "ed@example.com", "password123").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        update(editor_user.id.clone(), json!({"disabled":false})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call("GET", "/api/v1/me", None, Some(&key.secret), None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        update(admin_user.id.clone(), json!({"role":"editor"})).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        update(admin_user.id.clone(), json!({"disabled":true})).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        update(editor_user.id.clone(), json!({"role":"admin"})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        update(admin_user.id.clone(), json!({"role":"viewer"})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call("GET", "/api/v1/users", Some(&admin), None, None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn passwords_change_reset_and_end_other_sessions() {
+    let app = TestApp::new().await;
+    let (admin, _) = register(&app, "ada@example.com", "ada").await;
+    let (first, user) = register_as(&app, "ed@example.com", "ed", Role::Editor).await;
+    let second = session_of(&login(&app, "ed@example.com", "password123").await);
+
+    let change = |cookie: String, current: &'static str| {
+        let app = &app;
+        async move {
+            app.call(
+                "POST",
+                "/api/v1/auth/password",
+                Some(&cookie),
+                None,
+                Some(json!({"current_password": current, "new_password": "new-password-1"})),
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(
+        change(first.clone(), "wrong-password").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        change(first.clone(), "password123").await,
+        StatusCode::NO_CONTENT
+    );
+    let me = |cookie: String| {
+        let app = &app;
+        async move {
+            app.call("GET", "/api/v1/me", Some(&cookie), None, None)
+                .await
+                .status()
+        }
+    };
+    assert_eq!(me(first.clone()).await, StatusCode::OK);
+    assert_eq!(me(second.clone()).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        login(&app, "ed@example.com", "password123").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // An admin reset link sets a new password and signs out everywhere.
+    let (status, reset) = json_of::<CreatedInvite>(
+        app.call(
+            "POST",
+            &format!("/api/v1/users/{}/password-reset", user.id),
+            Some(&admin),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(reset.invite.purpose, vulse_model::LinkPurpose::Reset);
+    let response = accept(&app, &reset.token, None, "reset-password-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let third = session_of(&response);
+    assert_eq!(me(first.clone()).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(third.clone()).await, StatusCode::OK);
+    assert_eq!(
+        login(&app, "ed@example.com", "reset-password-1")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        app.call(
+            "POST",
+            "/api/v1/auth/logout-everywhere",
+            Some(&third),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(me(third).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn failed_sign_ins_are_throttled_per_account() {
+    let app = TestApp::new().await;
+    register(&app, "ada@example.com", "ada").await;
+    for _ in 0..crate::security::ACCOUNT_LIMIT {
+        assert_eq!(
+            login(&app, "ada@example.com", "wrong-password")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let blocked = login(&app, "ada@example.com", "password123").await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = blocked
+        .headers()
+        .get("retry-after")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry > 0 && retry <= crate::security::WINDOW.as_secs());
+    // Unknown accounts are counted the same way.
+    for _ in 0..crate::security::ACCOUNT_LIMIT {
+        login(&app, "ghost@example.com", "wrong-password").await;
+    }
+    assert_eq!(
+        login(&app, "ghost@example.com", "wrong-password")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn cross_site_cookie_writes_are_rejected() {
+    let app = TestApp::new().await;
+    let (admin, _) = register(&app, "ada@example.com", "ada").await;
+    let body = json!({"name":"notes","visibility":"private","blueprint":{"fields":[]}});
+    for headers in [
+        vec![("sec-fetch-site", "cross-site")],
+        vec![("sec-fetch-site", "same-site")],
+        vec![("origin", "https://evil.example"), ("host", "cms.example")],
+        vec![("origin", "null"), ("host", "cms.example")],
+    ] {
+        assert_eq!(
+            app.call_with(
+                "POST",
+                "/api/v1/collections",
+                Some(&admin),
+                None,
+                Some(body.clone()),
+                &headers
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "{headers:?}"
+        );
+    }
+    // Reads, same-origin writes and bearer requests are unaffected.
+    assert_eq!(
+        app.call_with(
+            "GET",
+            "/api/v1/me",
+            Some(&admin),
+            None,
+            None,
+            &[("sec-fetch-site", "cross-site")]
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call_with(
+            "POST",
+            "/api/v1/collections",
+            Some(&admin),
+            None,
+            Some(body),
+            &[("origin", "http://cms.example"), ("host", "cms.example")]
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&admin),
+            None,
+            Some(json!({"name":"site"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        app.call_with(
+            "POST",
+            "/api/v1/collections",
+            None,
+            Some(&key.secret),
+            Some(json!({"name":"other","visibility":"private","blueprint":{"fields":[]}})),
+            &[("sec-fetch-site", "cross-site")]
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn secure_cookies_use_the_host_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = crate::test_state(dir.path().to_path_buf()).await.unwrap();
+    state.auth = std::sync::Arc::new(crate::state::AuthSettings {
+        cookie_secure: true,
+        setup_token_hash: state.auth.setup_token_hash.clone(),
+        trust_proxy: false,
+        public_origin: None,
+        password_wait: state.auth.password_wait,
+    });
+    let app = TestApp::with_state(state, dir);
+    let response = app
+        .call(
+            "POST",
+            "/api/v1/auth/setup",
+            None,
+            None,
+            Some(json!({"token": crate::TEST_SETUP_TOKEN, "email": "ada@example.com", "handle": "ada", "password": "password123"})),
+        )
+        .await;
+    let raw = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(raw.starts_with("__Host-vulse_session="));
+    assert!(raw.contains("; Secure"));
+    let token = raw
+        .split(';')
+        .next()
+        .unwrap()
+        .trim_start_matches("__Host-vulse_session=");
+    let me = Request::builder()
+        .uri("/api/v1/me")
+        .header("cookie", format!("__Host-vulse_session={token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.app.clone().oneshot(me).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn admin_pages_cannot_be_framed() {
+    let dir = tempfile::tempdir().unwrap();
+    let dist = dir.path().join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), "<html></html>").unwrap();
+    let mut state = crate::test_state(dir.path().to_path_buf()).await.unwrap();
+    state.web_dist = dist;
+    let app = TestApp::with_state(state, dir);
+    let page = app.call("GET", "/setup", None, None, None).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+    let api = app
+        .call("GET", "/api/v1/auth/setup", None, None, None)
+        .await;
+    assert!(api.headers().get("x-frame-options").is_none());
 }
 
 #[tokio::test]
@@ -1843,6 +2668,13 @@ async fn migrations_backfill_legacy_history_search_and_relationships() {
     ] {
         conn.execute("INSERT INTO documents(id,collection_id,body,created_at,updated_at) VALUES(?1,'collection',?2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",&[SqlValue::Text(id.into()),SqlValue::Text(body.to_string())]).await.unwrap();
     }
+    // A second account with the same collection name, plus a collection that
+    // references it, from when names were unique per account.
+    conn.execute("INSERT INTO users(id,handle,email,password_hash,created_at) VALUES('second','second','second@example.com','unused','2026-01-02T00:00:00Z')",&[]).await.unwrap();
+    conn.execute("INSERT INTO collections(id,owner_id,name,visibility,blueprint,created_at,updated_at) VALUES('second-nodes','second','nodes','private',?1,'2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",&[SqlValue::Text(blueprint.to_string())]).await.unwrap();
+    let linking = json!({"fields":[{"name":"node","type":"reference","collection":"nodes"}]});
+    conn.execute("INSERT INTO collections(id,owner_id,name,visibility,blueprint,created_at,updated_at) VALUES('second-links','second','links','private',?1,'2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')",&[SqlValue::Text(linking.to_string())]).await.unwrap();
+    conn.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES('plain','owner','2099-01-01T00:00:00Z')",&[]).await.unwrap();
     conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);INSERT INTO schema_migrations VALUES(1,'2026-01-01T00:00:00Z');").await.unwrap();
     crate::migrate::migrate(&conn).await.unwrap();
     crate::migrate::migrate(&conn).await.unwrap();
@@ -1859,7 +2691,7 @@ async fn migrations_backfill_legacy_history_search_and_relationships() {
         .unwrap();
     assert_eq!(history.len(), 2);
     assert!(history.iter().all(|r| text_at(r, 0).unwrap() == "baseline"));
-    let c = crate::store::find_collection(&conn, "owner", "collection")
+    let c = crate::store::find_collection(&conn, "collection")
         .await
         .unwrap()
         .unwrap();
@@ -1875,4 +2707,41 @@ async fn migrations_backfill_legacy_history_search_and_relationships() {
     .unwrap();
     assert_eq!(result.total, 1);
     assert_eq!(result.items[0].id, target);
+
+    // Existing accounts keep full control, and names are now workspace-wide.
+    let roles = conn
+        .query("SELECT DISTINCT role FROM users", &[])
+        .await
+        .unwrap();
+    assert_eq!(roles.len(), 1);
+    assert_eq!(text_at(&roles[0], 0).unwrap(), "admin");
+    let renamed = crate::store::find_collection(&conn, "second-nodes")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed.name, "nodes-second");
+    assert_eq!(
+        renamed.blueprint.fields[1].collection.as_deref(),
+        Some("nodes-second")
+    );
+    let links = crate::store::find_collection(&conn, "second-links")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        links.blueprint.fields[0].collection.as_deref(),
+        Some("nodes-second")
+    );
+    assert_eq!(c.name, "nodes");
+    assert_eq!(c.blueprint.fields[1].collection.as_deref(), Some("nodes"));
+    assert!(
+        conn.query("SELECT COUNT(*) FROM auth_sessions", &[])
+            .await
+            .is_ok()
+    );
+    assert!(
+        conn.query("SELECT COUNT(*) FROM sessions", &[])
+            .await
+            .is_err()
+    );
 }

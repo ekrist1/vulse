@@ -1,6 +1,6 @@
 use crate::{
-    auth::AuthUser,
-    content::{materialize, owned_collection},
+    auth::{AuthUser, Editor},
+    content::{materialize, workspace_collection},
     db::{Conn, SqlValue, int_at, text_at},
     error::{AppError, unique_message},
     state::AppState,
@@ -203,7 +203,7 @@ pub async fn query_records(
     Json(query): Json<RecordQuery>,
 ) -> Result<Json<RecordPage>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = owned_collection(&conn, &principal, &id).await?;
+    let collection = workspace_collection(&conn, &principal, &id).await?;
     Ok(Json(run_query(&conn, &collection, &query).await?))
 }
 pub async fn list_views(
@@ -212,7 +212,7 @@ pub async fn list_views(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<SavedView>>, AppError> {
     let conn = state.db.connect().await?;
-    owned_collection(&conn, &principal, &id).await?;
+    workspace_collection(&conn, &principal, &id).await?;
     let rows = conn
         .query(
             "SELECT id,config FROM collection_views WHERE collection_id=?1 ORDER BY name,id",
@@ -239,7 +239,7 @@ async fn write_view(
 ) -> Result<SavedView, AppError> {
     let conn = state.db.connect().await?;
     conn.with_app_tx(async |conn| {
-        let collection=owned_collection(conn,&principal,&id).await?;config.name=config.name.trim().into();config.query.offset=0;validate_view(&collection.blueprint,&config).map_err(AppError::bad)?;
+        let collection=workspace_collection(conn,&principal,&id).await?;config.name=config.name.trim().into();config.query.offset=0;validate_view(&collection.blueprint,&config).map_err(AppError::bad)?;
         let view=SavedView{id:view_id.clone().unwrap_or_else(crate::auth::new_id),config};
         let encoded=serde_json::to_string(&view.config).map_err(anyhow::Error::from)?;
         if view_id.is_some() {let changed=conn.execute("UPDATE collection_views SET name=?1,config=?2 WHERE id=?3 AND collection_id=?4",&[text(&view.config.name),text(&encoded),text(&view.id),text(&id)]).await.map_err(|e|unique_message(e,"a view with that name already exists"))?;if changed==0{return Err(AppError::NotFound);}}
@@ -249,7 +249,7 @@ async fn write_view(
 }
 pub async fn create_view(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path(id): Path<String>,
     Json(config): Json<SavedViewWrite>,
 ) -> Result<(StatusCode, Json<SavedView>), AppError> {
@@ -260,7 +260,7 @@ pub async fn create_view(
 }
 pub async fn update_view(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, view_id)): Path<(String, String)>,
     Json(config): Json<SavedViewWrite>,
 ) -> Result<Json<SavedView>, AppError> {
@@ -270,11 +270,11 @@ pub async fn update_view(
 }
 pub async fn delete_view(
     State(state): State<AppState>,
-    AuthUser(principal): AuthUser,
+    Editor(principal): Editor,
     Path((id, view_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let conn = state.db.connect().await?;
-    owned_collection(&conn, &principal, &id).await?;
+    workspace_collection(&conn, &principal, &id).await?;
     if conn
         .execute(
             "DELETE FROM collection_views WHERE id=?1 AND collection_id=?2",

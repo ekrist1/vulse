@@ -40,10 +40,22 @@ fn code_example(props: &CodeProps) -> Html {
     };
     html! {<div class="api-code"><div class="api-code-heading"><span>{props.title.clone()}</span><div class="row"><span role="status">{(*status).clone()}</span><button type="button" class="secondary" aria-label={format!("Copy {}",props.title)} onclick={copy}>{"Copy"}</button></div></div><pre><code>{props.text.clone()}</code></pre></div>}
 }
+/// Minimum role for an endpoint. Query and export are reads sent as POST.
+fn required_role(method: &str, url: &str, schema: bool) -> &'static str {
+    if schema {
+        "Admin, all collections"
+    } else if method == "GET" || url.ends_with("/query") || url.ends_with("/export") {
+        "Viewer"
+    } else if method.starts_with("GET") {
+        "Viewer reads, editor writes"
+    } else {
+        "Editor"
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct CollectionApiProps {
     pub collection: CollectionView,
-    pub handle: String,
 }
 fn sample_body(collection: &CollectionView) -> Value {
     let mut body = serde_json::Map::new();
@@ -117,10 +129,7 @@ pub fn collection_api(props: &CollectionApiProps) -> Html {
         updated_at: "2026-10-11T12:00:00Z".into(),
         calculation_errors: errors,
     };
-    let public = format!(
-        "{origin}/api/v1/public/{}/{}",
-        props.handle, collection.name
-    );
+    let public = format!("{origin}/api/v1/public/{}", collection.name);
     let endpoints = [
         ("GET", base.clone(), "Read collection schema", false),
         ("PATCH", base.clone(), "Change schema or settings", true),
@@ -249,8 +258,8 @@ pub fn collection_api(props: &CollectionApiProps) -> Html {
     );
     html! {<div class="api-panel">
       <div class="section-heading"><div><h2>{"Build with your collection"}</h2><p class="muted">{"Live endpoint details and examples based on your saved fields."}</p></div><span class="badge">{"REST · JSON · v1"}</span></div>
-      <section class="card api-auth"><h3>{"Authenticate your requests"}</h3><p>{"Create an API key, then send it in the Authorization header. A key scoped to this collection can read and write its records, assets, and imports. Schema and settings changes require an account-wide key."}</p><Link<Route> classes="button secondary" to={Route::Keys}>{"Manage API keys →"}</Link<Route>><CodeExample title="Authorization header" text={"Authorization: Bearer YOUR_API_KEY"}/><p class="muted">{"The app also accepts your signed-in session cookie on same-origin requests. Keep API keys on your server; public reads are available without a key when a collection is public."}</p></section>
-      <section class="card"><h3>{"Endpoints"}</h3><p class="muted">{"Replace DOCUMENT_ID and ASSET_ID with returned IDs. All endpoints below require authentication."}</p><div class="table-scroll"><table class="api-endpoints"><thead><tr><th>{"Method"}</th><th>{"Path"}</th><th>{"Purpose"}</th><th>{"Key access"}</th></tr></thead><tbody>{for endpoints.iter().map(|(method,url,description,account)|html!{<tr><td><span class={format!("api-method method-{}",method.to_lowercase())}>{*method}</span></td><td><code>{url.strip_prefix(&origin).unwrap_or(url)}</code></td><td>{*description}</td><td>{if *account{"Account-wide"}else{"Collection or account"}}</td></tr>})}</tbody></table></div></section>
+      <section class="card api-auth"><h3>{"Authenticate your requests"}</h3><p>{"Create an API key, then send it in the Authorization header. A key has a role no higher than yours: viewer keys read, editor keys also write records, assets and imports, and admin keys also change schemas. A key scoped to this collection cannot reach others, and schema changes need an admin key for all collections."}</p><Link<Route> classes="button secondary" to={Route::Keys}>{"Manage API keys →"}</Link<Route>><CodeExample title="Authorization header" text={"Authorization: Bearer YOUR_API_KEY"}/><p class="muted">{"The app also accepts your signed-in session cookie on same-origin requests. Keep API keys on your server; public reads are available without a key when a collection is public."}</p></section>
+      <section class="card"><h3>{"Endpoints"}</h3><p class="muted">{"Replace DOCUMENT_ID and ASSET_ID with returned IDs. All endpoints below require authentication."}</p><div class="table-scroll"><table class="api-endpoints"><thead><tr><th>{"Method"}</th><th>{"Path"}</th><th>{"Purpose"}</th><th>{"Minimum role"}</th></tr></thead><tbody>{for endpoints.iter().map(|(method,url,description,account)|html!{<tr><td><span class={format!("api-method method-{}",method.to_lowercase())}>{*method}</span></td><td><code>{url.strip_prefix(&origin).unwrap_or(url)}</code></td><td>{*description}</td><td>{required_role(method,url,*account)}</td></tr>})}</tbody></table></div></section>
       <section class="card"><h3>{"Read records"}</h3><p>{"Lists return items, limit, and offset. The default limit is 50; choose 1–100. Increase offset until a page returns fewer items than limit. There is no total count in the response."}</p>
         <CodeExample title="List request" text={curl("GET",&format!("{documents}?limit=50&offset=0"),None,true)}/>
         <CodeExample title="Example list response · 200" text={pretty(&json!({"items":[response.clone()],"limit":50,"offset":0}))}/>
@@ -283,7 +292,7 @@ pub fn collection_api(props: &CollectionApiProps) -> Html {
         if collection.visibility==Visibility::Public {<p>{"This collection is public. Anyone can read its records and asset content without authentication. Public endpoints support cross-origin GET requests."}</p><CodeExample title="Public list request" text={curl("GET",&format!("{public}?limit=50&offset=0"),None,false)}/><p>{"The response has the same paginated shape as the authenticated list."}</p><CodeExample title="Public record and asset URLs" text={format!("GET {public}/DOCUMENT_ID\nGET {public}/assets/ASSET_ID")}/>}
         else {<p>{"This collection is private. Public endpoints return 404. Change visibility in Settings if you want unauthenticated read access."}</p>}
       </section>
-      <section class="card"><h3>{"Validation and errors"}</h3><p>{"Send numbers and booleans as JSON values, references and assets as UUID strings, and rich text as Portable Text arrays. The editor uses Tiptap; the stored API format remains Portable Text."}</p><div class="table-scroll"><table><tbody>{for [("400","Invalid JSON, schema, fields, references, or query parameters"),("401","Missing or invalid credentials"),("403","API key scope does not permit this action"),("404","Collection, record, or asset not found or inaccessible"),("409","Stale edit, invalid schema change, blocked deletion or undo conflict"),("413","Request exceeds the upload or JSON size limit")].iter().map(|(code,description)|html!{<tr><th>{*code}</th><td>{*description}</td></tr>})}</tbody></table></div><CodeExample title="Example error response" text={pretty(&json!({"error":"Example validation message"}))}/><p class="muted">{"JSON writes are limited to 1 MB. A schema conflict can also include document_ids to identify incompatible records. Responses above are illustrative, generated from your current schema."}</p></section>
+      <section class="card"><h3>{"Validation and errors"}</h3><p>{"Send numbers and booleans as JSON values, references and assets as UUID strings, and rich text as Portable Text arrays. The editor uses Tiptap; the stored API format remains Portable Text."}</p><div class="table-scroll"><table><tbody>{for [("400","Invalid JSON, schema, fields, references, or query parameters"),("401","Missing or invalid credentials"),("403","Your role or the API key's role or scope does not permit this action, or a browser sent a cross-site request"),("404","Collection, record, or asset not found or inaccessible"),("409","Stale edit, invalid schema change, blocked deletion or undo conflict"),("413","Request exceeds the upload or JSON size limit")].iter().map(|(code,description)|html!{<tr><th>{*code}</th><td>{*description}</td></tr>})}</tbody></table></div><CodeExample title="Example error response" text={pretty(&json!({"error":"Example validation message"}))}/><p class="muted">{"JSON writes are limited to 1 MB. A schema conflict can also include document_ids to identify incompatible records. Responses above are illustrative, generated from your current schema."}</p></section>
     </div>}
 }
 

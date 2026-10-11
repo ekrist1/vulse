@@ -100,9 +100,10 @@ pub fn collections_page() -> Html {
     if let Some(redirect) = signed_out(&session) {
         return redirect;
     }
+    let is_admin = session.is_admin();
     html! {
         <Shell>
-            <div class="page-heading"><div><p class="eyebrow">{"YOUR WORKSPACE"}</p><h1>{"A home for your data."}</h1><p class="muted">{"Organize, calculate and create with collections."}</p></div><button onclick={Callback::from({let show_create=show_create.clone();move |_|show_create.set(!*show_create)})}>{if *show_create {"Close"}else{"+ New collection"}}</button></div>
+            <div class="page-heading"><div><p class="eyebrow">{"SHARED WORKSPACE"}</p><h1>{"A home for your data."}</h1><p class="muted">{"Organize, calculate and create with collections."}</p></div>if is_admin {<button onclick={Callback::from({let show_create=show_create.clone();move |_|show_create.set(!*show_create)})}>{if *show_create {"Close"}else{"+ New collection"}}</button>}</div>
             <div class="workspace-summary"><div><span class="summary-icon">{"▤"}</span><strong>{items.len()}</strong><span>{"Collections"}</span></div><div><span class="summary-icon">{"ƒx"}</span><strong>{items.iter().flat_map(|c|&c.blueprint.fields).filter(|f|f.kind==vulse_model::FieldType::Calculated).count()}</strong><span>{"Calculated fields"}</span></div><div><span class="summary-icon">{"↗"}</span><strong>{items.iter().filter(|c|c.visibility==Visibility::Public).count()}</strong><span>{"Public collections"}</span></div></div>
             if *show_create {<form class="card create-card" onsubmit={onsubmit}>
                 <h2>{"New collection"}</h2>
@@ -119,9 +120,10 @@ pub fn collections_page() -> Html {
                 <p class="muted">{"Use lowercase letters, numbers, hyphens or underscores. Add your fields after creating the collection."}</p><button type="submit" disabled={*busy}>{if *busy{"Creating…"}else{"Create collection →"}}</button>
             </form>}
             if !error.is_empty() && !*show_create {<p class="error" role="alert">{(*error).clone()}</p>}
-            <div class="section-heading"><h2>{"Your collections"}</h2><input class="search" type="search" aria-label="Search collections" placeholder="Find a collection…" value={(*search).clone()} oninput={Callback::from({let search=search.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();search.set(input.value());}})}/></div>
+            <div class="section-heading"><h2>{"Collections"}</h2><input class="search" type="search" aria-label="Search collections" placeholder="Find a collection…" value={(*search).clone()} oninput={Callback::from({let search=search.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();search.set(input.value());}})}/></div>
             if !*loaded {<p class="muted" role="status">{"Loading collections…"}</p>}
-            else if items.is_empty() {<div class="card empty-state"><span class="empty-icon">{"▤"}</span><h2>{"Your first collection starts here"}</h2><p>{"Create a collection, define a few fields, and add or import your records."}</p><button onclick={Callback::from({let show_create=show_create.clone();move |_|show_create.set(true)})}>{"Create a collection"}</button></div>}
+            else if items.is_empty() && is_admin {<div class="card empty-state"><span class="empty-icon">{"▤"}</span><h2>{"Your first collection starts here"}</h2><p>{"Create a collection, define a few fields, and add or import your records."}</p><button onclick={Callback::from({let show_create=show_create.clone();move |_|show_create.set(true)})}>{"Create a collection"}</button></div>}
+            else if items.is_empty() {<div class="card empty-state"><span class="empty-icon">{"▤"}</span><h2>{"No collections yet"}</h2><p>{"A workspace admin creates collections. They will appear here."}</p></div>}
             else if !items.iter().any(|c|c.name.contains(search.as_str())) {<p class="muted">{"No collections match your search."}</p>}
             <ul class="collection-grid">
                 { for items.iter().filter(|c|c.name.contains(search.as_str())).map(|collection| {

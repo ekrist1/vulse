@@ -6,8 +6,8 @@ use crate::{
     import::ImportPanel,
 };
 use vulse_model::{
-    ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType, UpdateCollection,
-    Visibility,
+    ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType, Role,
+    UpdateCollection, Visibility,
 };
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
@@ -319,9 +319,9 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             if let Some(item)=collection.as_ref() {
                 <div class="page-heading"><div><p class="eyebrow">{"COLLECTION"}</p><h1>{item.name.clone()}</h1><p class="muted">{format!("{} fields",item.blueprint.fields.len())}</p></div>
                     <div class="row"><span class={if item.visibility==Visibility::Public {"badge public"}else{"badge"}}>{if item.visibility==Visibility::Public{"Public"}else{"Private"}}</span>
-                    <Link<Route> classes="button" to={Route::Document{id:props.id.clone(),doc_id:"new".into()}}>{"+ Add record"}</Link<Route>></div>
+                    if session.can_edit() {<Link<Route> classes="button" to={Route::Document{id:props.id.clone(),doc_id:"new".into()}}>{"+ Add record"}</Link<Route>>}</div>
                 </div>
-                <nav class="tabs" aria-label="Collection views">{for [("data","Records"),("fields","Fields"),("import","Import data"),("api","API"),("trash","Trash"),("settings","Settings")].into_iter().map(|(value,label)|{
+                <nav class="tabs" aria-label="Collection views">{for [("data","Records",Role::Viewer),("fields","Fields",Role::Admin),("import","Import data",Role::Editor),("api","API",Role::Viewer),("trash","Trash",Role::Viewer),("settings","Settings",Role::Admin)].into_iter().filter(|(_,_,role)|session.role()>=*role).map(|(value,label,_)|{
                     let tab=tab.clone();html!{<button type="button" class={if *tab==value{"active"}else{""}} aria-current={if *tab==value{Some("page")}else{None}} onclick={Callback::from(move |_|tab.set(value.into()))}>{label}</button>}
                 })}</nav>
                 if !error.is_empty(){<p class="error" role="alert">{(*error).clone()}</p>}
@@ -337,9 +337,9 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                     <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
                 </fieldset>}
                 if *tab=="import" {<ImportPanel key={props.id.clone()} collection={item.clone()} on_import={Callback::from({let refresh=refresh.clone();move |_|refresh.set(*refresh+1)})}/>}
-                if *tab=="api" {<CollectionApi collection={item.clone()} handle={session.state.user.as_ref().map(|u|u.handle.clone()).unwrap_or_default()}/>}
+                if *tab=="api" {<CollectionApi collection={item.clone()}/>}
                 if *tab=="settings" {<fieldset class="draft-fields" disabled={*busy||pending.is_some()}>
-                    <section class="card settings-card"><h2>{"Collection settings"}</h2><label>{"Collection name"}<input value={(*name).clone()} oninput={Callback::from({let name=name.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();name.set(input.value().to_ascii_lowercase());}})}/></label><label>{"Who can read your data?"}<select onchange={Callback::from({let visibility=visibility.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();visibility.set(if input.value()=="public"{Visibility::Public}else{Visibility::Private});}})}><option value="private" selected={*visibility==Visibility::Private}>{"Private — your account and API keys"}</option><option value="public" selected={*visibility==Visibility::Public}>{"Public — anyone with the API address"}</option></select></label><button disabled={*busy} onclick={on_save}>{if *busy{"Saving…"}else{"Save changes"}}</button></section>
+                    <section class="card settings-card"><h2>{"Collection settings"}</h2><label>{"Collection name"}<input value={(*name).clone()} oninput={Callback::from({let name=name.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();name.set(input.value().to_ascii_lowercase());}})}/></label><label>{"Who can read your data?"}<select onchange={Callback::from({let visibility=visibility.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();visibility.set(if input.value()=="public"{Visibility::Public}else{Visibility::Private});}})}><option value="private" selected={*visibility==Visibility::Private}>{"Private — workspace members and API keys"}</option><option value="public" selected={*visibility==Visibility::Public}>{"Public — anyone with the API address"}</option></select></label><button disabled={*busy} onclick={on_save}>{if *busy{"Saving…"}else{"Save changes"}}</button></section>
                     </fieldset><section class="card danger-zone"><h2>{"Delete collection"}</h2><p class="muted">{"Permanently remove all records, fields and attached files."}</p><button class="danger" disabled={*busy} onclick={on_delete}>{"Delete collection…"}</button></section>
                 }
             }else if error.is_empty(){<p role="status" class="muted">{"Loading collection…"}</p>}else{<p class="error" role="alert">{(*error).clone()}</p>}

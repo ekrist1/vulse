@@ -1,0 +1,603 @@
+use crate::{
+    auth::AuthUser,
+    content::{check_body, owned_collection},
+    error::AppError,
+    state::AppState,
+    store,
+};
+use axum::{
+    Json,
+    extract::{Multipart, Path, State},
+};
+use calamine::{Data, Reader, open_workbook_auto_from_rs};
+use serde_json::{Map, Value};
+use std::{collections::HashSet, io::Cursor};
+use vulse_model::{Blueprint, FieldType, ImportIssue, ImportResult};
+
+pub const MAX_BYTES: usize = 10 * 1024 * 1024;
+const MAX_ROWS: usize = 1000;
+const MAX_COLUMNS: usize = 200;
+#[derive(Debug)]
+struct Table {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    sheets: Vec<String>,
+    sheet: String,
+    first_row: usize,
+}
+
+pub async fn import_file(
+    State(state): State<AppState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<ImportResult>, AppError> {
+    let conn = state.db.connect().await?;
+    owned_collection(&conn, &principal, &id).await?;
+    let mut file = None;
+    let mut mapping = None::<Vec<Option<String>>>;
+    let mut sheet = String::new();
+    let mut commit = false;
+    let mut mode = String::from("append");
+    let mut match_field = String::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad(e.to_string()))?
+    {
+        match field.name().unwrap_or("") {
+            "file" => {
+                if file.is_some() {
+                    return Err(AppError::bad("send one file"));
+                }
+                let name = field.file_name().unwrap_or("").to_owned();
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?;
+                if bytes.len() > MAX_BYTES {
+                    return Err(AppError::PayloadTooLarge);
+                }
+                file = Some((name, bytes.to_vec()));
+            }
+            "mapping" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?;
+                mapping = Some(
+                    serde_json::from_str(&text).map_err(|_| AppError::bad("invalid mapping"))?,
+                );
+            }
+            "sheet" => {
+                sheet = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?
+            }
+            "mode" => {
+                mode = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?
+            }
+            "match_field" => {
+                match_field = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?
+            }
+            "commit" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?;
+                if value != "true" && value != "false" {
+                    return Err(AppError::bad("commit must be true or false"));
+                }
+                commit = value == "true";
+            }
+            _ => return Err(AppError::bad("unknown import option")),
+        }
+    }
+    if !["append", "upsert"].contains(&mode.as_str()) {
+        return Err(AppError::bad("mode must be append or upsert"));
+    }
+    let (name, bytes) = file.ok_or_else(|| AppError::bad("missing file"))?;
+    let table = tokio::task::spawn_blocking(move || parse_file(&name, &bytes, &sheet))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .map_err(AppError::bad)?;
+    // Re-read and validate inside the write transaction so schema changes cannot bypass validation.
+    let result = conn
+        .with_app_tx(async |conn| {
+            let collection = owned_collection(conn, &principal, &id).await?;
+            let mapping = match mapping {
+                Some(m) => m,
+                None => table
+                    .headers
+                    .iter()
+                    .map(|h| {
+                        collection
+                            .blueprint
+                            .fields
+                            .iter()
+                            .find(|f| {
+                                f.name == h.trim().to_ascii_lowercase()
+                                    && f.kind != FieldType::Calculated
+                            })
+                            .map(|f| f.name.clone())
+                    })
+                    .collect(),
+            };
+            validate_mapping(&collection.blueprint, &table.headers, &mapping)?;
+            let mut result = ImportResult {
+                headers: table.headers.clone(),
+                sheets: table.sheets.clone(),
+                sheet: table.sheet.clone(),
+                mapping: mapping.clone(),
+                row_count: 0,
+                preview: vec![],
+                errors: vec![],
+                imported: 0,created:0,updated:0,unchanged:0,preview_actions:vec![],
+            };
+            if mapping.iter().all(Option::is_none) {
+                result.errors.push(ImportIssue {
+                    row: 1,
+                    field: None,
+                    message: "Map at least one column to a field".into(),
+                });
+            }
+            let mut existing=std::collections::HashMap::new();
+            if mode=="upsert" {
+                if !collection.blueprint.fields.iter().any(|f|f.name==match_field&&matches!(f.kind,FieldType::String|FieldType::Number)){return Err(AppError::bad("Choose a string or number field for matching records"));}
+                if !mapping.iter().any(|m|m.as_deref()==Some(match_field.as_str())){return Err(AppError::bad("The matching field must be mapped to an imported column"));}
+                for(doc,body)in store::list_document_bodies(conn,&id).await? {
+                    if let Some(key)=match_key(&body[&match_field]){if existing.insert(key,(doc,body)).is_some(){result.errors.push(ImportIssue{row:0,field:Some(match_field.clone()),message:"Existing records contain duplicate matching values. Resolve them before importing updates.".into()});}}
+                }
+            }
+            let mut seen_keys=HashSet::new();
+            let mut bodies = vec![];
+            for (i, row) in table.rows.iter().enumerate() {
+                if row.iter().all(|c| c.trim().is_empty()) {
+                    continue;
+                }
+                result.row_count += 1;
+                let row_number = table.first_row + i;
+                let mut obj = Map::new();
+                let mut failed = false;
+                for (column, target) in mapping.iter().enumerate() {
+                    let Some(target) = target else {
+                        continue;
+                    };
+                    let f = collection
+                        .blueprint
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == target)
+                        .unwrap();
+                    let cell = row.get(column).map(String::as_str).unwrap_or("");
+                    if cell.trim().is_empty() {
+                        continue;
+                    }
+                    match convert(f.kind, cell) {
+                        Ok(v) => {
+                            obj.insert(target.clone(), v);
+                        }
+                        Err(message) => {
+                            failed = true;
+                            result.errors.push(ImportIssue {
+                                row: row_number,
+                                field: Some(target.clone()),
+                                message,
+                            });
+                        }
+                    }
+                }
+                let mut body=Value::Object(obj);
+                let mut target=None;let mut same=false;
+                if mode=="upsert"{
+                    match match_key(&body[&match_field]) {
+                        None=>{failed=true;result.errors.push(ImportIssue{row:row_number,field:Some(match_field.clone()),message:"Every imported row needs a nonempty matching value".into()});},
+                        Some(key)=>{
+                            if !seen_keys.insert(key.clone()){failed=true;result.errors.push(ImportIssue{row:row_number,field:Some(match_field.clone()),message:"Duplicate matching value in this file".into()});}
+                            if let Some((doc,previous))=existing.get(&key){let mut merged=previous.as_object().cloned().unwrap_or_default();merged.extend(body.as_object().unwrap().clone());body=Value::Object(merged);same=semantic_eq(previous,&body);target=Some(doc.clone());}
+                        }
+                    }
+                }
+                let action=if target.is_none(){"create"}else if same{"unchanged"}else{"update"};
+                if !failed {
+                    match check_body(
+                        conn,
+                        &principal.user_id,
+                        &id,
+                        &collection.name,
+                        &collection.blueprint,
+                        &body,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(AppError::BadRequest(message)) => {
+                            failed = true;
+                            result.errors.push(ImportIssue {
+                                row: row_number,
+                                field: None,
+                                message,
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    let (computed, errors) =
+                        vulse_model::calculate_document(&collection.blueprint, &body);
+                    for (field, message) in errors {
+                        failed = true;
+                        result.errors.push(ImportIssue {
+                            row: row_number,
+                            field: Some(field),
+                            message,
+                        });
+                    }
+                    if result.preview.len() < 10 {
+                        result.preview.push(computed);
+                        result.preview_actions.push(action.into());
+                    }
+                }
+                if !failed {
+                    match action{"create"=>result.created+=1,"update"=>result.updated+=1,_=>result.unchanged+=1}
+                    bodies.push((target,body,action));
+                }
+            }
+            if result.row_count == 0 {
+                result.errors.push(ImportIssue {
+                    row: table.first_row,
+                    field: None,
+                    message: "No data rows found".into(),
+                });
+            }
+            if commit && result.errors.is_empty() {
+                let now = crate::timeutil::now_rfc3339();
+                for (target,body,action) in bodies {
+                    if action=="unchanged"{continue;}
+                    if let Some(doc)=target{store::update_document(conn,&id,&doc,&body,&now).await?;}else{store::insert_document(conn,&crate::auth::new_id(),&id,&body,&now).await?;}
+                    result.imported += 1;
+                }
+            }
+            Ok(result)
+        })
+        .await?;
+    Ok(Json(result))
+}
+// Exact decimal normalization avoids treating large distinct integers as equal.
+fn match_key(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return if text.trim().is_empty() {
+            None
+        } else {
+            Some(format!("s:{text}"))
+        };
+    }
+    if !value.is_number() {
+        return None;
+    }
+    let raw = value.to_string();
+    let (negative, raw) = if let Some(raw) = raw.strip_prefix('-') {
+        (true, raw)
+    } else {
+        (false, raw.as_str())
+    };
+    let mut parts = raw.split(['e', 'E']);
+    let mantissa = parts.next()?;
+    let exponent = parts
+        .next()
+        .map(|e| e.parse::<i32>().ok())
+        .unwrap_or(Some(0))?;
+    let decimals = mantissa.split('.').nth(1).map(str::len).unwrap_or(0) as i32;
+    let mut digits = mantissa
+        .replace('.', "")
+        .trim_start_matches('0')
+        .to_string();
+    let mut exponent = exponent - decimals;
+    if digits.is_empty() {
+        return Some("n:0".into());
+    }
+    while digits.ends_with('0') {
+        digits.pop();
+        exponent += 1;
+    }
+    Some(format!(
+        "n:{}{}e{}",
+        if negative { "-" } else { "" },
+        digits,
+        exponent
+    ))
+}
+fn semantic_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(_), Value::Number(_)) => match_key(a) == match_key(b),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| semantic_eq(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| semantic_eq(v, other)))
+        }
+        _ => a == b,
+    }
+}
+fn validate_mapping(
+    bp: &Blueprint,
+    headers: &[String],
+    mapping: &[Option<String>],
+) -> Result<(), AppError> {
+    if mapping.len() != headers.len() {
+        return Err(AppError::bad("mapping must have one target per column"));
+    }
+    let mut seen = HashSet::new();
+    for n in mapping.iter().flatten() {
+        if !seen.insert(n) {
+            return Err(AppError::bad(format!(
+                "field '{n}' is mapped more than once"
+            )));
+        }
+        if !bp
+            .fields
+            .iter()
+            .any(|f| &f.name == n && f.kind != FieldType::Calculated)
+        {
+            return Err(AppError::bad(format!("unknown or calculated target '{n}'")));
+        }
+    }
+    Ok(())
+}
+fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
+    match kind {
+        FieldType::String | FieldType::Asset | FieldType::Reference => {
+            Ok(Value::String(cell.into()))
+        }
+        FieldType::Number => {
+            let n: Value =
+                serde_json::from_str(cell.trim()).map_err(|_| "Expected a finite number")?;
+            if !n.is_number() {
+                return Err("Expected a number".into());
+            }
+            Ok(n)
+        }
+        FieldType::Boolean => match cell.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(Value::Bool(true)),
+            "false" | "0" | "no" => Ok(Value::Bool(false)),
+            _ => Err("Expected true/false, yes/no or 1/0".into()),
+        },
+        FieldType::Json | FieldType::Array | FieldType::PortableText => {
+            serde_json::from_str(cell).map_err(|_| "Expected valid JSON".into())
+        }
+        FieldType::Calculated => Err("Calculated fields are read-only".into()),
+    }
+}
+fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
+    if bytes.len() > MAX_BYTES {
+        return Err("File exceeds 10 MB".into());
+    }
+    if name.to_ascii_lowercase().ends_with(".csv") {
+        let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+        std::str::from_utf8(bytes).map_err(|_| "CSV must use UTF-8 encoding")?;
+        let mut reader = csv::ReaderBuilder::new().from_reader(bytes);
+        let headers = reader
+            .headers()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        validate_headers(&headers)?;
+        let mut rows = vec![];
+        for row in reader.records() {
+            let row = row.map_err(|e| e.to_string())?;
+            if rows.len() >= MAX_ROWS {
+                return Err("Maximum 1,000 data rows per import".into());
+            }
+            rows.push(row.iter().map(str::to_owned).collect());
+        }
+        return Ok(Table {
+            headers,
+            rows,
+            sheets: vec![],
+            sheet: String::new(),
+            first_row: 2,
+        });
+    }
+    if !name.to_ascii_lowercase().ends_with(".xlsx") {
+        return Err(
+            "Choose a .csv or .xlsx file; save legacy .xls workbooks as .xlsx first".into(),
+        );
+    }
+    if name.to_ascii_lowercase().ends_with(".xlsx") {
+        preflight_xlsx(bytes)?;
+    }
+    let mut book = open_workbook_auto_from_rs(Cursor::new(bytes))
+        .map_err(|e| format!("Cannot read workbook: {e}"))?;
+    let sheets = book.sheet_names().to_vec();
+    let selected = if sheet.is_empty() {
+        sheets.first().ok_or("Workbook has no worksheets")?.clone()
+    } else {
+        sheet.into()
+    };
+    if !sheets.contains(&selected) {
+        return Err("Unknown worksheet".into());
+    }
+    let range = book.worksheet_range(&selected).map_err(|e| e.to_string())?;
+    if range.height() > MAX_ROWS + 1 || range.width() > MAX_COLUMNS {
+        return Err("Maximum 1,000 rows and 200 columns per worksheet".into());
+    }
+    let first_row = range.start().map(|(row, _)| row as usize + 2).unwrap_or(2);
+    let mut rows = range.rows();
+    let headers = rows
+        .next()
+        .ok_or("Worksheet is empty")?
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    validate_headers(&headers)?;
+    let rows = rows
+        .enumerate()
+        .map(|(i, row)| {
+            row.iter()
+                .map(|c| match c {
+                    Data::Error(e) => {
+                        Err(format!("Row {}: spreadsheet error {e:?}", first_row + i))
+                    }
+                    Data::DateTimeIso(s) => Ok(s.clone()),
+                    _ => Ok(c.to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Table {
+        headers,
+        rows,
+        sheets,
+        sheet: selected,
+        first_row,
+    })
+}
+fn validate_headers(headers: &[String]) -> Result<(), String> {
+    if headers.is_empty() || headers.len() > MAX_COLUMNS {
+        return Err("Expected 1–200 columns".into());
+    }
+    let mut names = HashSet::new();
+    for h in headers {
+        let n = h.trim().to_ascii_lowercase();
+        if n.is_empty() || !names.insert(n) {
+            return Err("Column headers must be nonempty and unique".into());
+        }
+    }
+    Ok(())
+}
+
+// Check archive expansion and sparse coordinates before Calamine allocates a dense worksheet.
+fn preflight_xlsx(bytes: &[u8]) -> Result<(), String> {
+    use quick_xml::events::Event;
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("Invalid XLSX archive: {e}"))?;
+    if archive.len() > 2000 {
+        return Err("Workbook contains too many archive entries".into());
+    }
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        total = total
+            .checked_add(entry.size())
+            .ok_or("Workbook is too large")?;
+        if total > 50 * 1024 * 1024 {
+            return Err("Expanded workbook exceeds 50 MB".into());
+        }
+        if !entry.name().starts_with("xl/worksheets/") || !entry.name().ends_with(".xml") {
+            continue;
+        }
+        let mut xml = Vec::new();
+        entry
+            .by_ref()
+            .take(50 * 1024 * 1024 + 1)
+            .read_to_end(&mut xml)
+            .map_err(|e| e.to_string())?;
+        if xml.len() > 50 * 1024 * 1024 {
+            return Err("Expanded worksheet exceeds 50 MB".into());
+        }
+        let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+        loop {
+            match reader.read_event().map_err(|e| e.to_string())? {
+                Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"c" => {
+                    for attr in e.attributes() {
+                        let attr = attr.map_err(|e| e.to_string())?;
+                        if attr.key.as_ref() == b"r" {
+                            let value = std::str::from_utf8(&attr.value)
+                                .map_err(|_| "Invalid cell coordinate")?;
+                            check_coordinate(value)?;
+                        }
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+fn check_coordinate(value: &str) -> Result<(), String> {
+    let mut column = 0usize;
+    let mut row = 0usize;
+    let mut digits = false;
+    for c in value.chars() {
+        if c.is_ascii_uppercase() && !digits {
+            column = column
+                .saturating_mul(26)
+                .saturating_add(c as usize - 'A' as usize + 1);
+        } else if c.is_ascii_digit() {
+            digits = true;
+            row = row
+                .saturating_mul(10)
+                .saturating_add(c as usize - '0' as usize);
+        } else {
+            return Err("Invalid cell coordinate".into());
+        }
+    }
+    if row == 0 || column == 0 || row > MAX_ROWS + 1 || column > MAX_COLUMNS {
+        return Err("Workbook cells must be within the first 1,001 rows and 200 columns; export a smaller worksheet".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    fn workbook(cell: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let entries=[
+            ("[Content_Types].xml",r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#.to_string()),
+            ("_rels/.rels",r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.into()),
+            ("xl/workbook.xml",r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="First" sheetId="1" r:id="rId1"/><sheet name="Second" sheetId="2" r:id="rId2"/></sheets></workbook>"#.into()),
+            ("xl/_rels/workbook.xml.rels",r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#.into()),
+            ("xl/worksheets/sheet1.xml",format!(r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>price</t></is></c></row><row r="2">{cell}</row></sheetData></worksheet>"#)),
+            ("xl/worksheets/sheet2.xml",r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>title</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Hello</t></is></c></row></sheetData></worksheet>"#.into()),
+        ];
+        for (name, data) in entries {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+    #[test]
+    fn parses_xlsx_worksheets_and_cached_formula_values() {
+        let bytes = workbook(r#"<c r="A2"><f>10+2</f><v>12</v></c>"#);
+        let first = parse_file("data.xlsx", &bytes, "").unwrap();
+        assert_eq!(first.sheets, vec!["First", "Second"]);
+        assert_eq!(first.rows[0][0], "12");
+        let second = parse_file("data.xlsx", &bytes, "Second").unwrap();
+        assert_eq!(second.headers, vec!["title"]);
+        assert_eq!(second.rows[0][0], "Hello");
+        assert!(parse_file("data.xlsx", &bytes, "Missing").is_err());
+        let error = workbook(r#"<c r="A2" t="e"><v>#DIV/0!</v></c>"#);
+        assert!(
+            parse_file("data.xlsx", &error, "")
+                .unwrap_err()
+                .contains("Row 2")
+        );
+    }
+    #[test]
+    fn rejects_sparse_workbooks_and_invalid_csv() {
+        let bytes = workbook(r#"<c r="XFD1048576"><v>12</v></c>"#);
+        assert!(parse_file("data.xlsx", &bytes, "").is_err());
+        for csv in ["a,a\n1,2\n", "a,b\n1\n", ",b\n1,2\n"] {
+            assert!(parse_file("data.csv", csv.as_bytes(), "").is_err());
+        }
+        assert!(parse_file("data.xlsx", b"not a workbook", "").is_err());
+        let csv = parse_file("data.csv", b"\xef\xbb\xbftitle,price\n\"a,b\",12\n", "").unwrap();
+        assert_eq!(csv.headers[0], "title");
+        assert_eq!(csv.rows[0][0], "a,b");
+        let huge = "a\n".to_owned() + &"1\n".repeat(1001);
+        assert!(parse_file("data.csv", huge.as_bytes(), "").is_err());
+    }
+}

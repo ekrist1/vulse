@@ -1,0 +1,7 @@
+/target
+/storage
+*.db
+*.db-*
+crates/web/dist
+crates/web/node_modules
+crates/web/editor-assets

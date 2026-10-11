@@ -1,0 +1,1878 @@
+use std::path::Path;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use vulse_model::{
+    ApiErrorBody, ApiKeyView, AssetView, CollectionView, CreatedApiKey, DocumentView, Page,
+    UserView,
+};
+
+use crate::app;
+
+struct TestApp {
+    app: axum::Router,
+    asset_dir: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl TestApp {
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let asset_dir = dir.path().join("assets");
+        let state = crate::test_state(dir.path().to_path_buf()).await.unwrap();
+        Self {
+            app: app(state),
+            asset_dir,
+            _dir: dir,
+        }
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        bearer: Option<&str>,
+        body: Option<Value>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", format!("vulse_session={cookie}"));
+        }
+        if let Some(bearer) = bearer {
+            builder = builder.header("authorization", format!("Bearer {bearer}"));
+        }
+        let payload = body.map(|value| value.to_string()).unwrap_or_default();
+        self.app
+            .clone()
+            .oneshot(builder.body(Body::from(payload)).unwrap())
+            .await
+            .unwrap()
+    }
+}
+
+async fn json_of<T: serde::de::DeserializeOwned>(
+    response: axum::response::Response,
+) -> (StatusCode, T) {
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&bytes)));
+    (status, value)
+}
+
+fn session_of(response: &axum::response::Response) -> String {
+    let raw = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(raw.contains("HttpOnly"));
+    assert!(raw.contains("SameSite=Lax"));
+    assert!(raw.contains("Path=/"));
+    raw.split(';')
+        .next()
+        .unwrap()
+        .trim_start_matches("vulse_session=")
+        .to_string()
+}
+
+async fn register(app: &TestApp, email: &str, handle: &str) -> (String, UserView) {
+    let response = app
+        .call(
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            None,
+            Some(json!({"email": email, "handle": handle, "password": "password123"})),
+        )
+        .await;
+    let cookie = session_of(&response);
+    let (status, user) = json_of::<UserView>(response).await;
+    assert_eq!(status, StatusCode::CREATED);
+    (cookie, user)
+}
+
+#[tokio::test]
+async fn session_and_api_keys() {
+    let app = TestApp::new().await;
+    let (cookie, user) = register(&app, "ada@example.com", "ada").await;
+    let (status, me) = json_of::<UserView>(
+        app.call("GET", "/api/v1/me", Some(&cookie), None, None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me.handle, user.handle);
+
+    assert_eq!(
+        app.call("POST", "/api/v1/auth/logout", Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        app.call("GET", "/api/v1/me", Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let login = app
+        .call(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            None,
+            Some(json!({"email": "ada@example.com", "password": "wrong-password"})),
+        )
+        .await;
+    assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+    let login = app
+        .call(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            None,
+            Some(json!({"email": "ada@example.com", "password": "password123"})),
+        )
+        .await;
+    let cookie = session_of(&login);
+    assert_eq!(login.status(), StatusCode::OK);
+
+    let duplicate = app
+        .call(
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            None,
+            Some(json!({"email": "ada@example.com", "handle": "other", "password": "password123"})),
+        )
+        .await;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let created = app
+        .call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&cookie),
+            None,
+            Some(json!({"name": "site"})),
+        )
+        .await;
+    let (status, key) = json_of::<CreatedApiKey>(created).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(key.secret.starts_with(&key.key.prefix));
+    let (status, me) = json_of::<UserView>(
+        app.call("GET", "/api/v1/me", None, Some(&key.secret), None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me.id, user.id);
+
+    let (status, keys) = json_of::<Vec<ApiKeyView>>(
+        app.call("GET", "/api/v1/api-keys", Some(&cookie), None, None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys.len(), 1);
+    assert!(!format!("{keys:?}").contains(&key.secret));
+}
+
+#[tokio::test]
+async fn collections_visibility_and_blueprint_rules() {
+    let app = TestApp::new().await;
+    let (cookie, _user) = register(&app, "ada@example.com", "ada").await;
+    let authors = create_collection(
+        &app,
+        &cookie,
+        "authors",
+        "private",
+        json!({"fields": [{"name": "name", "type": "string", "required": true}]}),
+    )
+    .await;
+    let author = create_document(&app, &cookie, &authors.id, json!({"name": "Ada"})).await;
+    let posts = create_collection(
+        &app,
+        &cookie,
+        "posts",
+        "public",
+        json!({
+            "fields": [
+                {"name": "title", "type": "string", "required": true},
+                {"name": "body", "type": "portable_text"},
+                {"name": "author", "type": "reference", "collection": "authors"}
+            ]
+        }),
+    )
+    .await;
+    let invalid = app
+        .call(
+            "POST",
+            &format!("/api/v1/collections/{}/documents", posts.id),
+            Some(&cookie),
+            None,
+            Some(json!({"body": {"title": "Hello", "author": "missing"}})),
+        )
+        .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let post = create_document(
+        &app,
+        &cookie,
+        &posts.id,
+        json!({"title": "Hello", "author": author.id}),
+    )
+    .await;
+
+    let public_doc = app
+        .call(
+            "GET",
+            &format!("/api/v1/public/ada/posts/{}", post.id),
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        public_doc
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    let (status, seen) = json_of::<DocumentView>(public_doc).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen.body["title"], "Hello");
+
+    let secrets = create_collection(
+        &app,
+        &cookie,
+        "secrets",
+        "private",
+        json!({"fields": [{"name": "note", "type": "string", "required": true}]}),
+    )
+    .await;
+    let _secret = create_document(
+        &app,
+        &cookie,
+        &secrets.id,
+        json!({"note": "top-secret-phrase"}),
+    )
+    .await;
+    let hidden = app
+        .call("GET", "/api/v1/public/ada/secrets", None, None, None)
+        .await;
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    let bytes = hidden.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&bytes).contains("top-secret-phrase"));
+    assert_eq!(
+        app.call("GET", "/api/v1/public/ada/missing", None, None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let (_other_cookie, _) = register(&app, "grace@example.com", "grace").await;
+    assert_eq!(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}", secrets.id),
+            Some(&_other_cookie),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let scoped = app
+        .call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&cookie),
+            None,
+            Some(json!({"name": "posts-only", "collection_id": posts.id})),
+        )
+        .await;
+    let (_, scoped) = json_of::<CreatedApiKey>(scoped).await;
+    assert_eq!(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/documents/{}", posts.id, post.id),
+            None,
+            Some(&scoped.secret),
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}", secrets.id),
+            None,
+            Some(&scoped.secret),
+            None
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            "/api/v1/collections",
+            None,
+            Some(&scoped.secret),
+            Some(json!({"name": "nope", "visibility": "public", "blueprint": {"fields": []}}))
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let broken = app
+        .call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", posts.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint": {"fields": [{"name": "name", "type": "string", "required": true}]}})),
+        )
+        .await;
+    let (status, err) = json_of::<ApiErrorBody>(broken).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err.document_ids.unwrap(), vec![post.id.clone()]);
+
+    let extended = app
+        .call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", posts.id),
+            Some(&cookie),
+            None,
+            Some(json!({
+                "blueprint": {
+                    "fields": [
+                        {"name": "title", "type": "string", "required": true},
+                        {"name": "subtitle", "type": "string"},
+                        {"name": "body", "type": "portable_text"},
+                        {"name": "author", "type": "reference", "collection": "authors"}
+                    ]
+                }
+            })),
+        )
+        .await;
+    assert_eq!(extended.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn patches_bulk_and_undo_are_atomic_and_conflict_aware() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "bulk@example.com", "bulk").await;
+    let collection=create_collection(&app,&cookie,"products","private",json!({"fields":[{"name":"sku","type":"string","required":true},{"name":"price","type":"number"},{"name":"total","type":"calculated","formula":"=[price]*2"}]})).await;
+    let first = create_document(&app, &cookie, &collection.id, json!({"sku":"A","price":2})).await;
+    let second = create_document(&app, &cookie, &collection.id, json!({"sku":"B","price":3})).await;
+    let endpoint = format!(
+        "/api/v1/collections/{}/documents/{}",
+        collection.id, first.id
+    );
+    let bulk = format!("/api/v1/collections/{}/bulk", collection.id);
+    let (status, patched) = json_of::<vulse_model::MutationResult>(
+        app.call(
+            "PATCH",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"price":5},"expected_updated_at":first.updated_at})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched.documents[0].body["total"].as_f64(), Some(10.0));
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"price":99},"expected_updated_at":first.updated_at}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"total":1}}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            &bulk,
+            Some(&cookie),
+            None,
+            Some(json!({"action":"update","ids":[first.id,second.id],"patch":{"sku":null}}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let (_, seen) =
+        json_of::<DocumentView>(app.call("GET", &endpoint, Some(&cookie), None, None).await).await;
+    assert_eq!(seen.body["price"], 5);
+    let undo = |id: &str| format!("/api/v1/collections/{}/actions/{id}/undo", collection.id);
+    assert_eq!(
+        app.call("POST", &undo(&patched.undo_id), Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let (_, seen) =
+        json_of::<DocumentView>(app.call("GET", &endpoint, Some(&cookie), None, None).await).await;
+    assert_eq!(seen.body["price"], 2);
+    let (_, deleted) = json_of::<vulse_model::MutationResult>(
+        app.call(
+            "POST",
+            &bulk,
+            Some(&cookie),
+            None,
+            Some(json!({"action":"delete","ids":[first.id,second.id]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(deleted.affected, 2);
+    assert_eq!(
+        app.call("GET", &endpoint, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let (_, restored) = json_of::<vulse_model::MutationResult>(
+        app.call("POST", &undo(&deleted.undo_id), Some(&cookie), None, None)
+            .await,
+    )
+    .await;
+    assert_eq!(restored.documents.len(), 2);
+    let (_, duplicates) = json_of::<vulse_model::MutationResult>(
+        app.call(
+            "POST",
+            &bulk,
+            Some(&cookie),
+            None,
+            Some(json!({"action":"duplicate","ids":[first.id,second.id]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(duplicates.documents.len(), 2);
+    assert_ne!(duplicates.documents[0].id, first.id);
+    assert_eq!(
+        app.call(
+            "POST",
+            &undo(&duplicates.undo_id),
+            Some(&cookie),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (_, patched) = json_of::<vulse_model::MutationResult>(
+        app.call(
+            "PATCH",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"price":5}})),
+        )
+        .await,
+    )
+    .await;
+    app.call(
+        "PATCH",
+        &endpoint,
+        Some(&cookie),
+        None,
+        Some(json!({"patch":{"price":6}})),
+    )
+    .await;
+    assert_eq!(
+        app.call("POST", &undo(&patched.undo_id), Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let (other, _) = register(&app, "other-bulk@example.com", "otherbulk").await;
+    assert_eq!(
+        app.call(
+            "POST",
+            &bulk,
+            Some(&other),
+            None,
+            Some(json!({"action":"delete","ids":[first.id]}))
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn saved_views_query_filter_sort_page_and_recalculate() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "views@example.com", "views").await;
+    let collection=create_collection(&app,&cookie,"products","private",json!({"fields":[{"name":"name","type":"string"},{"name":"price","type":"number"},{"name":"active","type":"boolean"},{"name":"total","type":"calculated","formula":"=[price]*2"}]})).await;
+    for (name, price, active) in [
+        ("Pen", 2, true),
+        ("Notebook", 12, true),
+        ("100%_ cotton", 5, false),
+        ("Folder", 7, true),
+    ] {
+        create_document(
+            &app,
+            &cookie,
+            &collection.id,
+            json!({"name":name,"price":price,"active":active}),
+        )
+        .await;
+    }
+    let endpoint = format!("/api/v1/collections/{}/query", collection.id);
+    let query = json!({"filters":[{"field":"active","op":"eq","value":true}],"sort_field":"price","descending":false,"limit":2});
+    let (status, page) = json_of::<vulse_model::RecordPage>(
+        app.call("POST", &endpoint, Some(&cookie), None, Some(query.clone()))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.total, 3);
+    assert_eq!(page.items[0].body["name"], "Pen");
+    assert_eq!(page.items[1].body["name"], "Folder");
+    let mut second = query.clone();
+    second["offset"] = json!(2);
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call("POST", &endpoint, Some(&cookie), None, Some(second))
+            .await,
+    )
+    .await;
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].body["name"], "Notebook");
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"search":"100%_"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 1);
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"filters":[{"field":"total","op":"gt","value":20}]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        app.call(
+            "POST",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"sort_field":"name; DROP TABLE documents"}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let views = format!("/api/v1/collections/{}/views", collection.id);
+    let config = json!({"name":"Active products","query":query,"columns":["name","price"]});
+    let (status, saved) = json_of::<vulse_model::SavedView>(
+        app.call("POST", &views, Some(&cookie), None, Some(config.clone()))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        app.call("POST", &views, Some(&cookie), None, Some(config))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let (_, seen) = json_of::<Vec<vulse_model::SavedView>>(
+        app.call("GET", &views, Some(&cookie), None, None).await,
+    )
+    .await;
+    assert_eq!(seen, vec![saved.clone()]);
+    let (other, _) = register(&app, "other-views@example.com", "otherviews").await;
+    assert_eq!(
+        app.call("POST", &endpoint, Some(&other), None, Some(json!({})))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.call("GET", &views, Some(&other), None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut blueprint = collection.blueprint.clone();
+    blueprint.fields[3].formula = Some("=[price]*10".into());
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", collection.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":blueprint}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(
+                json!({"filters":[{"field":"total","op":"gt","value":20}],"group_field":"active"}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 3);
+    assert_eq!(
+        app.call(
+            "DELETE",
+            &format!("{views}/{}", saved.id),
+            Some(&cookie),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn structured_portable_text_validates_nested_assets_and_public_round_trips() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "blocks@example.com", "blocks").await;
+    let collection = create_collection(
+        &app,
+        &cookie,
+        "articles",
+        "public",
+        json!({"fields":[{"name":"content", "type":"portable_text"}]}),
+    )
+    .await;
+    let uploaded = multipart_call(
+        &app,
+        &cookie,
+        &collection.id,
+        "image/png",
+        b"\x89PNG\r\nhello-image",
+        "cover.png",
+    )
+    .await;
+    let (status, asset) = json_of::<AssetView>(uploaded).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let content = json!([
+        {"_key":"accordion", "_type":"accordion", "title":"FAQ", "collapsed":true, "content":[
+            {"_key":"repeat", "_type":"repeatable", "title":"Answers", "items":[
+                {"_key":"entry", "label":"First", "content":[{"_key":"image", "_type":"image", "asset":{"_ref":asset.id}}]}
+            ]}
+        ]},
+        {"_key":"embed", "_type":"iframe", "title":"Video", "url":"https://example.com/embed", "height":400}
+    ]);
+    let document = create_document(&app, &cookie, &collection.id, json!({"content":content})).await;
+    let (_, public) = json_of::<DocumentView>(
+        app.call(
+            "GET",
+            &format!("/api/v1/public/blocks/articles/{}", document.id),
+            None,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(public.body["content"], content);
+    let asset_endpoint = format!("/api/v1/collections/{}/assets/{}", collection.id, asset.id);
+    assert_eq!(
+        app.call("DELETE", &asset_endpoint, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.call(
+            "GET",
+            &format!("{asset_endpoint}/content"),
+            Some(&cookie),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let endpoint = format!(
+        "/api/v1/collections/{}/documents/{}",
+        collection.id, document.id
+    );
+    let mut invalid = content.clone();
+    invalid[0]["content"][0]["items"][0]["content"][0]["asset"]["_ref"] =
+        json!("550e8400-e29b-41d4-a716-446655440000");
+    assert_eq!(
+        app.call(
+            "PUT",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"body":{"content":invalid}}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    for url in [
+        "javascript:alert(1)",
+        "https://user:password@example.com/embed",
+    ] {
+        let mut invalid = content.clone();
+        invalid[1]["url"] = json!(url);
+        assert_eq!(
+            app.call(
+                "PUT",
+                &endpoint,
+                Some(&cookie),
+                None,
+                Some(json!({"body":{"content":invalid}}))
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let (_, saved) =
+        json_of::<DocumentView>(app.call("GET", &endpoint, Some(&cookie), None, None).await).await;
+    assert_eq!(saved.body["content"], content);
+}
+
+#[tokio::test]
+async fn uploads_stay_inside_the_asset_directory() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "ada@example.com", "ada").await;
+    let notes = create_collection(
+        &app,
+        &cookie,
+        "notes",
+        "public",
+        json!({"fields": [{"name": "cover", "type": "asset", "required": true}]}),
+    )
+    .await;
+    let svg = multipart_call(
+        &app,
+        &cookie,
+        &notes.id,
+        "image/svg+xml",
+        b"<svg></svg>",
+        "x.svg",
+    )
+    .await;
+    assert_eq!(svg.status(), StatusCode::BAD_REQUEST);
+    assert!(file_count(&app.asset_dir) == 0);
+
+    let png = b"\x89PNG\r\nhello-image";
+    let uploaded = multipart_call(&app, &cookie, &notes.id, "image/png", png, "cover.png").await;
+    let (status, asset) = json_of::<AssetView>(uploaded).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let stored = only_file(&app.asset_dir);
+    let root = app.asset_dir.canonicalize().unwrap();
+    assert!(stored.canonicalize().unwrap().starts_with(&root));
+    assert_eq!(std::fs::read(&stored).unwrap(), png);
+
+    let _doc = create_document(&app, &cookie, &notes.id, json!({"cover": asset.id})).await;
+    let response = app
+        .call(
+            "GET",
+            &format!("/api/v1/public/ada/notes/assets/{}", asset.id),
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], png);
+
+    let secrets = create_collection(
+        &app,
+        &cookie,
+        "secrets",
+        "private",
+        json!({"fields": [{"name": "cover", "type": "asset"}]}),
+    )
+    .await;
+    let private_asset = multipart_call(
+        &app,
+        &cookie,
+        &secrets.id,
+        "image/png",
+        b"\x89PNG\r\nprivate",
+        "secret.png",
+    )
+    .await;
+    let (_, private_asset) = json_of::<AssetView>(private_asset).await;
+    assert_eq!(
+        app.call(
+            "GET",
+            &format!("/api/v1/public/ada/secrets/assets/{}", private_asset.id),
+            None,
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn json_bodies_are_limited() {
+    let app = TestApp::new().await;
+    let huge = "a".repeat(1024 * 1024 + 64);
+    let response = app
+        .call(
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            None,
+            Some(json!({"email": huge, "handle": "ada", "password": "password123"})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+async fn create_collection(
+    app: &TestApp,
+    cookie: &str,
+    name: &str,
+    visibility: &str,
+    blueprint: Value,
+) -> CollectionView {
+    let response = app
+        .call(
+            "POST",
+            "/api/v1/collections",
+            Some(cookie),
+            None,
+            Some(json!({"name": name, "visibility": visibility, "blueprint": blueprint})),
+        )
+        .await;
+    let (status, collection) = json_of::<CollectionView>(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{collection:?}");
+    collection
+}
+
+async fn create_document(
+    app: &TestApp,
+    cookie: &str,
+    collection_id: &str,
+    body: Value,
+) -> DocumentView {
+    let response = app
+        .call(
+            "POST",
+            &format!("/api/v1/collections/{collection_id}/documents"),
+            Some(cookie),
+            None,
+            Some(json!({"body": body})),
+        )
+        .await;
+    let (status, document) = json_of::<DocumentView>(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{document:?}");
+    document
+}
+
+async fn multipart_call(
+    app: &TestApp,
+    cookie: &str,
+    collection_id: &str,
+    content_type: &str,
+    bytes: &[u8],
+    filename: &str,
+) -> axum::response::Response {
+    let boundary = "----vulseboundary";
+    let mut body = Vec::new();
+    body.extend(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .into_bytes(),
+    );
+    body.extend(bytes);
+    body.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/collections/{collection_id}/assets"))
+        .header("cookie", format!("vulse_session={cookie}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    app.app.clone().oneshot(request).await.unwrap()
+}
+
+fn file_count(root: &Path) -> usize {
+    walk(root).len()
+}
+
+fn only_file(root: &Path) -> std::path::PathBuf {
+    let files = walk(root);
+    assert_eq!(files.len(), 1);
+    files.into_iter().next().unwrap()
+}
+
+fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return files;
+    }
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[allow(dead_code)]
+fn _page<T>(page: Page<T>) -> Vec<T> {
+    page.items
+}
+
+#[tokio::test]
+async fn calculated_fields_refresh_on_writes_schema_changes_and_public_reads() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "calc@example.com", "calc").await;
+    let collection = create_collection(
+        &app,
+        &cookie,
+        "sales",
+        "public",
+        json!({"fields":[
+            {"name":"price","type":"number","required":true}, {"name":"quantity","type":"number"},
+            {"name":"total","type":"calculated","formula":"=ROUND([price]*[quantity],2)"},
+            {"name":"safe","type":"calculated","formula":"=IFERROR(1/[quantity],0)"}
+        ]}),
+    )
+    .await;
+    let document = create_document(
+        &app,
+        &cookie,
+        &collection.id,
+        json!({"price":12,"quantity":3,"total":999}),
+    )
+    .await;
+    assert_eq!(document.body["total"].as_f64(), Some(36.0));
+    let url = format!(
+        "/api/v1/collections/{}/documents/{}",
+        collection.id, document.id
+    );
+    let (status, document) = json_of::<DocumentView>(
+        app.call(
+            "PUT",
+            &url,
+            Some(&cookie),
+            None,
+            Some(json!({"body":{"price":20,"quantity":0}})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document.body["total"].as_f64(), Some(0.0));
+    assert_eq!(document.body["safe"].as_f64(), Some(0.0));
+    let response=app.call("PATCH",&format!("/api/v1/collections/{}",collection.id),Some(&cookie),None,Some(json!({"blueprint":{"fields":[
+        {"name":"price","type":"number"},{"name":"quantity","type":"number"},
+        {"name":"total","type":"calculated","formula":"=[price]+10"},{"name":"safe","type":"calculated","formula":"=1/[quantity]"}
+    ]}}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (status, public) = json_of::<DocumentView>(
+        app.call(
+            "GET",
+            &format!("/api/v1/public/calc/sales/{}", document.id),
+            None,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(public.body["total"].as_f64(), Some(30.0));
+    assert!(public.body["safe"].is_null());
+    assert!(public.calculation_errors["safe"].contains("DIV"));
+    let (_, page) = json_of::<Page<DocumentView>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/documents", collection.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.items[0].body["total"].as_f64(), Some(30.0));
+    let bad=app.call("PATCH",&format!("/api/v1/collections/{}",collection.id),Some(&cookie),None,Some(json!({"blueprint":{"fields":[{"name":"a","type":"calculated","formula":"=[b]"},{"name":"b","type":"calculated","formula":"=[a]"}]}}))).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+async fn import_csv(
+    app: &TestApp,
+    cookie: Option<&str>,
+    id: &str,
+    csv: &str,
+    commit: bool,
+    mapping: Option<Value>,
+) -> axum::response::Response {
+    let mut body = format!(
+        "--vulse-import\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--vulse-import\r\nContent-Disposition: form-data; name=\"commit\"\r\n\r\n{commit}\r\n"
+    );
+    if let Some(m) = mapping {
+        body.push_str(&format!(
+            "--vulse-import\r\nContent-Disposition: form-data; name=\"mapping\"\r\n\r\n{m}\r\n"
+        ));
+    }
+    body.push_str("--vulse-import--\r\n");
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/collections/{id}/import"))
+        .header("content-type", "multipart/form-data; boundary=vulse-import");
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", format!("vulse_session={cookie}"));
+    }
+    app.app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn imports_preview_validate_authorize_and_commit_atomically() {
+    use vulse_model::ImportResult;
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "import@example.com", "import").await;
+    let c=create_collection(&app,&cookie,"inventory","private",json!({"fields":[{"name":"title","type":"string","required":true},{"name":"price","type":"number","required":true},{"name":"tax","type":"calculated","formula":"=[price]*0.25"}]})).await;
+    let csv = "title,price\n\"A, B\",12\nSecond,20\n";
+    assert_eq!(
+        import_csv(&app, None, &c.id, csv, true, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let (_, preview) =
+        json_of::<ImportResult>(import_csv(&app, Some(&cookie), &c.id, csv, false, None).await)
+            .await;
+    assert!(preview.errors.is_empty());
+    assert_eq!(preview.imported, 0);
+    assert_eq!(preview.preview[0]["tax"].as_f64(), Some(3.0));
+    let (_, page) = json_of::<Page<DocumentView>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/documents", c.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(page.items.is_empty());
+    let (_, bad) = json_of::<ImportResult>(
+        import_csv(
+            &app,
+            Some(&cookie),
+            &c.id,
+            "title,price\nValid,4\nInvalid,NaN\nMissing,\n",
+            true,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(bad.imported, 0);
+    assert_eq!(bad.errors.len(), 2);
+    assert_eq!(bad.errors[0].row, 3);
+    assert_eq!(bad.errors[0].field.as_deref(), Some("price"));
+    let (_, page) = json_of::<Page<DocumentView>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/documents", c.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(page.items.is_empty());
+    let (_, done) =
+        json_of::<ImportResult>(import_csv(&app, Some(&cookie), &c.id, csv, true, None).await)
+            .await;
+    assert_eq!(done.imported, 2);
+    let mapped = "Product,Cost,Other\nMapped,8,ignored\n";
+    let (_, done) = json_of::<ImportResult>(
+        import_csv(
+            &app,
+            Some(&cookie),
+            &c.id,
+            mapped,
+            true,
+            Some(json!(["title", "price", null])),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(done.imported, 1);
+    assert_eq!(
+        import_csv(
+            &app,
+            Some(&cookie),
+            &c.id,
+            mapped,
+            true,
+            Some(json!(["title", "title", null]))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        import_csv(&app, Some(&cookie), &c.id, "title,title\na,b\n", true, None)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let (other, _) = register(&app, "other@example.com", "other").await;
+    assert_eq!(
+        import_csv(&app, Some(&other), &c.id, csv, true, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn history_restore_deleted_records_and_schema_conflicts() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "history@example.com", "history").await;
+    let c=create_collection(&app,&cookie,"products","private",json!({"fields":[{"name":"name","type":"string"},{"name":"price","type":"number"},{"name":"total","type":"calculated","formula":"=[price]*2"}]})).await;
+    let d = create_document(&app, &cookie, &c.id, json!({"name":"Notebook","price":2})).await;
+    let endpoint = format!("/api/v1/collections/{}/documents/{}", c.id, d.id);
+    let (status, history) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("{endpoint}/revisions"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(history.items.len(), 1);
+    assert_eq!(history.items[0].action, "create");
+    assert!(history.items[0].body.get("total").is_none());
+    let (status, updated) = json_of::<DocumentView>(
+        app.call(
+            "PUT",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"body":{"name":"Changed","price":3},"expected_updated_at":d.updated_at})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let restore = format!("{endpoint}/revisions/{}/restore", history.items[0].id);
+    assert_eq!(
+        app.call(
+            "POST",
+            &restore,
+            Some(&cookie),
+            None,
+            Some(json!({"expected_updated_at":d.updated_at}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let (status, restored) = json_of::<DocumentView>(
+        app.call(
+            "POST",
+            &restore,
+            Some(&cookie),
+            None,
+            Some(json!({"expected_updated_at":updated.updated_at})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored.body["name"], "Notebook");
+    assert_eq!(restored.body["total"].as_f64(), Some(4.0));
+    assert_eq!(
+        app.call("DELETE", &endpoint, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let (_, trash) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/deleted", c.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(trash.items.len(), 1);
+    let (status, recreated) = json_of::<DocumentView>(
+        app.call("POST", &restore, Some(&cookie), None, Some(json!({})))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recreated.id, d.id);
+    assert_eq!(recreated.created_at, d.created_at);
+    let collection_endpoint = format!("/api/v1/collections/{}", c.id);
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &collection_endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"name":"renamed","expected_updated_at":c.updated_at}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &collection_endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"visibility":"public","expected_updated_at":c.updated_at}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let (other, _) = register(&app, "historyother@example.com", "historyother").await;
+    assert_eq!(
+        app.call(
+            "GET",
+            &format!("{endpoint}/revisions"),
+            Some(&other),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn relationship_rename_backlinks_and_deletion_guards() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "links@example.com", "links").await;
+    let products = create_collection(
+        &app,
+        &cookie,
+        "products",
+        "private",
+        json!({"title_field":"name","fields":[{"name":"name","type":"string"}]}),
+    )
+    .await;
+    let target = create_document(&app, &cookie, &products.id, json!({"name":"Notebook"})).await;
+    let orders=create_collection(&app,&cookie,"orders","private",json!({"title_field":"name","fields":[{"name":"name","type":"string"},{"name":"product","type":"reference","collection":"products","label":"Ordered product"}]})).await;
+    let source = create_document(
+        &app,
+        &cookie,
+        &orders.id,
+        json!({"name":"Order #1","product":target.id}),
+    )
+    .await;
+    let endpoint = format!(
+        "/api/v1/collections/{}/documents/{}",
+        products.id, target.id
+    );
+    let (_, links) = json_of::<Page<vulse_model::ReferenceView>>(
+        app.call(
+            "GET",
+            &format!("{endpoint}/references"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(links.items.len(), 1);
+    assert_eq!(links.items[0].title, "Order #1");
+    assert_eq!(links.items[0].field, "Ordered product");
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&cookie),
+            None,
+            Some(json!({"name":"products only","collection_id":products.id})),
+        )
+        .await,
+    )
+    .await;
+    let (status, scoped) = json_of::<Page<vulse_model::ReferenceView>>(
+        app.call(
+            "GET",
+            &format!("{endpoint}/references"),
+            None,
+            Some(&key.secret),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(scoped.items.is_empty());
+    let (_, duplicate) = json_of::<vulse_model::MutationResult>(
+        app.call(
+            "POST",
+            &format!("/api/v1/collections/{}/bulk", products.id),
+            Some(&cookie),
+            None,
+            Some(json!({"action":"duplicate","ids":[target.id]})),
+        )
+        .await,
+    )
+    .await;
+    let copy = &duplicate.documents[0];
+    let order_copy = create_document(
+        &app,
+        &cookie,
+        &orders.id,
+        json!({"name":"Order copy","product":copy.id}),
+    )
+    .await;
+    let undo = format!(
+        "/api/v1/collections/{}/actions/{}/undo",
+        products.id, duplicate.undo_id
+    );
+    assert_eq!(
+        app.call("POST", &undo, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!(
+                "/api/v1/collections/{}/documents/{}",
+                orders.id, order_copy.id
+            ),
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"product":null}}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call("POST", &undo, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        app.call("DELETE", &endpoint, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.call(
+            "DELETE",
+            &format!("/api/v1/collections/{}", products.id),
+            Some(&cookie),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", products.id),
+            Some(&cookie),
+            None,
+            Some(json!({"name":"catalog"}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (_, renamed) = json_of::<CollectionView>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}", orders.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        renamed.blueprint.fields[1].collection.as_deref(),
+        Some("catalog")
+    );
+    assert_eq!(
+        app.call(
+            "PUT",
+            &format!("/api/v1/collections/{}/documents/{}", orders.id, source.id),
+            Some(&cookie),
+            None,
+            Some(json!({"body":{"name":"Renamed order","product":target.id}}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!("/api/v1/collections/{}/documents/{}", orders.id, source.id),
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"product":null}}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call("DELETE", &endpoint, Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let selfcoll=create_collection(&app,&cookie,"nodes","private",json!({"fields":[{"name":"name","type":"string"},{"name":"parent","type":"reference","collection":"nodes"}]})).await;
+    let a = create_document(&app, &cookie, &selfcoll.id, json!({"name":"A"})).await;
+    let b = create_document(
+        &app,
+        &cookie,
+        &selfcoll.id,
+        json!({"name":"B","parent":a.id}),
+    )
+    .await;
+    assert_eq!(
+        app.call(
+            "POST",
+            &format!("/api/v1/collections/{}/bulk", selfcoll.id),
+            Some(&cookie),
+            None,
+            Some(json!({"action":"delete","ids":[a.id]}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            &format!("/api/v1/collections/{}/bulk", selfcoll.id),
+            Some(&cookie),
+            None,
+            Some(json!({"action":"delete","ids":[a.id,b.id]}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
+
+async fn upsert_csv(
+    app: &TestApp,
+    cookie: &str,
+    id: &str,
+    csv: &str,
+    commit: bool,
+    field: &str,
+) -> axum::response::Response {
+    let body = format!(
+        "--upsert\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--upsert\r\nContent-Disposition: form-data; name=\"commit\"\r\n\r\n{commit}\r\n--upsert\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\nupsert\r\n--upsert\r\nContent-Disposition: form-data; name=\"match_field\"\r\n\r\n{field}\r\n--upsert--\r\n"
+    );
+    app.app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/collections/{id}/import"))
+                .header("cookie", format!("vulse_session={cookie}"))
+                .header("content-type", "multipart/form-data; boundary=upsert")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn upsert_imports_preview_counts_validate_keys_preserve_fields_and_export_views() {
+    use vulse_model::ImportResult;
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "upsert@example.com", "upsert").await;
+    let c=create_collection(&app,&cookie,"products","private",json!({"fields":[{"name":"sku","type":"string","required":true},{"name":"name","type":"string"},{"name":"price","type":"number","required":true},{"name":"total","type":"calculated","formula":"=[price]*2"}]})).await;
+    let first = create_document(
+        &app,
+        &cookie,
+        &c.id,
+        json!({"sku":"A","name":"A, \"quoted\"\nNotebook","price":2}),
+    )
+    .await;
+    let second = create_document(
+        &app,
+        &cookie,
+        &c.id,
+        json!({"sku":"B","name":"=1+2","price":3}),
+    )
+    .await;
+    let csv = "sku,price\nA,5\nB,3\nC,7\n";
+    let (status, preview) =
+        json_of::<ImportResult>(upsert_csv(&app, &cookie, &c.id, csv, false, "sku").await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(preview.errors.is_empty());
+    assert_eq!(
+        (
+            preview.created,
+            preview.updated,
+            preview.unchanged,
+            preview.imported
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(
+        preview.preview_actions,
+        vec!["update", "unchanged", "create"]
+    );
+    assert_eq!(preview.preview[0]["name"], first.body["name"]);
+    assert_eq!(preview.preview[0]["total"].as_f64(), Some(10.0));
+    let (_, bad) = json_of::<ImportResult>(
+        upsert_csv(&app, &cookie, &c.id, "sku,price\nA,8\nA,9\n", true, "sku").await,
+    )
+    .await;
+    assert!(!bad.errors.is_empty());
+    assert_eq!(bad.imported, 0);
+    let endpoint = format!("/api/v1/collections/{}/documents/{}", c.id, first.id);
+    let (_, unchanged) =
+        json_of::<DocumentView>(app.call("GET", &endpoint, Some(&cookie), None, None).await).await;
+    assert_eq!(unchanged.updated_at, first.updated_at);
+    let (_, done) =
+        json_of::<ImportResult>(upsert_csv(&app, &cookie, &c.id, csv, true, "sku").await).await;
+    assert!(done.errors.is_empty());
+    assert_eq!(done.imported, 2);
+    let (_, updated) =
+        json_of::<DocumentView>(app.call("GET", &endpoint, Some(&cookie), None, None).await).await;
+    assert_eq!(updated.id, first.id);
+    assert_eq!(updated.body["name"], first.body["name"]);
+    assert_eq!(updated.body["total"].as_f64(), Some(10.0));
+    let (_, repeat) =
+        json_of::<ImportResult>(upsert_csv(&app, &cookie, &c.id, csv, true, "sku").await).await;
+    assert_eq!(
+        (
+            repeat.created,
+            repeat.updated,
+            repeat.unchanged,
+            repeat.imported
+        ),
+        (0, 0, 3, 0)
+    );
+    let (_, blank) = json_of::<ImportResult>(
+        upsert_csv(&app, &cookie, &c.id, "sku,price,name\nA,,\n", true, "sku").await,
+    )
+    .await;
+    assert!(blank.errors.is_empty());
+    assert_eq!(blank.unchanged, 1);
+    let (_, missing) = json_of::<ImportResult>(
+        upsert_csv(&app, &cookie, &c.id, "sku,price\n,9\n", true, "sku").await,
+    )
+    .await;
+    assert!(!missing.errors.is_empty());
+    assert_eq!(missing.imported, 0);
+    let export = format!("/api/v1/collections/{}/export", c.id);
+    let response=app.call("POST",&export,Some(&cookie),None,Some(json!({"format":"csv","columns":["sku","name","total"],"query":{"filters":[{"field":"price","op":"gt","value":4}],"sort_field":"sku","descending":false,"offset":1,"limit":1}}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("products.csv")
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let mut csv = csv::Reader::from_reader(bytes.as_ref());
+    assert_eq!(
+        csv.headers().unwrap(),
+        &csv::StringRecord::from(vec!["sku", "name", "total"])
+    );
+    let rows = csv.records().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(&rows[0][0], "A");
+    assert_eq!(&rows[0][1], "A, \"quoted\"\nNotebook");
+    assert_eq!(&rows[1][0], "C");
+    let response = app
+        .call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"csv","columns":["name"],"ids":[second.id]})),
+        )
+        .await;
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("'=1+2"));
+    let(status,selected)=json_of::<Vec<DocumentView>>(app.call("POST",&export,Some(&cookie),None,Some(json!({"format":"json","columns":["name"],"ids":[second.id],"query":{"search":"does not match"}}))).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].body, json!({"name":"=1+2"}));
+    assert_eq!(selected[0].id, second.id);
+    assert_eq!(
+        app.call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"csv","columns":["sku; DROP TABLE documents"]}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let (other, _) = register(&app, "upsertother@example.com", "upsertother").await;
+    assert_eq!(
+        app.call(
+            "POST",
+            &export,
+            Some(&other),
+            None,
+            Some(json!({"format":"csv","columns":["sku"]}))
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    // Numeric matching is canonical, while integers above 2^53 remain distinct.
+    let nums = create_collection(
+        &app,
+        &cookie,
+        "numbers",
+        "private",
+        json!({"fields":[{"name":"key","type":"number"},{"name":"name","type":"string"}]}),
+    )
+    .await;
+    create_document(&app, &cookie, &nums.id, json!({"key":1,"name":"One"})).await;
+    create_document(
+        &app,
+        &cookie,
+        &nums.id,
+        json!({"key":9007199254740992u64,"name":"Large"}),
+    )
+    .await;
+    let (_, numeric) = json_of::<ImportResult>(
+        upsert_csv(
+            &app,
+            &cookie,
+            &nums.id,
+            "key,name\n1.0,One\n9007199254740993,Distinct\n",
+            true,
+            "key",
+        )
+        .await,
+    )
+    .await;
+    assert!(numeric.errors.is_empty());
+    assert_eq!((numeric.created, numeric.unchanged), (1, 1));
+    create_document(&app, &cookie, &c.id, json!({"sku":"A","price":1})).await;
+    let (_, duplicate) = json_of::<ImportResult>(
+        upsert_csv(&app, &cookie, &c.id, "sku,price\nA,9\n", true, "sku").await,
+    )
+    .await;
+    assert!(!duplicate.errors.is_empty());
+    assert_eq!(duplicate.imported, 0);
+}
+
+#[tokio::test]
+async fn authentication_work_is_bounded_and_releases_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = crate::test_state(dir.path().to_path_buf()).await.unwrap();
+    let semaphore = state.password_work.clone();
+    let permit = semaphore.clone().acquire_many_owned(4).await.unwrap();
+    let app = TestApp {
+        app: app(state),
+        asset_dir: dir.path().join("assets"),
+        _dir: dir,
+    };
+    let response = app
+        .call(
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            None,
+            Some(json!({"email":"busy@example.com","handle":"busy","password":"password123"})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(permit);
+    let (cookie, _) = register(&app, "busy@example.com", "busy").await;
+    assert_eq!(semaphore.available_permits(), 4);
+    assert_eq!(
+        app.call("GET", "/api/v1/me", Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            None,
+            Some(json!({"email":"busy@example.com","password":"wrongpassword"}))
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(semaphore.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn migrations_backfill_legacy_history_search_and_relationships() {
+    use crate::db::{Db, SqlValue, text_at};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_local(&dir.path().join("legacy.db")).await.unwrap();
+    let conn = db.connect().await.unwrap();
+    conn.execute_batch(include_str!("../migrations/001_init.sql"))
+        .await
+        .unwrap();
+    let source = "550e8400-e29b-41d4-a716-446655440001";
+    let target = "550e8400-e29b-41d4-a716-446655440002";
+    let blueprint = json!({"fields":[{"name":"name","type":"string"},{"name":"parent","type":"reference","collection":"nodes"}]});
+    conn.execute("INSERT INTO users(id,handle,email,password_hash,created_at) VALUES('owner','legacy','legacy@example.com','unused','2026-01-01T00:00:00Z')",&[]).await.unwrap();
+    conn.execute("INSERT INTO collections(id,owner_id,name,visibility,blueprint,created_at,updated_at) VALUES('collection','owner','nodes','private',?1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",&[SqlValue::Text(blueprint.to_string())]).await.unwrap();
+    for (id, body) in [
+        (target, json!({"name":"Parent"})),
+        (source, json!({"name":"Child","parent":target})),
+    ] {
+        conn.execute("INSERT INTO documents(id,collection_id,body,created_at,updated_at) VALUES(?1,'collection',?2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",&[SqlValue::Text(id.into()),SqlValue::Text(body.to_string())]).await.unwrap();
+    }
+    conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);INSERT INTO schema_migrations VALUES(1,'2026-01-01T00:00:00Z');").await.unwrap();
+    crate::migrate::migrate(&conn).await.unwrap();
+    crate::migrate::migrate(&conn).await.unwrap();
+    let links = conn
+        .query("SELECT source_id,target_id FROM document_links", &[])
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(text_at(&links[0], 0).unwrap(), source);
+    assert_eq!(text_at(&links[0], 1).unwrap(), target);
+    let history = conn
+        .query("SELECT action FROM record_revisions", &[])
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|r| text_at(r, 0).unwrap() == "baseline"));
+    let c = crate::store::find_collection(&conn, "owner", "collection")
+        .await
+        .unwrap()
+        .unwrap();
+    let result = crate::records::run_query(
+        &conn,
+        &c,
+        &vulse_model::RecordQuery {
+            search: "Parent".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.total, 1);
+    assert_eq!(result.items[0].id, target);
+}

@@ -164,15 +164,44 @@ Click a text, number or boolean cell to edit it. Enter saves and Escape cancels.
 
 Unsaved record and collection drafts are stored under your account on this device. On returning, choose Restore or Discard. Older record drafts can apply only their changed fields to the latest record; when both edits change the same field, the explicit merge keeps the draft value. Review older schema drafts against the current fields before choosing **Use latest collection version**. Incomplete number/JSON inputs are retained. Storage failures are shown visibly. Saved record history includes field differences and restore controls, and **Trash** recovers deleted record IDs. Existing data receives a baseline version during migration; history cannot reconstruct earlier edits. Restores validate against the current schema, references and files.
 
-Reference fields search their target collection in pages of 25 with readable titles and a related-record link. A record’s **Referenced by** section lists incoming links. Collection renames update every incoming schema atomically; deleting a collection first requires removing any schema fields that target it.
+Reference fields use a searchable picker: a new record starts with nothing selected, typing searches the target collection on the server, results load 25 at a time with **Show more**, and the arrow keys and Enter choose a record. A chosen record shows its title with **Change**, **Clear** and a related-record link. A record’s **Referenced by** section lists incoming links. Collection renames update every incoming schema atomically; deleting a collection first requires removing any schema fields that target it.
 
 CSV and Excel XLSX imports support worksheet selection, column mapping, previews and row-level validation. Choose **Create or update by a unique field** and select a string/number field such as SKU or email. Matching rows keep their IDs and unmapped values; empty cells preserve existing values. Keys are case-sensitive, numbers match by exact decimal value, and duplicate matching keys in either the file or collection stop the entire import. Preview reports new, updated and unchanged rows. A commit revalidates current data and writes only changes. Imports are limited to 1,000 rows per batch and commit atomically: validation failures write no records.
 
-Open **Export records** to choose CSV or JSON. **Export current view** downloads all matching records across pages using visible columns. **Export selected** downloads the selected records. CSV uses API field names as headers and JSON-encodes structured values; formula-like text gets an apostrophe prefix for spreadsheet safety. JSON keeps exact values, IDs, timestamps and calculation errors. Exports have explicit limits of 10,000 records / 25 MB and selected exports allow up to 100 IDs. Narrow the view when exceeding a limit. CSV exports can be imported with matching headers; use JSON for exact value preservation and for backups that include metadata.
+Open **Export records** to choose CSV or JSON. **Export current view** downloads all matching records across pages using visible columns. **Export selected** downloads the selected records. The Export panel can also include columns from related records: for each reference field, tick fields of the collection it points to. CSV adds columns named like `product.name` next to the reference column, with lists of references exported as a JSON list of values. JSON adds a `related` object per record with each related record's `id` and the chosen fields (`"missing": true` if it no longer exists). The API takes `"related": [{"field": "product", "columns": ["name", "price"]}]`; a collection-scoped API key cannot export columns from other collections. CSV uses API field names as headers and JSON-encodes structured values; formula-like text gets an apostrophe prefix for spreadsheet safety. JSON keeps exact values, IDs, timestamps and calculation errors. Exports have explicit limits of 10,000 records / 25 MB and selected exports allow up to 100 IDs. Narrow the view when exceeding a limit. CSV exports can be imported with matching headers; use JSON for exact value preservation and for backups that include metadata.
 
 Database migrations run transactionally on server startup and backfill search indexes, relationship links and baseline history. Rebuild the UI and restart the backend to load these features. No manual database reset is required.
 
 See [calculated fields and imports](docs/CALCULATED_FIELDS.md) for supported functions, examples and compatibility limits, and [the development code review](docs/CODE_REVIEW.md) for review status and verification.
+
+## Summaries and charts
+
+Switch the records toolbar from **Table** to **Summary** to group records and calculate totals. Search and filters apply first, then:
+
+- **Group records by** up to three fields: text, number, true/false, date, reference or calculated fields. Dates can be grouped by day, month or year. References group by the related record and show its title. Text keeps its capitalisation, so `Barnehage1` and `barnehage1` are separate groups. Records without a value form an "(empty)" group, listed last.
+- **Values** (up to 20): sum, average, minimum or maximum of a number or calculated field (minimum and maximum also work on dates), count of records or of non-empty values in a field, count of unique values, or a **formula** over the other values, such as `=[total_revenue]/3.14` or `=[total_revenue]*[average_employees]`. Formulas use the same functions as calculated fields and are worked out per group and for the totals row. A formula that fails, for example dividing by zero, shows "Error" for that group only.
+- **Sort** groups by any group field or value, ascending or descending.
+- **Chart**: a bar or line chart of up to four values on one shared axis, with a legend for two or more values and a tooltip per group on hover or keyboard focus. If the values differ greatly in size, the chart says so. Chart them separately in that case, since one axis makes the smaller ones look flat.
+
+The table lists every group with its record count and an **All records** totals row. **View records →** opens the table filtered to that group. **Export summary CSV** downloads the table. Up to 1,000 groups are shown; a summary with more than 10,000 groups is refused, so group more coarsely or filter first.
+
+A view saved in Summary mode keeps its summary and opens in Summary mode. Field renames update saved summaries.
+
+Over the API, summaries are reads (any role, and collection-scoped keys for their collection):
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/collections/$ID/summary \
+  -H "Authorization: Bearer $VULSE_API_KEY" -H 'content-type: application/json' \
+  -d '{"query":{"filters":[]},"summary":{
+        "group_by":[{"field":"name"}],
+        "measures":[
+          {"name":"total_revenue","op":"sum","field":"revenue"},
+          {"name":"average_employees","op":"average","field":"employees"},
+          {"name":"per_employee","op":"formula","formula":"=[total_revenue]/[average_employees]"}],
+        "sort":"total_revenue","descending":true}}'
+```
+
+`op` is one of `sum`, `average`, `min`, `max`, `count` (without `field` it counts records), `count_unique` or `formula`. A date group takes `"bucket": "day" | "month" | "year"`. The response has `rows` (each with `group` values, readable `labels`, `count`, `values` and any formula `errors`), a `totals` row, `group_count` and `truncated`. `GET /api/v1/collections/{id}/views/{view_id}/summary` runs a saved view's summary. Public collections also accept `POST /api/v1/public/{collection}/summary` without credentials, from any site.
 
 ## Rich text and collection API reference
 

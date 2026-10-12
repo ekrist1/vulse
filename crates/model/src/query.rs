@@ -41,6 +41,9 @@ pub struct SavedViewWrite {
     pub name: String,
     pub query: RecordQuery,
     pub columns: Vec<String>,
+    /// Grouped totals shown in the view's Summary mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::SummarySpec>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedView {
@@ -132,6 +135,9 @@ pub fn validate_query(blueprint: &Blueprint, query: &RecordQuery) -> Result<(), 
 }
 pub fn validate_view(blueprint: &Blueprint, view: &SavedViewWrite) -> Result<(), String> {
     validate_query(blueprint, &view.query)?;
+    if let Some(summary) = &view.summary {
+        crate::validate_summary(blueprint, summary)?;
+    }
     if view.name.trim().is_empty() || view.name.chars().count() > 100 {
         return Err("view name must contain 1–100 characters".into());
     }

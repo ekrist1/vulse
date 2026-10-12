@@ -328,6 +328,9 @@ pub async fn rename_view_fields(
         rename(&mut config.query.sort_field);
         rename(&mut config.query.group_field);
         config.columns.iter_mut().for_each(rename);
+        if let Some(summary) = &mut config.summary {
+            vulse_model::rename_summary_fields(summary, renames);
+        }
         if config != original {
             conn.execute(
                 "UPDATE collection_views SET config=?1 WHERE id=?2",

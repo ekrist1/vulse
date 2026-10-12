@@ -3205,3 +3205,426 @@ async fn renaming_fields_moves_values_formulas_titles_and_views() {
         );
     }
 }
+
+#[tokio::test]
+async fn exports_include_columns_from_related_records() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "related@example.com", "related").await;
+    let products = create_collection(
+        &app,
+        &cookie,
+        "products",
+        "private",
+        json!({"fields":[{"name":"name","type":"string"},{"name":"price","type":"number"},
+            {"name":"double","type":"calculated","formula":"=[price]*2"}]}),
+    )
+    .await;
+    let saw = create_document(
+        &app,
+        &cookie,
+        &products.id,
+        json!({"name":"Saw","price":10}),
+    )
+    .await;
+    let pen = create_document(
+        &app,
+        &cookie,
+        &products.id,
+        json!({"name":"=Pen","price":2}),
+    )
+    .await;
+    let orders = create_collection(
+        &app,
+        &cookie,
+        "orders",
+        "private",
+        json!({"fields":[{"name":"code","type":"string"},
+            {"name":"product","type":"reference","collection":"products"},
+            {"name":"extras","type":"array","items":"reference","collection":"products"}]}),
+    )
+    .await;
+    create_document(
+        &app,
+        &cookie,
+        &orders.id,
+        json!({"code":"A1","product":saw.id,"extras":[pen.id,saw.id]}),
+    )
+    .await;
+    create_document(&app, &cookie, &orders.id, json!({"code":"B2"})).await;
+    let export = format!("/api/v1/collections/{}/export", orders.id);
+    let body = |response: axum::response::Response| async move {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    };
+
+    let (status, csv) = body(
+        app.call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"csv","columns":["code","product"],"query":{"sort_field":"code","descending":false},
+                "related":[{"field":"product","columns":["name","double"]},{"field":"extras","columns":["name"]}]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{csv}");
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(
+        lines[0],
+        "code,product,product.name,product.double,extras.name"
+    );
+    assert_eq!(
+        lines[1],
+        format!("A1,{},Saw,20.0,\"[\"\"=Pen\"\",\"\"Saw\"\"]\"", saw.id)
+    );
+    assert_eq!(lines[2], "B2,,,,[]");
+
+    let (status, json) = body(
+        app.call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"json","columns":["code"],"query":{"sort_field":"code","descending":false},
+                "related":[{"field":"product","columns":["price"]},{"field":"extras","columns":["name"]}]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let rows: Vec<Value> = serde_json::from_str(&json).unwrap();
+    assert_eq!(rows[0]["body"], json!({"code":"A1"}));
+    assert_eq!(
+        rows[0]["related"]["product"],
+        json!({"id":saw.id,"price":10})
+    );
+    assert_eq!(
+        rows[0]["related"]["extras"],
+        json!([{"id":pen.id,"name":"=Pen"},{"id":saw.id,"name":"Saw"}])
+    );
+    assert_eq!(rows[1]["related"], json!({"product":null,"extras":[]}));
+
+    // Plain exports keep their shape.
+    let (_, plain) = body(
+        app.call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"json","columns":["code"]})),
+        )
+        .await,
+    )
+    .await;
+    assert!(!plain.contains("related"));
+
+    for (related, expected) in [
+        (
+            json!([{"field":"code","columns":["name"]}]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!([{"field":"product","columns":["missing"]}]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!([{"field":"product","columns":[]}]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!([{"field":"product","columns":["name"]},{"field":"product","columns":["price"]}]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            app.call(
+                "POST",
+                &export,
+                Some(&cookie),
+                None,
+                Some(json!({"format":"csv","columns":["code"],"related":related}))
+            )
+            .await
+            .status(),
+            expected,
+            "{related}"
+        );
+    }
+
+    // A key scoped to orders cannot read products through a link.
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call(
+            "POST",
+            "/api/v1/api-keys",
+            Some(&cookie),
+            None,
+            Some(json!({"name":"orders only","collection_id":orders.id})),
+        )
+        .await,
+    )
+    .await;
+    let scoped = |related: Value| {
+        let app = &app;
+        let export = export.clone();
+        let secret = key.secret.clone();
+        async move {
+            app.call(
+                "POST",
+                &export,
+                None,
+                Some(&secret),
+                Some(json!({"format":"csv","columns":["code"],"related":related})),
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(scoped(json!([])).await, StatusCode::OK);
+    assert_eq!(
+        scoped(json!([{"field":"product","columns":["name"]}])).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn summaries_group_aggregate_calculate_and_save_with_views() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "summary@example.com", "summary").await;
+    let regions = create_collection(
+        &app,
+        &cookie,
+        "regions",
+        "private",
+        json!({"fields":[{"name":"title","type":"string"}]}),
+    )
+    .await;
+    let north = create_document(&app, &cookie, &regions.id, json!({"title":"North"})).await;
+    let kids = create_collection(
+        &app,
+        &cookie,
+        "kindergartens",
+        "public",
+        json!({"fields":[
+            {"name":"name","type":"string"},
+            {"name":"revenue","type":"number"},
+            {"name":"employees","type":"number"},
+            {"name":"opened","type":"date"},
+            {"name":"region","type":"reference","collection":"regions"},
+            {"name":"per_employee","type":"calculated","formula":"=[revenue]/[employees]"}
+        ]}),
+    )
+    .await;
+    for body in [
+        json!({"name":"Barnehage1","revenue":1000,"employees":4,"opened":"2026-01-15","region":north.id}),
+        json!({"name":"Barnehage1","revenue":2000,"employees":5,"opened":"2026-01-20","region":north.id}),
+        json!({"name":"Barnehage2","revenue":4000,"employees":10,"opened":"2026-03-02"}),
+        json!({"name":"barnehage1","revenue":0.5,"employees":1}),
+        json!({"revenue":7,"employees":1}),
+    ] {
+        create_document(&app, &cookie, &kids.id, body).await;
+    }
+    let endpoint = format!("/api/v1/collections/{}/summary", kids.id);
+    let summarize = |body: Value| {
+        let app = &app;
+        let cookie = cookie.clone();
+        let endpoint = endpoint.clone();
+        async move {
+            let response = app
+                .call("POST", &endpoint, Some(&cookie), None, Some(body))
+                .await;
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+    let spec = json!({
+        "group_by":[{"field":"name"}],
+        "measures":[
+            {"name":"total_revenue","op":"sum","field":"revenue"},
+            {"name":"average_employees","op":"average","field":"employees"},
+            {"name":"records","op":"count"},
+            {"name":"scaled","op":"formula","formula":"=[total_revenue]/3.14"},
+            {"name":"combined","op":"formula","formula":"=[total_revenue]*[average_employees]"}
+        ]
+    });
+    let (status, result) = summarize(json!({"summary":spec})).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let rows = result["rows"].as_array().unwrap();
+    // Case is kept, so "barnehage1" is its own group; records without a name come last.
+    let names: Vec<_> = rows.iter().map(|r| r["group"][0].clone()).collect();
+    assert_eq!(
+        names,
+        vec![
+            json!("Barnehage1"),
+            json!("barnehage1"),
+            json!("Barnehage2"),
+            Value::Null
+        ]
+    );
+    assert_eq!(rows[0]["values"]["total_revenue"], 3000);
+    assert_eq!(rows[0]["values"]["average_employees"], 4.5);
+    assert_eq!(rows[0]["values"]["records"], 2);
+    assert_eq!(rows[0]["values"]["combined"].as_f64(), Some(13500.0));
+    assert!((rows[0]["values"]["scaled"].as_f64().unwrap() - 955.414).abs() < 0.001);
+    assert_eq!(rows[2]["values"]["total_revenue"], 4000);
+    assert_eq!(rows[2]["values"]["average_employees"], 10);
+    assert_eq!(rows[3]["labels"][0], "(empty)");
+    assert_eq!(result["totals"]["count"], 5);
+    assert_eq!(result["totals"]["values"]["total_revenue"], 7007.5);
+    assert_eq!(result["group_count"], 4);
+    assert_eq!(result["truncated"], false);
+
+    // Filters apply first; sorting by a value; date buckets; reference titles;
+    // calculated fields can be aggregated; dates have min and max.
+    let (status, result) = summarize(json!({
+        "query":{"filters":[{"field":"revenue","op":"gte","value":1000}]},
+        "summary":{
+            "group_by":[{"field":"opened","bucket":"month"},{"field":"region"}],
+            "measures":[
+                {"name":"revenue","op":"sum","field":"revenue"},
+                {"name":"best_ratio","op":"max","field":"per_employee"},
+                {"name":"first","op":"min","field":"opened"},
+                {"name":"names","op":"count_unique","field":"name"}
+            ],
+            "sort":"revenue","descending":true
+        }
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let rows = result["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["group"], json!(["2026-03", null]));
+    assert_eq!(rows[0]["labels"], json!(["2026-03", "(empty)"]));
+    assert_eq!(rows[1]["group"], json!(["2026-01", north.id]));
+    assert_eq!(rows[1]["labels"], json!(["2026-01", "North"]));
+    assert_eq!(
+        rows[1]["values"],
+        json!({"revenue":3000,"best_ratio":400,"first":"2026-01-15","names":1})
+    );
+
+    let (status, error) =
+        summarize(json!({"summary":{"measures":[{"name":"t","op":"sum","field":"name"}]}})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("sum cannot be used")
+    );
+
+    // Saved with a view, runnable by id, and readable by viewers.
+    let views = format!("/api/v1/collections/{}/views", kids.id);
+    let (status, view) = json_of::<vulse_model::SavedView>(
+        app.call(
+            "POST",
+            &views,
+            Some(&cookie),
+            None,
+            Some(
+                json!({"name":"Per kindergarten","query":{},"columns":["name"],"summary":{
+                    "group_by":[{"field":"name"}],
+                    "measures":[{"name":"total_revenue","op":"sum","field":"revenue"}],
+                    "chart":{"kind":"bar","measures":["total_revenue"]}
+                }}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (viewer, _) = register_as(&app, "sv@example.com", "sv", Role::Viewer).await;
+    let (status, saved) = json_of::<vulse_model::SummaryResult>(
+        app.call(
+            "GET",
+            &format!("{views}/{}/summary", view.id),
+            Some(&viewer),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved.rows[0].values["total_revenue"], 3000);
+    assert_eq!(
+        app.call(
+            "POST",
+            &views,
+            Some(&cookie),
+            None,
+            Some(json!({"name":"Bad","query":{},"columns":["name"],"summary":{"measures":[{"name":"x","op":"sum","field":"nope"}]}}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Renaming a field keeps saved summaries working.
+    let mut blueprint = kids.blueprint.clone();
+    blueprint.fields[0].name = "school".into();
+    blueprint.fields[0].renamed_from = Some("name".into());
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", kids.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":blueprint}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (status, renamed) = json_of::<vulse_model::SummaryResult>(
+        app.call(
+            "GET",
+            &format!("{views}/{}/summary", view.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed.rows[0].group[0], "Barnehage1");
+
+    // Public collections can be summarized without credentials, even cross-site.
+    let public_spec = json!({"summary":{"measures":[{"name":"n","op":"count"}]}});
+    let response = app
+        .call_with(
+            "POST",
+            "/api/v1/public/kindergartens/summary",
+            None,
+            None,
+            Some(public_spec.clone()),
+            &[
+                ("sec-fetch-site", "cross-site"),
+                ("origin", "https://site.example"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            "/api/v1/public/regions/summary",
+            None,
+            None,
+            Some(public_spec)
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}

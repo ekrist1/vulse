@@ -423,3 +423,14 @@ pub async fn export_records(
     }
     response.binary().await.map_err(|e| e.to_string())
 }
+
+pub async fn summarize(
+    collection: &str,
+    request: &vulse_model::SummaryRequest,
+) -> Result<vulse_model::SummaryResult, String> {
+    send_json(
+        Request::post(&format!("/api/v1/collections/{collection}/summary")),
+        request,
+    )
+    .await
+}

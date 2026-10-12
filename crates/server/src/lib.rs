@@ -15,6 +15,7 @@ mod relationships;
 mod security;
 mod state;
 mod store;
+mod summary;
 mod timeutil;
 mod users;
 
@@ -149,6 +150,11 @@ fn api() -> Router<AppState> {
         )
         .route("/collections/{id}/query", post(records::query_records))
         .route("/collections/{id}/export", post(export::export_records))
+        .route("/collections/{id}/summary", post(summary::summarize))
+        .route(
+            "/collections/{id}/views/{view_id}/summary",
+            get(summary::view_summary),
+        )
         .route("/collections/{id}/bulk", post(mutations::bulk_records))
         .route(
             "/collections/{id}/actions/{action_id}/undo",
@@ -172,6 +178,10 @@ fn api() -> Router<AppState> {
         .route(
             "/public/{collection}",
             get(public::list_documents).options(public::options),
+        )
+        .route(
+            "/public/{collection}/summary",
+            post(public::summary).options(public::options),
         )
         .route(
             "/public/{collection}/{doc_id}",

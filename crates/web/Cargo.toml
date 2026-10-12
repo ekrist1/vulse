@@ -23,6 +23,7 @@ futures-channel = "0.3"
 uuid = { version = "1", features = ["v4", "js"] }
 web-sys = { version = "0.3", features = [
     "Blob",
+    "Document",
     "Element",
     "Location",
     "File",
@@ -34,6 +35,8 @@ web-sys = { version = "0.3", features = [
     "HtmlSelectElement",
     "HtmlTextAreaElement",
     "RequestCredentials",
+    "ResizeObserver",
+    "ResizeObserverEntry",
     "Window",
     "Storage",
 ] }

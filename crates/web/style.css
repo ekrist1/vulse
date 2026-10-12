@@ -115,3 +115,73 @@ button.toolbar-toggle.active{background:#e7f4f1;border-color:#9ccfc4;color:var(-
 .records-panel .column-picker p{flex-basis:100%;margin:0 0 4px}
 .records-panel .column-picker label{margin:0}
 @media(max-width:600px){.records-toolbar{padding:12px}.records-search{flex-basis:100%}.records-toolbar>select{flex:1 1 100%;max-width:none}.records-count{margin-left:0;flex-basis:100%}.records-panel{margin-inline:12px}.filter-chips{padding-inline:12px}.records-panel .records-controls{grid-template-columns:1fr}}
+.reference-picker{position:relative}
+.reference-selected{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.reference-value{flex:1 1 200px;min-width:0;padding:.55rem .8rem;border:1px solid #cbd8dc;border-radius:8px;background:#f7fbfa;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reference-selected button{min-height:38px;padding:.45rem .8rem}
+.combobox-list{position:absolute;z-index:20;left:0;right:0;top:calc(100% - 2px);max-height:300px;overflow:auto;margin:4px 0 0;padding:4px;list-style:none;background:white;border:1px solid #cbd8dc;border-radius:10px;box-shadow:0 12px 32px #12303a24}
+.combobox>input+.combobox-list{top:44px}
+.combobox-list [role=option]{padding:.55rem .7rem;border-radius:6px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.combobox-list [role=option].active,.combobox-list [role=option]:hover{background:#e7f4f1}
+.combobox-list [role=option].current{font-weight:650;color:var(--accent)}
+.combobox-note{padding:.55rem .7rem;color:var(--muted)}
+.combobox-more{padding:4px}
+.combobox-more button{width:100%;min-height:32px;font-size:.85rem}
+.export-related{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.export-related p{margin:0 0 10px;font-size:.85rem}
+.export-related fieldset{display:flex;flex-wrap:wrap;gap:6px 18px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0 0 10px}
+.export-related legend{font-weight:650;font-size:.85rem;padding:0 4px}
+.mode-switch{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:white}
+.mode-switch button{background:white;color:var(--muted);border:0;border-radius:0;min-height:36px;padding:.4rem .85rem;font-size:.88rem;box-shadow:none}
+.mode-switch button+button{border-left:1px solid var(--line)}
+.mode-switch button[aria-pressed=true]{background:#e7f4f1;color:var(--accent)}
+.mode-switch button:hover{box-shadow:none;background:#eef4f5}
+.summary-panel{padding:0 20px 20px}
+.summary-builder{border:1px solid var(--line);border-radius:10px;background:#fafcfc;margin:16px 0}
+.summary-builder>summary{cursor:pointer;padding:12px 14px;font-weight:650}
+.summary-builder[open]>summary{border-bottom:1px solid var(--line)}
+.summary-section{padding:12px 14px;border-bottom:1px solid var(--line)}
+.summary-section:last-child{border-bottom:0}
+.summary-section h3{margin:0 0 8px;font-size:.85rem;color:var(--muted);font-weight:650}
+.summary-row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin-bottom:10px}
+.summary-row label{margin:0;flex:1 1 160px;min-width:0}
+.summary-row label.formula-input{flex:3 1 320px}
+.summary-row button{min-height:40px}
+.summary-options{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
+.summary-options label{margin:0;flex:1 1 160px}
+.chart-series{flex-basis:100%;display:flex;flex-wrap:wrap;gap:6px 18px;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:0}
+.chart-series legend{font-size:.8rem;font-weight:650;padding:0 4px}
+.summary-results.refreshing{opacity:.55;transition:opacity .2s}
+.summary-loading{padding:8px 0}
+.summary-table-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:14px 0 8px}
+.summary-table th.number,.summary-table td.number{text-align:right;font-variant-numeric:tabular-nums}
+.summary-table tfoot th{background:#f4f7f8;color:var(--ink);font-size:.85rem;border-bottom:0}
+.summary-table td .text-button{min-height:28px;padding:.2rem .4rem;font-size:.85rem}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.summary-chart{--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-4:#eda100;--chart-surface:#fff;--grid:#e8eef0;--axis:#c6d3d7;margin:16px 0 0;padding:14px 16px 8px;border:1px solid var(--line);border-radius:10px;background:var(--chart-surface)}
+.summary-chart figcaption{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 16px;align-items:center;margin-bottom:6px;font-size:.9rem}
+.chart-legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:.82rem;color:var(--muted)}
+.legend-item{display:inline-flex;align-items:center;gap:6px}
+.summary-chart .key{display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--key)}
+.summary-chart .key.line-key,.chart-tooltip .key{width:14px;height:2px;border-radius:1px}
+.summary-chart .series-1{--key:var(--series-1)}.summary-chart .series-2{--key:var(--series-2)}.summary-chart .series-3{--key:var(--series-3)}.summary-chart .series-4{--key:var(--series-4)}
+.chart-note{font-size:.8rem;margin:0 0 6px}
+.chart-scroll{overflow-x:auto}
+.chart-frame{position:relative}
+.summary-chart svg{display:block;overflow:visible;font-size:11px}
+.summary-chart svg text{fill:var(--muted)}
+.summary-chart .grid{stroke:var(--grid);stroke-width:1}
+.summary-chart .axis{stroke:var(--axis);stroke-width:1}
+.summary-chart .mark{fill:var(--key)}
+.summary-chart .line{fill:none;stroke:var(--key);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.summary-chart .dot{fill:var(--key);stroke:var(--chart-surface);stroke-width:2}
+.summary-chart .hit{fill:transparent;cursor:default;outline:none}
+.summary-chart .hit:focus-visible{stroke:#38a99f;stroke-width:2}
+.summary-chart .hover-band{fill:#eef5f4}
+.summary-chart .crosshair{stroke:var(--axis);stroke-width:1}
+.chart-tooltip{position:absolute;top:8px;z-index:5;min-width:150px;pointer-events:none;background:white;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px #12303a1f;padding:8px 10px;font-size:.8rem}
+.tooltip-title{font-weight:650;margin-bottom:4px;color:var(--ink)}
+.tooltip-row{display:flex;align-items:center;gap:6px;line-height:1.6}
+.tooltip-row strong{color:var(--ink);font-variant-numeric:tabular-nums}
+@media(max-width:600px){.summary-panel{padding:0 12px 12px}}
+.table-scroll{position:relative}

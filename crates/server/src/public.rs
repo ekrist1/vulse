@@ -53,12 +53,34 @@ pub async fn get_asset(
     }
 }
 
+/// Grouped totals of a public collection. Uses the same request as the
+/// authenticated summary endpoint.
+pub async fn summary(
+    State(state): State<AppState>,
+    Path(path): Path<PublicCollectionPath>,
+    Json(request): Json<vulse_model::SummaryRequest>,
+) -> Response {
+    public_response(summary_inner(state, path, request).await)
+}
+
+async fn summary_inner(
+    state: AppState,
+    path: PublicCollectionPath,
+    request: vulse_model::SummaryRequest,
+) -> Result<Json<vulse_model::SummaryResult>, AppError> {
+    let conn = state.db.connect().await?;
+    let collection = public_collection(&conn, &path.collection).await?;
+    Ok(Json(
+        crate::summary::run_summary(&conn, &collection, &request).await?,
+    ))
+}
+
 pub async fn options() -> Response {
     (
         StatusCode::NO_CONTENT,
         [
             (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
             (header::ACCESS_CONTROL_ALLOW_HEADERS, "*"),
             (header::ACCESS_CONTROL_MAX_AGE, "86400"),
         ],

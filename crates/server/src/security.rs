@@ -123,7 +123,10 @@ pub async fn same_origin_writes(
     let method = request.method();
     let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     let headers = request.headers();
-    if safe || headers.contains_key(header::AUTHORIZATION) {
+    // Public endpoints ignore cookies, so cross-site calls are expected there.
+    let path = request.uri().path();
+    let public = path.starts_with("/public/") || path.starts_with("/api/v1/public/");
+    if safe || public || headers.contains_key(header::AUTHORIZATION) {
         return next.run(request).await;
     }
     let fetch_site = headers

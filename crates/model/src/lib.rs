@@ -11,6 +11,12 @@ pub use formula::{
 };
 mod identity;
 mod portable_text;
+mod summary;
+pub use summary::{
+    ChartKind, DateBucket, MAX_CHART_SERIES, MAX_GROUP_FIELDS, MAX_MEASURES, MAX_SUMMARY_GROUPS,
+    SummaryChart, SummaryGroup, SummaryMeasure, SummaryOp, SummaryRequest, SummaryResult,
+    SummaryRow, SummarySpec, apply_summary_formulas, rename_summary_fields, validate_summary,
+};
 
 pub use blueprint::{
     ArrayItems, Blueprint, CheckedDocument, DocumentRef, FieldDef, FieldType, record_title,
@@ -364,4 +370,16 @@ pub struct ExportRequest {
     pub columns: Vec<String>,
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Columns to include from records that reference fields point to.
+    #[serde(default)]
+    pub related: Vec<RelatedColumns>,
+}
+
+/// For one reference field (or list of references), the fields of the
+/// referenced records to export. CSV adds `field.column` columns; JSON adds
+/// a `related` object keyed by field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedColumns {
+    pub field: String,
+    pub columns: Vec<String>,
 }

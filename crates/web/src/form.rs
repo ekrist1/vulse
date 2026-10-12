@@ -3,7 +3,7 @@ use vulse_model::{
     ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType,
     validate_portable_text,
 };
-use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 use crate::api;
@@ -445,6 +445,8 @@ struct RefSelectProps {
     on_change: Callback<ValueInput>,
 }
 
+/// Searchable picker for one related record. Results load only while the
+/// list is open, 25 at a time, so large collections stay fast.
 #[function_component(RefSelect)]
 fn ref_select(props: &RefSelectProps) -> Html {
     let documents = use_state(Vec::<DocumentView>::new);
@@ -454,7 +456,13 @@ fn ref_select(props: &RefSelectProps) -> Html {
     let total = use_state(|| 0u64);
     let loading = use_state(|| false);
     let error = use_state(String::new);
+    let open = use_state(|| false);
+    let active = use_state(|| None::<usize>);
+    // Shows the search box while a value is set, after "Change".
+    let changing = use_state(|| false);
+    let input = use_node_ref();
     let epoch = use_mut_ref(|| 0usize);
+    let list_id = use_memo((), |_| format!("ref-{}", uuid::Uuid::new_v4().simple()));
     let target = props
         .collections
         .iter()
@@ -467,39 +475,47 @@ fn ref_select(props: &RefSelectProps) -> Html {
         let error = error.clone();
         let epoch = epoch.clone();
         use_effect_with(
-            (target.clone(), (*search).clone(), *offset),
-            move |(target, search, offset)| {
+            (target.clone(), (*search).clone(), *offset, *open),
+            move |(target, search, offset, open)| {
                 *epoch.borrow_mut() += 1;
                 let generation = *epoch.borrow();
                 let (target, search, offset) = (target.clone(), search.clone(), *offset);
-                loading.set(true);
-                let timer = gloo_timers::callback::Timeout::new(200, move || {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        if let Some(target) = target {
-                            let q = vulse_model::RecordQuery {
-                                search,
-                                offset,
-                                sort_field: "updated_at".into(),
-                                limit: 25,
-                                ..Default::default()
-                            };
-                            match api::query_records(&target.id, &q).await {
-                                Ok(page) if *epoch.borrow() == generation => {
-                                    documents.set(page.items);
-                                    total.set(page.total);
-                                    error.set(String::new());
+                let timer = (*open).then(|| {
+                    loading.set(true);
+                    gloo_timers::callback::Timeout::new(200, move || {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Some(target) = target {
+                                let q = vulse_model::RecordQuery {
+                                    search,
+                                    offset,
+                                    sort_field: "updated_at".into(),
+                                    limit: 25,
+                                    ..Default::default()
+                                };
+                                match api::query_records(&target.id, &q).await {
+                                    Ok(page) if *epoch.borrow() == generation => {
+                                        let mut next = if offset == 0 {
+                                            Vec::new()
+                                        } else {
+                                            (*documents).clone()
+                                        };
+                                        next.extend(page.items);
+                                        documents.set(next);
+                                        total.set(page.total);
+                                        error.set(String::new());
+                                    }
+                                    Err(e) if *epoch.borrow() == generation => error.set(e),
+                                    _ => {}
                                 }
-                                Err(e) if *epoch.borrow() == generation => error.set(e),
-                                _ => {}
+                            } else {
+                                documents.set(vec![]);
+                                total.set(0);
+                                error.set("The referenced collection is unavailable. Reload the collection fields.".into());
                             }
-                        } else {
-                            documents.set(vec![]);
-                            total.set(0);
-                            error.set("The referenced collection is unavailable. Reload the collection fields.".into());
-                        }
-                        if *epoch.borrow() == generation {
-                            loading.set(false);
-                        }
+                            if *epoch.borrow() == generation {
+                                loading.set(false);
+                            }
+                        })
                     })
                 });
                 move || drop(timer)
@@ -512,31 +528,188 @@ fn ref_select(props: &RefSelectProps) -> Html {
         use_effect_with(
             (target.clone(), props.value.clone()),
             move |(target, value)| {
-                selected.set(None);
-                let (target, value) = (target.clone(), value.clone());
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Some(target) = target {
-                        if !value.is_empty() {
-                            match api::document(&target.id, &value).await {
-                                Ok(d) => selected.set(Some(d)),
-                                Err(e) => error.set(e),
+                if selected.as_ref().map(|d| &d.id) != Some(value) {
+                    selected.set(None);
+                    let (target, value) = (target.clone(), value.clone());
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Some(target) = target {
+                            if !value.is_empty() {
+                                match api::document(&target.id, &value).await {
+                                    Ok(d) => selected.set(Some(d)),
+                                    Err(e) => error.set(e),
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             },
         );
     }
-    let on_change = props.on_change.clone();
-    html! {<div class="reference-picker stack"><input type="search" aria-label={format!("Search {} records",props.collection_name)} placeholder="Search by title or content…" value={(*search).clone()} oninput={Callback::from({let search=search.clone();let offset=offset.clone();move |e:InputEvent|{search.set(e.target_unchecked_into::<HtmlInputElement>().value());offset.set(0);}})}/>
-        <select aria-label={format!("Choose {} record",props.collection_name)} value={props.value.clone()} disabled={*loading} onchange={Callback::from(move |e:Event|on_change.emit(ValueInput::Reference(e.target_unchecked_into::<HtmlSelectElement>().value())))}>
-            <option value="">{"Select a record"}</option>
-            if let Some(d)=selected.as_ref().filter(|d|!documents.iter().any(|r|r.id==d.id)){<option value={d.id.clone()} selected={d.id==props.value}>{document_label(d,target.as_ref().map(|c|&c.blueprint))}</option>}
-            {for documents.iter().map(|d|html!{<option value={d.id.clone()} selected={d.id==props.value}>{document_label(d,target.as_ref().map(|c|&c.blueprint))}</option>})}
-        </select>
-        <div class="row"><span class="muted">{if *loading{"Searching…".into()}else{format!("{} matching records",*total)}}</span><button type="button" class="secondary" disabled={*offset==0||*loading} onclick={Callback::from({let offset=offset.clone();move |_|offset.set(offset.saturating_sub(25))})}>{"Previous matches"}</button><button type="button" class="secondary" disabled={(*offset as u64+25)>=*total||*loading} onclick={Callback::from({let offset=offset.clone();move |_|offset.set(*offset+25)})}>{"More matches"}</button></div>
-        if let Some(target)=target{if !props.value.is_empty(){<yew_router::components::Link<crate::app::Route> to={crate::app::Route::Document{id:target.id.clone(),doc_id:props.value.clone()}}>{format!("Open {} →",selected.as_ref().map(|d|vulse_model::record_title(&target.blueprint,&d.body,&d.id)).unwrap_or_else(||"related record".into()))}</yew_router::components::Link<crate::app::Route>>}}
-        if !error.is_empty(){<p class="error" role="alert">{(*error).clone()}</p>}
+    {
+        // Focus the search box when "Change" reveals it.
+        let input = input.clone();
+        use_effect_with(*changing, move |changing| {
+            if *changing {
+                if let Some(element) = input.cast::<HtmlInputElement>() {
+                    let _ = element.focus();
+                }
+            }
+        });
+    }
+    {
+        // Keep the keyboard-highlighted option visible.
+        let list_id = (*list_id).clone();
+        use_effect_with(*active, move |active| {
+            if let Some(index) = active {
+                if let Some(element) = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.get_element_by_id(&format!("{list_id}-{index}")))
+                {
+                    element.scroll_into_view_with_bool(false);
+                }
+            }
+        });
+    }
+    let blueprint = target.as_ref().map(|c| c.blueprint.clone());
+    let pick = {
+        let on_change = props.on_change.clone();
+        let (selected, open, active, changing, search, offset) = (
+            selected.clone(),
+            open.clone(),
+            active.clone(),
+            changing.clone(),
+            search.clone(),
+            offset.clone(),
+        );
+        Callback::from(move |document: DocumentView| {
+            on_change.emit(ValueInput::Reference(document.id.clone()));
+            selected.set(Some(document));
+            open.set(false);
+            active.set(None);
+            changing.set(false);
+            search.set(String::new());
+            offset.set(0);
+        })
+    };
+    let close = {
+        let (open, active, changing) = (open.clone(), active.clone(), changing.clone());
+        Callback::from(move |_: ()| {
+            open.set(false);
+            active.set(None);
+            changing.set(false);
+        })
+    };
+    let name = props.collection_name.clone();
+    let list_id = (*list_id).clone();
+    let error_line = html! {
+        if !error.is_empty() {<p class="error" role="alert">{(*error).clone()}</p>}
+    };
+    if !props.value.is_empty() && !*changing {
+        let label = selected
+            .as_ref()
+            .map(|d| document_label(d, blueprint.as_ref()))
+            .unwrap_or_else(|| "Loading…".into());
+        let clear = {
+            let on_change = props.on_change.clone();
+            let selected = selected.clone();
+            Callback::from(move |_| {
+                on_change.emit(ValueInput::Reference(String::new()));
+                selected.set(None);
+            })
+        };
+        return html! {<div class="reference-picker">
+            <div class="reference-selected">
+                <span class="reference-value">{label}</span>
+                <button type="button" class="secondary" aria-label={format!("Change {name} record")} onclick={Callback::from({let changing=changing.clone();move |_|changing.set(true)})}>{"Change"}</button>
+                <button type="button" class="text-button" aria-label={format!("Clear {name} record")} onclick={clear}>{"Clear"}</button>
+                if let Some(target)=&target {
+                    <yew_router::components::Link<crate::app::Route> to={crate::app::Route::Document{id:target.id.clone(),doc_id:props.value.clone()}}>{format!("Open {} →",selected.as_ref().map(|d|vulse_model::record_title(&target.blueprint,&d.body,&d.id)).unwrap_or_else(||"related record".into()))}</yew_router::components::Link<crate::app::Route>>
+                }
+            </div>
+            {error_line}
+        </div>};
+    }
+    let count = documents.len();
+    let onkeydown = {
+        let (open, active, documents, pick, close) = (
+            open.clone(),
+            active.clone(),
+            documents.clone(),
+            pick.clone(),
+            close.clone(),
+        );
+        Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
+            "ArrowDown" | "ArrowUp" => {
+                e.prevent_default();
+                open.set(true);
+                if count > 0 {
+                    let next = match (*active, e.key() == "ArrowDown") {
+                        (None, true) => 0,
+                        (None, false) => count - 1,
+                        (Some(i), true) => (i + 1) % count,
+                        (Some(i), false) => (i + count - 1) % count,
+                    };
+                    active.set(Some(next));
+                }
+            }
+            "Enter" if *open => {
+                e.prevent_default();
+                if let Some(document) = active.and_then(|i| documents.get(i)) {
+                    pick.emit(document.clone());
+                }
+            }
+            "Escape" if *open => {
+                e.prevent_default();
+                close.emit(());
+            }
+            _ => {}
+        })
+    };
+    let keep_focus = Callback::from(|e: MouseEvent| e.prevent_default());
+    html! {<div class="reference-picker combobox">
+        <input
+            ref={input}
+            type="text"
+            role="combobox"
+            autocomplete="off"
+            aria-label={format!("Search {name} records")}
+            aria-autocomplete="list"
+            aria-expanded={open.to_string()}
+            aria-controls={list_id.clone()}
+            aria-activedescendant={active.map(|i| format!("{list_id}-{i}"))}
+            placeholder={if props.value.is_empty() {format!("Search {name}…")} else {"Search for a replacement…".into()}}
+            value={(*search).clone()}
+            onfocus={Callback::from({let open=open.clone();move |_|open.set(true)})}
+            onclick={Callback::from({let open=open.clone();move |_|open.set(true)})}
+            onblur={Callback::from({let close=close.clone();move |_|close.emit(())})}
+            oninput={Callback::from({let (search,offset,open,active)=(search.clone(),offset.clone(),open.clone(),active.clone());move |e:InputEvent|{search.set(e.target_unchecked_into::<HtmlInputElement>().value());offset.set(0);open.set(true);active.set(None);}})}
+            {onkeydown}
+        />
+        if *open {
+            <ul class="combobox-list" role="listbox" id={list_id.clone()} aria-label={format!("{name} records")}>
+                if documents.is_empty() {
+                    <li class="combobox-note" role="presentation">{if *loading {"Searching…"} else {"No matching records"}}</li>
+                }
+                { for documents.iter().enumerate().map(|(index, document)| {
+                    let title = blueprint.as_ref().map(|b| vulse_model::record_title(b, &document.body, &document.id)).unwrap_or_else(|| document.id.clone());
+                    let choose = {let pick=pick.clone();let document=document.clone();Callback::from(move |e:MouseEvent|{e.prevent_default();pick.emit(document.clone());})};
+                    html! {<li id={format!("{list_id}-{index}")} role="option" aria-selected={(*active==Some(index)).to_string()} class={classes!((document.id==props.value).then_some("current"), (*active==Some(index)).then_some("active"))} onmousedown={choose}>
+                        {title}<span class="muted">{format!(" · {}", document.id.chars().take(8).collect::<String>())}</span>
+                    </li>}
+                }) }
+                if (count as u64) < *total {
+                    <li class="combobox-more" role="presentation">
+                        <button type="button" tabindex="-1" class="text-button" disabled={*loading} onmousedown={keep_focus.clone()} onclick={Callback::from({let offset=offset.clone();move |_|offset.set(*offset+25)})}>
+                            {if *loading {"Loading…".to_string()} else {format!("Show more ({} more)", *total - count as u64)}}
+                        </button>
+                    </li>
+                }
+            </ul>
+        }
+        if *changing {
+            <button type="button" class="text-button" onmousedown={keep_focus} onclick={Callback::from({let close=close.clone();move |_|close.emit(())})}>{"Keep current record"}</button>
+        }
+        {error_line}
     </div>}
 }
 

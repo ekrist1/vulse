@@ -11,7 +11,11 @@ use yew_router::prelude::*;
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(catch,js_namespace=["window","VulseEditor"],js_name=download)]
-    fn download(name: &str, bytes: &[u8], mime: &str) -> Result<(), wasm_bindgen::JsValue>;
+    pub(crate) fn download(
+        name: &str,
+        bytes: &[u8],
+        mime: &str,
+    ) -> Result<(), wasm_bindgen::JsValue>;
 }
 
 #[derive(Properties, PartialEq)]
@@ -66,9 +70,14 @@ pub fn records_panel(props: &RecordsProps) -> Html {
     });
     let bulk_value = use_state(String::new);
     let working = use_state(|| false);
+    // Summary mode shows grouped totals instead of the table.
+    let summary_mode = use_state(|| false);
+    let summary_spec = use_state(|| None::<vulse_model::SummarySpec>);
     // At most one tool panel (filters, sort, columns, view, export) is open.
     let panel = use_state(|| None::<&'static str>);
     let export_format = use_state(|| "csv".to_string());
+    // Reference field → columns of the related collection to export.
+    let export_related = use_state(std::collections::BTreeMap::<String, Vec<String>>::new);
     let last_undo = use_state(|| None::<String>);
     let serial = use_mut_ref(|| 0usize);
     let refresh = Callback::from({
@@ -295,6 +304,8 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         }
     });
     let save_view = Callback::from({
+        let summary_mode = summary_mode.clone();
+        let summary_spec = summary_spec.clone();
         let id = props.collection.id.clone();
         let query = query.clone();
         let columns = columns.clone();
@@ -304,10 +315,16 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         let error = error.clone();
         let status = status.clone();
         move |_| {
+            // A view saved in Summary mode opens in Summary mode.
             let config = SavedViewWrite {
                 name: (*view_name).clone(),
                 query: (*query).clone(),
                 columns: (*columns).clone(),
+                summary: if *summary_mode {
+                    (*summary_spec).clone()
+                } else {
+                    None
+                },
             };
             let view = if selected.is_empty() {
                 None
@@ -379,6 +396,7 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         let columns = columns.clone();
         let picked = picked.clone();
         let format = export_format.clone();
+        let related = export_related.clone();
         let working = working.clone();
         let error = error.clone();
         let status = status.clone();
@@ -396,6 +414,14 @@ pub fn records_panel(props: &RecordsProps) -> Html {
                 } else {
                     vec![]
                 },
+                related: related
+                    .iter()
+                    .filter(|(_, columns)| !columns.is_empty())
+                    .map(|(field, columns)| vulse_model::RelatedColumns {
+                        field: field.clone(),
+                        columns: columns.clone(),
+                    })
+                    .collect(),
             };
             working.set(true);
             error.set(String::new());
@@ -437,6 +463,22 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         .collect();
     let pages = page.total.div_ceil(query.limit as u64).max(1);
     let current = query.offset as u64 / query.limit as u64;
+    // "View records" on a summary group: add its filters and show the table.
+    let on_drill = {
+        let query = (*query).clone();
+        let change = change.clone();
+        let mode = summary_mode.clone();
+        let panel = panel.clone();
+        Callback::from(move |filters: Vec<RecordFilter>| {
+            let mut next = query.clone();
+            next.filters.extend(filters);
+            next.filters.truncate(20);
+            next.offset = 0;
+            change.emit(next);
+            mode.set(false);
+            panel.set(None);
+        })
+    };
     let toggle = |name: &'static str, label: String| {
         let open = *panel == Some(name);
         let panel = panel.clone();
@@ -445,12 +487,18 @@ pub fn records_panel(props: &RecordsProps) -> Html {
     html! {<section class="card data-card">
         <div class="records-toolbar" role="toolbar" aria-label="Records tools">
             <div class="records-search"><input type="search" aria-label="Search records" placeholder="Search record values…" value={query.search.clone()} oninput={Callback::from({let query=(*query).clone();let change=change.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=query.clone();next.search=input.value();change.emit(next);}})}/></div>
-            <select aria-label="Collection view" onchange={Callback::from({let views=views.clone();let selected=selected.clone();let query=query.clone();let columns=columns.clone();let view_name=view_name.clone();let all=fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let id=input.value();if let Some(view)=views.iter().find(|v|v.id==id){query.set(view.config.query.clone());columns.set(view.config.columns.clone());view_name.set(view.config.name.clone());}else{query.set(RecordQuery::default());columns.set(all.clone());view_name.set(String::new());}selected.set(id);}})}><option value="" selected={selected.is_empty()}>{"All records"}</option>{for views.iter().map(|view|html!{<option value={view.id.clone()} selected={*selected==view.id}>{view.config.name.clone()}</option>})}</select>
+            <select aria-label="Collection view" onchange={Callback::from({let summary_mode=summary_mode.clone();let summary_spec=summary_spec.clone();let views=views.clone();let selected=selected.clone();let query=query.clone();let columns=columns.clone();let view_name=view_name.clone();let all=fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let id=input.value();if let Some(view)=views.iter().find(|v|v.id==id){query.set(view.config.query.clone());columns.set(view.config.columns.clone());view_name.set(view.config.name.clone());summary_mode.set(view.config.summary.is_some());if view.config.summary.is_some(){summary_spec.set(view.config.summary.clone());}}else{query.set(RecordQuery::default());columns.set(all.clone());view_name.set(String::new());summary_mode.set(false);}selected.set(id);}})}><option value="" selected={selected.is_empty()}>{"All records"}</option>{for views.iter().map(|view|html!{<option value={view.id.clone()} selected={*selected==view.id}>{view.config.name.clone()}</option>})}</select>
             {toggle("filters",if query.filters.is_empty(){"Filter".to_string()}else{format!("Filter · {}",query.filters.len())})}
-            {toggle("sort",if query.group_field.is_empty(){"Sort".to_string()}else{"Sort · grouped".to_string()})}
-            {toggle("columns",if visible.len()==fields.len(){"Columns".to_string()}else{format!("Columns · {}/{}",visible.len(),fields.len())})}
+            <div class="mode-switch" role="group" aria-label="Show records as">
+                <button type="button" aria-pressed={(!*summary_mode).to_string()} onclick={Callback::from({let mode=summary_mode.clone();move |_|mode.set(false)})}>{"Table"}</button>
+                <button type="button" aria-pressed={summary_mode.to_string()} onclick={Callback::from({let mode=summary_mode.clone();let spec=summary_spec.clone();let panel=panel.clone();let fields=fields.clone();move |_|{if spec.is_none(){spec.set(Some(crate::summary::default_spec(&fields)));}if matches!(*panel,Some("sort")|Some("columns")|Some("export")){panel.set(None);}mode.set(true);}})}>{"Summary"}</button>
+            </div>
+            if !*summary_mode {
+                {toggle("sort",if query.group_field.is_empty(){"Sort".to_string()}else{"Sort · grouped".to_string()})}
+                {toggle("columns",if visible.len()==fields.len(){"Columns".to_string()}else{format!("Columns · {}/{}",visible.len(),fields.len())})}
+            }
             {toggle("view",if selected.is_empty(){"Save view…".to_string()}else{"Edit view…".to_string()})}
-            {toggle("export","Export".to_string())}
+            if !*summary_mode {{toggle("export","Export".to_string())}}
             <span class="records-count muted" role="status">{if *loading{"Loading…".into()}else{format!("{} matching records",page.total)}}</span>
         </div>
         if *panel!=Some("filters")&&!query.filters.is_empty(){<div class="filter-chips">{for query.filters.iter().enumerate().map(|(index,filter)|{let label=filter_summary(fields,filter);html!{<span class="filter-chip"><button type="button" class="chip-edit" onclick={Callback::from({let panel=panel.clone();move |_|panel.set(Some("filters"))})}>{label.clone()}</button><button type="button" class="chip-remove" aria-label={format!("Remove filter {label}")} onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();next.filters.remove(index);change.emit(next);}})}>{"×"}</button></span>}})}<button type="button" class="text-button" onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();next.filters.clear();change.emit(next);}})}>{"Clear filters"}</button></div>}
@@ -474,10 +522,11 @@ pub fn records_panel(props: &RecordsProps) -> Html {
             if open=="view" {<div class="view-toolbar">
         <label>{"View name"}<input aria-label="View name" maxlength="100" placeholder="e.g. Active products" value={(*view_name).clone()} oninput={Callback::from({let name=view_name.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();name.set(input.value());}})}/></label><button type="button" class="secondary" disabled={view_name.trim().is_empty()} onclick={save_view}>{"Save view"}</button>if !selected.is_empty(){<button type="button" class="secondary" onclick={Callback::from({let selected=selected.clone();let name=view_name.clone();move |_|{selected.set(String::new());name.set(String::new());}})}>{"Save as new"}</button><button type="button" class="danger" onclick={remove_view}>{"Delete view"}</button>}
         </div>}
-            if open=="export" {<div class="export-toolbar row"><label>{"Export format"}<select aria-label="Export format" onchange={Callback::from({let format=export_format.clone();move |e:Event|format.set(e.target_unchecked_into::<HtmlSelectElement>().value())})}><option value="csv" selected={*export_format=="csv"}>{"CSV spreadsheet"}</option><option value="json" selected={*export_format=="json"}>{"JSON with record IDs"}</option></select></label><button type="button" class="secondary" disabled={*loading||*working||columns.is_empty()} onclick={Callback::from({let export=run_export.clone();move |_|export.emit(false)})}>{"Export current view"}</button><span class="muted">{"All matching records and visible fields, including other pages."}</span></div>}
+            if open=="export" {<div class="export-toolbar row"><label>{"Export format"}<select aria-label="Export format" onchange={Callback::from({let format=export_format.clone();move |e:Event|format.set(e.target_unchecked_into::<HtmlSelectElement>().value())})}><option value="csv" selected={*export_format=="csv"}>{"CSV spreadsheet"}</option><option value="json" selected={*export_format=="json"}>{"JSON with record IDs"}</option></select></label><button type="button" class="secondary" disabled={*loading||*working||columns.is_empty()} onclick={Callback::from({let export=run_export.clone();move |_|export.emit(false)})}>{"Export current view"}</button><span class="muted">{"All matching records and visible fields, including other pages."}</span></div>{related_export_options(fields,&props.collections,&export_related)}}
         </div>}
         if !query_error.is_empty(){<p class="error" role="alert">{(*query_error).clone()}</p>}
         if !error.is_empty(){<p class="error" role="alert">{(*error).clone()}</p>}if !status.is_empty(){<p class="success" role="status">{(*status).clone()}</p>}
+        if *summary_mode {<crate::summary::SummaryPanel collection={props.collection.clone()} query={(*query).clone()} spec={(*summary_spec).clone().unwrap_or_else(||crate::summary::default_spec(fields))} on_change={Callback::from({let spec=summary_spec.clone();move |next|spec.set(Some(next))})} on_drill={on_drill}/>} else {<>
         if last_undo.is_some(){<div class="undo-banner"><span>{"The last table action can be undone."}</span><button type="button" class="secondary" disabled={*working} onclick={undo}>{"Undo last action"}</button></div>}
         if !picked.is_empty(){<div class="bulk-toolbar"><button type="button" class="secondary" disabled={*working||columns.is_empty()} onclick={Callback::from({let export=run_export.clone();move |_|export.emit(true)})}>{"Export selected"}</button><strong>{format!("{} selected",picked.len())}</strong><button type="button" class="secondary" disabled={*working||bulk_field.is_empty()} onclick={Callback::from({let open=bulk_open.clone();move |_|open.set(!*open)})}>{"Bulk edit"}</button><button type="button" class="secondary" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("duplicate".into())})}>{"Duplicate selected"}</button><button type="button" class="danger" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("delete".into())})}>{"Delete selected"}</button><button type="button" class="text-button" onclick={Callback::from({let picked=picked.clone();move |_|picked.set(vec![])})}>{"Clear selection"}</button></div>}
         if *bulk_open&&!picked.is_empty(){<div class="bulk-editor"><label>{"Field to update"}<select aria-label="Bulk field" onchange={Callback::from({let field=bulk_field.clone();let value=bulk_value.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();field.set(input.value());value.set(String::new());}})}>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date)).map(|f|html!{<option value={f.name.clone()} selected={*bulk_field==f.name}>{f.display_label().to_string()}</option>})}</select></label><label>{"New value"}{if fields.iter().find(|f|f.name==*bulk_field).is_some_and(|f|f.kind==FieldType::Date){html!{<input aria-label="Bulk value" type="date" value={(*bulk_value).clone()} oninput={Callback::from({let value=bulk_value.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();value.set(input.value());}})}/>}}else if fields.iter().find(|f|f.name==*bulk_field).is_some_and(|f|f.kind==FieldType::Boolean){html!{<select aria-label="Bulk value" onchange={Callback::from({let value=bulk_value.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();value.set(input.value());}})}><option value="false" selected={!bulk_value.eq_ignore_ascii_case("true")}>{"False"}</option><option value="true" selected={bulk_value.eq_ignore_ascii_case("true")}>{"True"}</option></select>}}else{html!{<input aria-label="Bulk value" value={(*bulk_value).clone()} oninput={Callback::from({let value=bulk_value.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();value.set(input.value());}})}/>}}}</label><button type="button" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("update".into())})}>{"Apply to selected"}</button><p class="muted">{"Only this field changes. Calculated fields stay read-only. The whole batch must pass validation."}</p></div>}
@@ -487,6 +536,7 @@ pub fn records_panel(props: &RecordsProps) -> Html {
             html!{<>{if let Some(group)=group{html!{<tr class="group-row"><th colspan={(visible.len()+3).to_string()}>{group}</th></tr>}}else{html!{}}}<tr key={document.id.clone()}><td><input type="checkbox" aria-label={format!("Select record {}",document.id)} disabled={*loading||*working} checked={picked.iter().any(|p|p.id==document.id)} onchange={Callback::from({let picked=picked.clone();let document=document.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=(*picked).clone();next.retain(|d|d.id!=document.id);if input.checked(){next.push(document.clone());}picked.set(next);}})}/></td><td><Link<Route> to={Route::Document{id:props.collection.id.clone(),doc_id:document.id.clone()}}>{format!("{} →",record_title(&props.collection.blueprint,&document.body,&document.id))}</Link<Route>></td>{for visible.iter().map(|field|html!{<crate::record_cell::RecordCell key={field.name.clone()} collections={props.collections.clone()} collection_id={props.collection.id.clone()} document={document.clone()} field={(*field).clone()} on_saved={on_saved.clone()}/>})}<td class="muted">{document.updated_at.chars().take(10).collect::<String>()}</td></tr></>}
         })}</tbody></table></div>}
         <div class="table-footer"><span class="muted">{format!("{} records · Page {} of {}",page.total,current+1,pages)}</span><div class="row"><label class="page-size">{"Rows"}<select aria-label="Rows per page" onchange={Callback::from({let query=(*query).clone();let change=change.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=query.clone();next.limit=input.value().parse().unwrap_or(25);change.emit(next);}})}>{for [25,50,100].into_iter().map(|size|html!{<option value={size.to_string()} selected={query.limit==size}>{size}</option>})}</select></label><button type="button" class="secondary" disabled={query.offset==0||*loading} onclick={Callback::from({let query=query.clone();move |_|{let mut next=(*query).clone();next.offset=next.offset.saturating_sub(next.limit);query.set(next);}})}>{"Previous"}</button><button type="button" class="secondary" disabled={current+1>=pages||*loading} onclick={Callback::from({let query=query.clone();move |_|{let mut next=(*query).clone();next.offset+=next.limit;query.set(next);}})}>{"Next"}</button></div></div>
+        </>}
     </section>}
 }
 
@@ -540,4 +590,59 @@ fn filter_summary(fields: &[vulse_model::FieldDef], filter: &RecordFilter) -> St
         value
     };
     format!("{name} {op} {value}")
+}
+
+/// Checkboxes for exporting columns of records that reference fields point to.
+fn related_export_options(
+    fields: &[vulse_model::FieldDef],
+    collections: &[CollectionView],
+    chosen: &UseStateHandle<std::collections::BTreeMap<String, Vec<String>>>,
+) -> Html {
+    let references: Vec<_> = fields
+        .iter()
+        .filter(|f| {
+            f.kind == FieldType::Reference
+                || (f.kind == FieldType::Array
+                    && f.items == Some(vulse_model::ArrayItems::Reference))
+        })
+        .filter_map(|f| {
+            let target = collections
+                .iter()
+                .find(|c| Some(c.name.as_str()) == f.collection.as_deref())?;
+            Some((f, target))
+        })
+        .collect();
+    if references.is_empty() {
+        return html! {};
+    }
+    html! {<div class="export-related">
+        <p class="muted">{"Include columns from related records. CSV adds a column such as product.name; lists of references export a JSON list of values. JSON adds a related object with each record's id."}</p>
+        { for references.into_iter().map(|(field, target)| {
+            let picked = chosen.get(&field.name).cloned().unwrap_or_default();
+            html! {<fieldset key={field.name.clone()}>
+                <legend>{format!("{} → {}", field.display_label(), target.name)}</legend>
+                { for target.blueprint.fields.iter().map(|column| {
+                    let toggle = {
+                        let chosen = chosen.clone();
+                        let field = field.name.clone();
+                        let column = column.name.clone();
+                        let order: Vec<String> = target.blueprint.fields.iter().map(|f| f.name.clone()).collect();
+                        Callback::from(move |e: Event| {
+                            let input: HtmlInputElement = e.target_unchecked_into();
+                            let mut next = (*chosen).clone();
+                            let entry = next.entry(field.clone()).or_default();
+                            entry.retain(|c| *c != column);
+                            if input.checked() {
+                                entry.push(column.clone());
+                            }
+                            // Keep the related collection's field order.
+                            entry.sort_by_key(|c| order.iter().position(|o| o == c));
+                            chosen.set(next);
+                        })
+                    };
+                    html! {<label class="check"><input type="checkbox" checked={picked.contains(&column.name)} onchange={toggle}/>{column.display_label().to_string()}</label>}
+                }) }
+            </fieldset>}
+        }) }
+    </div>}
 }

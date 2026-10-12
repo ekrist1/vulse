@@ -40,11 +40,15 @@ fn code_example(props: &CodeProps) -> Html {
     };
     html! {<div class="api-code"><div class="api-code-heading"><span>{props.title.clone()}</span><div class="row"><span role="status">{(*status).clone()}</span><button type="button" class="secondary" aria-label={format!("Copy {}",props.title)} onclick={copy}>{"Copy"}</button></div></div><pre><code>{props.text.clone()}</code></pre></div>}
 }
-/// Minimum role for an endpoint. Query and export are reads sent as POST.
+/// Minimum role for an endpoint. Query, export and summary are reads sent as POST.
 fn required_role(method: &str, url: &str, schema: bool) -> &'static str {
     if schema {
         "Admin, all collections"
-    } else if method == "GET" || url.ends_with("/query") || url.ends_with("/export") {
+    } else if method == "GET"
+        || url.ends_with("/query")
+        || url.ends_with("/export")
+        || url.ends_with("/summary")
+    {
         "Viewer"
     } else if method.starts_with("GET") {
         "Viewer reads, editor writes"
@@ -214,6 +218,18 @@ pub fn collection_api(props: &CollectionApiProps) -> Html {
             "POST",
             format!("{base}/export"),
             "Download a filtered view or selection",
+            false,
+        ),
+        (
+            "POST",
+            format!("{base}/summary"),
+            "Group records; sum, average, min, max, count and formulas",
+            false,
+        ),
+        (
+            "GET",
+            format!("{base}/views/VIEW_ID/summary"),
+            "Run a saved view's summary",
             false,
         ),
         (

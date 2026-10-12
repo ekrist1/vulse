@@ -12,6 +12,7 @@ mod pages;
 mod record_cell;
 mod records;
 mod relationships;
+mod summary;
 
 fn main() {
     yew::Renderer::<app::App>::new().render();

@@ -137,6 +137,25 @@ pub async fn update_collection(
                 .filter(|old| !renames.contains_key(&old.name))
                 .map(|old| old.name.clone())
                 .collect();
+            // Stored fields that keep their data (by name or rename) but change type.
+            let retyped: Vec<(String, vulse_model::FieldDef, vulse_model::FieldDef)> = blueprint
+                .fields
+                .iter()
+                .filter(|new| new.kind != FieldType::Calculated)
+                .filter_map(|new| {
+                    let origin = renames
+                        .iter()
+                        .find(|(_, to)| **to == new.name)
+                        .map(|(from, _)| from.as_str())
+                        .unwrap_or(new.name.as_str());
+                    let old = current.blueprint.fields.iter().find(|f| f.name == origin)?;
+                    (old.kind != FieldType::Calculated
+                        && (old.kind != new.kind || old.items != new.items))
+                        .then(|| (new.name.clone(), old.clone(), new.clone()))
+                })
+                .collect();
+            let mut unconvertible = Vec::<(String, String)>::new();
+            let mut unconvertible_docs = Vec::new();
             let mut holding = BTreeMap::<String, usize>::new();
             let mut holders = Vec::new();
             let mut stripped = Vec::new();
@@ -160,11 +179,44 @@ pub async fn update_collection(
                             }
                         }
                     }
+                    let mut converted = false;
+                    if body.convert_field_values {
+                        for (name, old, new) in &retyped {
+                            let Some(value) = object.get(name) else {
+                                continue;
+                            };
+                            match crate::convert::convert_value(value, old, new) {
+                                Ok(Some(next)) if next == *value => {}
+                                Ok(Some(next)) => {
+                                    object.insert(name.clone(), next);
+                                    converted = true;
+                                }
+                                Ok(None) => {
+                                    object.remove(name);
+                                    converted = true;
+                                }
+                                Err(reason) => {
+                                    if unconvertible.len() < 5 {
+                                        let shown: String =
+                                            vulse_model::display_value(value).chars().take(40).collect();
+                                        unconvertible.push((name.clone(), format!("“{shown}” {reason}")));
+                                    }
+                                    unconvertible_docs.push(doc.clone());
+                                }
+                            }
+                        }
+                    }
                     if changed {
                         holders.push(doc.clone());
                     }
-                    if changed || renamed {
-                        let action = if renamed { "fields renamed" } else { "fields removed" };
+                    if changed || renamed || converted {
+                        let action = if converted {
+                            "fields converted"
+                        } else if renamed {
+                            "fields renamed"
+                        } else {
+                            "fields removed"
+                        };
                         stripped.push((doc.clone(), source.clone(), action));
                     }
                 }
@@ -192,10 +244,42 @@ pub async fn update_collection(
                     holders,
                 ));
             }
-            if !failing.is_empty() {
+            if !unconvertible.is_empty() {
+                unconvertible_docs.dedup();
+                let examples = unconvertible
+                    .iter()
+                    .map(|(field, problem)| format!("{field}: {problem}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Err(AppError::conflict_docs(
                     format!(
-                        "Existing records do not fit the new fields: {}",
+                        "{} record{} cannot be converted. Fix or clear these values first: {examples}",
+                        unconvertible_docs.len(),
+                        if unconvertible_docs.len() == 1 { "" } else { "s" }
+                    ),
+                    unconvertible_docs,
+                ));
+            }
+            if !failing.is_empty() {
+                let hint = if !retyped.is_empty() && !body.convert_field_values {
+                    format!(
+                        " To convert stored values to the new type of {}, confirm with convert_field_values.",
+                        retyped
+                            .iter()
+                            .map(|(name, old, new)| format!(
+                                "'{name}' ({} → {})",
+                                crate::convert::kind_name(old.kind),
+                                crate::convert::kind_name(new.kind)
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(AppError::conflict_docs(
+                    format!(
+                        "Existing records do not fit the new fields: {}{hint}",
                         first_error.unwrap_or_default()
                     ),
                     failing,

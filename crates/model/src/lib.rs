@@ -215,6 +215,12 @@ pub struct UpdateCollection {
     /// Without it, removing a field that holds values is refused.
     #[serde(default)]
     pub remove_field_data: bool,
+    /// Convert stored values of fields whose type changes, such as text
+    /// holding "12" becoming the number 12. Values that cannot be converted
+    /// refuse the whole change. Without it, any stored value of the old type
+    /// refuses the change.
+    #[serde(default)]
+    pub convert_field_values: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

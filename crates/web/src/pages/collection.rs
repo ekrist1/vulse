@@ -262,6 +262,30 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Saved fields (followed through renames) whose type changes.
+            let retyped: Vec<String> = collection
+                .as_ref()
+                .map(|c| {
+                    fields
+                        .iter()
+                        .filter(|f| f.kind != FieldType::Calculated)
+                        .filter_map(|f| {
+                            let origin = f.renamed_from.as_deref().unwrap_or(&f.name);
+                            let old = c.blueprint.fields.iter().find(|o| o.name == origin)?;
+                            (old.kind != FieldType::Calculated
+                                && (old.kind != f.kind || old.items != f.items))
+                                .then(|| {
+                                    format!(
+                                        "{} ({} → {})",
+                                        f.display_label(),
+                                        type_label(old.kind),
+                                        type_label(f.kind)
+                                    )
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let unconfirmed: Vec<String> = removed
                 .iter()
                 .filter(|name| !confirmed_removals.contains(name))
@@ -283,6 +307,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                     fields: (*fields).clone(),
                 }),
                 remove_field_data: !removed.is_empty(),
+                convert_field_values: !retyped.is_empty(),
             };
             let name = name.clone();
             let fields = fields.clone();
@@ -318,6 +343,20 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                             unconfirmed.join(", ")
                         ),
                         "Delete field data and save",
+                    );
+                    if !confirm.ask(request).await {
+                        busy.set(false);
+                        return;
+                    }
+                }
+                if !retyped.is_empty() {
+                    let request = ConfirmRequest::new(
+                        "Convert existing values?",
+                        format!(
+                            "Changing the type of {} converts every stored value, for example the text \"12\" becomes the number 12, and blank text becomes empty. If any value cannot be converted, nothing is saved and you'll see which records to fix. Each record's previous version stays in its history.",
+                            retyped.join(", ")
+                        ),
+                        "Convert and save",
                     );
                     if !confirm.ask(request).await {
                         busy.set(false);
@@ -825,4 +864,13 @@ fn parse_items(value: &str) -> ArrayItems {
         "reference" => ArrayItems::Reference,
         _ => ArrayItems::String,
     }
+}
+
+/// Readable field type for conversion prompts.
+fn type_label(kind: FieldType) -> &'static str {
+    field_types()
+        .iter()
+        .find(|(value, _)| *value == type_value(kind))
+        .map(|(_, label)| *label)
+        .unwrap_or("value")
 }

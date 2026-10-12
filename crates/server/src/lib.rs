@@ -2,6 +2,7 @@ mod assets;
 mod auth;
 mod config;
 mod content;
+mod convert;
 mod db;
 mod error;
 mod export;

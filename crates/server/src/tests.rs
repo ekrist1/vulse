@@ -3628,3 +3628,169 @@ async fn summaries_group_aggregate_calculate_and_save_with_views() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn changing_field_types_converts_stored_values_on_request() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "convert@example.com", "convert").await;
+    let items = create_collection(
+        &app,
+        &cookie,
+        "items",
+        "private",
+        json!({"fields":[{"name":"title","type":"string"},{"name":"amount","type":"string"},{"name":"active","type":"string"}]}),
+    )
+    .await;
+    let collection = format!("/api/v1/collections/{}", items.id);
+    let a = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"A","amount":"12","active":"yes"}),
+    )
+    .await;
+    let b = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"B","amount":" 3.5 ","active":"no"}),
+    )
+    .await;
+    let c = create_document(&app, &cookie, &items.id, json!({"title":"C","amount":""})).await;
+    let d = create_document(&app, &cookie, &items.id, json!({"title":"D"})).await;
+    let numbers = json!({"fields":[{"name":"title","type":"string"},{"name":"amount","type":"number"},{"name":"active","type":"boolean"}]});
+    let patch = |body: Value| {
+        let app = &app;
+        let collection = collection.clone();
+        let cookie = cookie.clone();
+        async move {
+            let response = app
+                .call("PATCH", &collection, Some(&cookie), None, Some(body))
+                .await;
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+    let read = |id: String| {
+        let app = &app;
+        let collection = collection.clone();
+        let cookie = cookie.clone();
+        async move {
+            json_of::<DocumentView>(
+                app.call(
+                    "GET",
+                    &format!("{collection}/documents/{id}"),
+                    Some(&cookie),
+                    None,
+                    None,
+                )
+                .await,
+            )
+            .await
+            .1
+        }
+    };
+
+    // Without confirmation the error explains how to convert.
+    let (status, error) = patch(json!({"blueprint":numbers})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = error["error"].as_str().unwrap();
+    assert!(
+        message.contains("convert_field_values") && message.contains("'amount' (text → a number)"),
+        "{message}"
+    );
+
+    // A value that cannot be converted stops everything and is named.
+    let bad = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"E","amount":"12a"}),
+    )
+    .await;
+    let (status, error) = patch(json!({"blueprint":numbers,"convert_field_values":true})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = error["error"].as_str().unwrap();
+    assert!(
+        message.starts_with("1 record cannot be converted") && message.contains("“12a”"),
+        "{message}"
+    );
+    assert_eq!(error["document_ids"], json!([bad.id]));
+    assert_eq!(read(a.id.clone()).await.body["amount"], "12");
+
+    // After fixing it, the conversion runs.
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!("{collection}/documents/{}", bad.id),
+            Some(&cookie),
+            None,
+            Some(json!({"patch":{"amount":"7"}}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (status, saved) = patch(json!({"blueprint":numbers,"convert_field_values":true})).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let converted = read(a.id.clone()).await;
+    assert_eq!(
+        (
+            converted.body["amount"].clone(),
+            converted.body["active"].clone()
+        ),
+        (json!(12), json!(true))
+    );
+    let converted = read(b.id.clone()).await;
+    assert_eq!(
+        (
+            converted.body["amount"].clone(),
+            converted.body["active"].clone()
+        ),
+        (json!(3.5), json!(false))
+    );
+    assert!(read(c.id.clone()).await.body.get("amount").is_none());
+    let untouched = read(d.id.clone()).await;
+    assert_eq!(untouched.updated_at, d.updated_at);
+
+    let (_, revisions) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}/revisions", a.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(revisions.items[0].action, "fields converted");
+    assert!(
+        revisions.items[1..]
+            .iter()
+            .any(|r| r.body["amount"] == "12")
+    );
+
+    // Numbers now sum, and a renamed field converts too.
+    let (_, summary) = json_of::<vulse_model::SummaryResult>(
+        app.call(
+            "POST",
+            &format!("{collection}/summary"),
+            Some(&cookie),
+            None,
+            Some(json!({"summary":{"measures":[{"name":"total","op":"sum","field":"amount"}]}})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(summary.totals.values["total"], 22.5);
+    let (status, _) = patch(json!({"blueprint":{"fields":[
+        {"name":"title","type":"string"},
+        {"name":"label","type":"string","renamed_from":"amount"},
+        {"name":"active","type":"boolean"}
+    ]},"convert_field_values":true}))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read(b.id.clone()).await.body["label"], "3.5");
+}

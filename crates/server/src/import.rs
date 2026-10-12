@@ -350,7 +350,7 @@ fn validate_mapping(
     }
     Ok(())
 }
-fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
+pub(crate) fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
     match kind {
         FieldType::String | FieldType::Asset | FieldType::Reference => {
             Ok(Value::String(cell.into()))

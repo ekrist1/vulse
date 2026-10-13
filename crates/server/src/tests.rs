@@ -3921,3 +3921,83 @@ async fn formulas_read_columns_of_other_collections() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+#[tokio::test]
+async fn views_hear_about_changes_to_their_collection_and_what_it_shows() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "events@example.com", "events").await;
+    let source = create_collection(
+        &app,
+        &cookie,
+        "reports",
+        "private",
+        json!({"fields":[{"name":"org","type":"string"},{"name":"fte","type":"number"}]}),
+    )
+    .await;
+    let unrelated = create_collection(
+        &app,
+        &cookie,
+        "unrelated",
+        "private",
+        json!({"fields":[{"name":"x","type":"number"}]}),
+    )
+    .await;
+    let view = create_collection(
+        &app,
+        &cookie,
+        "kids",
+        "private",
+        json!({"fields":[{"name":"org","type":"string"},{"name":"fte","type":"calculated","formula":"=SUMIFS([reports.fte],[reports.org],[org])"}]}),
+    )
+    .await;
+    let response = app
+        .call(
+            "GET",
+            &format!("/api/v1/collections/{}/events", view.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut body = response.into_body();
+    let mut next_event = async || -> String {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .expect("an event within 5 seconds")
+                .unwrap()
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                let text = String::from_utf8(data.to_vec()).unwrap();
+                if text.starts_with("event: change") {
+                    return text;
+                }
+            }
+        }
+    };
+    // Unrelated writes are skipped; the formula's source collection counts.
+    create_document(&app, &cookie, &unrelated.id, json!({"x":1})).await;
+    create_document(&app, &cookie, &source.id, json!({"org":"a","fte":2})).await;
+    assert!(next_event().await.contains(&source.id));
+    create_document(&app, &cookie, &unrelated.id, json!({"x":2})).await;
+    let doc = create_document(&app, &cookie, &view.id, json!({"org":"a"})).await;
+    assert!(next_event().await.contains(&view.id));
+    let response = app
+        .call(
+            "DELETE",
+            &format!("/api/v1/collections/{}/documents/{}", view.id, doc.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(next_event().await.contains(&view.id));
+    // Signed-out requests are refused like any read.
+    let response = app
+        .call("GET", &format!("/api/v1/collections/{}/events", view.id), None, None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

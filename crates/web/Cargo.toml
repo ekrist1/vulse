@@ -25,6 +25,8 @@ web-sys = { version = "0.3", features = [
     "Blob",
     "Document",
     "Element",
+    "EventSource",
+    "MessageEvent",
     "Location",
     "File",
     "FileList",

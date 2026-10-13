@@ -5,6 +5,7 @@ mod content;
 mod convert;
 mod db;
 mod error;
+mod events;
 mod export;
 mod history;
 mod import;
@@ -151,6 +152,7 @@ fn api() -> Router<AppState> {
             post(history::restore),
         )
         .route("/collections/{id}/query", post(records::query_records))
+        .route("/collections/{id}/events", get(events::collection_events))
         .route("/collections/{id}/export", post(export::export_records))
         .route("/collections/{id}/summary", post(summary::summarize))
         .route(

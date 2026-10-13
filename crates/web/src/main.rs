@@ -9,6 +9,7 @@ mod formula_builder;
 mod formula_input;
 mod history;
 mod import;
+mod live;
 mod lookup_builder;
 mod pages;
 mod record_cell;

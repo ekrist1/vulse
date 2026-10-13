@@ -474,12 +474,14 @@ pub async fn update_collection(
     )
     .await?;
     crate::records::sync_collection_cells(conn, id, blueprint).await?;
+    conn.changed(id);
     Ok(())
 }
 
 pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM collections WHERE id = ?1", &[text(id)])
         .await?;
+    conn.changed(id);
     Ok(())
 }
 
@@ -615,6 +617,7 @@ pub async fn insert_document(
     .await?;
     crate::records::sync_stored_document(conn, collection_id, id, body).await?;
     crate::history::snapshot(conn, collection_id, id, "create").await?;
+    conn.changed(collection_id);
     Ok(())
 }
 
@@ -652,6 +655,7 @@ pub async fn update_document_as(
     if previous.as_ref().is_some_and(|old| old.body != *body) {
         crate::history::snapshot(conn, collection_id, id, action).await?;
     }
+    conn.changed(collection_id);
     Ok(())
 }
 
@@ -663,6 +667,7 @@ pub async fn delete_document(conn: &Conn, collection_id: &str, id: &str) -> anyh
             &[text(id), text(collection_id)],
         )
         .await?;
+    conn.changed(collection_id);
     Ok(changed > 0)
 }
 

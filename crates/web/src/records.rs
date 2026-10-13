@@ -80,6 +80,19 @@ pub fn records_panel(props: &RecordsProps) -> Html {
     let export_related = use_state(std::collections::BTreeMap::<String, Vec<String>>::new);
     let last_undo = use_state(|| None::<String>);
     let serial = use_mut_ref(|| 0usize);
+    // Background reloads keep the table as it is unless the data changed.
+    let silent = use_mut_ref(|| false);
+    let shown = use_mut_ref(|| None::<RecordPage>);
+    let background = Callback::from({
+        let reload = reload.clone();
+        let serial = serial.clone();
+        let silent = silent.clone();
+        move |()| {
+            *silent.borrow_mut() = true;
+            *serial.borrow_mut() += 1;
+            reload.set(*serial.borrow());
+        }
+    });
     let refresh = Callback::from({
         let reload = reload.clone();
         let loading = loading.clone();
@@ -236,16 +249,25 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         let loading = loading.clone();
         let epoch = epoch.clone();
         let query_state = query.clone();
+        let silent = silent.clone();
+        let shown = shown.clone();
+        let loud = use_mut_ref(|| false);
         use_effect_with(
             (props.collection.clone(), (*query).clone(), *reload),
             move |(collection, query, _)| {
-                loading.set(true);
+                let quiet = std::mem::take(&mut *silent.borrow_mut());
+                if !quiet {
+                    *loud.borrow_mut() = true;
+                    loading.set(true);
+                }
                 *epoch.borrow_mut() += 1;
                 let current = *epoch.borrow();
                 let id = collection.id.clone();
                 let query = query.clone();
                 let timer = gloo_timers::callback::Timeout::new(200, move || {
-                    loading.set(true);
+                    if !quiet {
+                        loading.set(true);
+                    }
                     wasm_bindgen_futures::spawn_local(async move {
                         let result = api::query_records(&id, &query).await;
                         if *epoch.borrow() != current {
@@ -262,12 +284,22 @@ pub fn records_panel(props: &RecordsProps) -> Html {
                                     };
                                     query_state.set(corrected);
                                 }
-                                page.set(next);
-                                error.set(String::new());
+                                if shown.borrow().as_ref() != Some(&next) {
+                                    *shown.borrow_mut() = Some(next.clone());
+                                    page.set(next);
+                                }
+                                if !quiet {
+                                    error.set(String::new());
+                                }
                             }
-                            Err(message) => error.set(message),
+                            Err(message) if !quiet => error.set(message),
+                            Err(_) => {}
                         }
-                        loading.set(false);
+                        // A quiet reload may replace a visible one that was still loading.
+                        let was_loud = std::mem::take(&mut *loud.borrow_mut());
+                        if !quiet || was_loud {
+                            loading.set(false);
+                        }
                     });
                 });
                 move || drop(timer)
@@ -288,12 +320,20 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         });
     }
     {
-        let refresh = refresh.clone();
-        use_effect_with(props.collection.id.clone(), move |_| {
-            let timer = gloo_timers::callback::Interval::new(15_000, move || {
-                refresh.emit(());
+        // The server announces changes; a slow timer covers missed ones,
+        // such as writes handled by another server process.
+        let background = background.clone();
+        use_effect_with(props.collection.id.clone(), move |id| {
+            let changes = crate::live::Changes::listen(id, background.clone());
+            let timer = gloo_timers::callback::Interval::new(60_000, move || {
+                if !crate::live::hidden() {
+                    background.emit(());
+                }
             });
-            move || drop(timer)
+            move || {
+                drop(timer);
+                drop(changes);
+            }
         });
     }
     let change = Callback::from({

@@ -26,6 +26,8 @@ enum DbInner {
 
 pub struct Conn {
     inner: ConnInner,
+    /// Collections changed in the open transaction, published on commit.
+    changes: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
 enum ConnInner {
@@ -56,9 +58,11 @@ impl Db {
         let conn = match &*self.inner {
             DbInner::Local(database) => Conn {
                 inner: ConnInner::Local(database.connect()?),
+                changes: Default::default(),
             },
             DbInner::Remote(database) => Conn {
                 inner: ConnInner::Remote(database.connect()?),
+                changes: Default::default(),
             },
         };
         conn.execute("PRAGMA foreign_keys = ON", &[]).await?;
@@ -67,21 +71,52 @@ impl Db {
 }
 
 impl Conn {
+    /// Notes that a collection's records or fields changed. Open views are
+    /// told once the transaction commits, or right away outside one.
+    pub fn changed(&self, collection_id: &str) {
+        let mut changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        match changes.as_mut() {
+            Some(pending) => {
+                pending.insert(collection_id.to_string());
+            }
+            None => crate::events::publish([collection_id.to_string()]),
+        }
+    }
+    fn begin_changes(&self) {
+        *self.changes.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
+    }
+    /// Ends the transaction's change list, publishing it if committed.
+    fn end_changes(&self, committed: bool) {
+        let pending = self
+            .changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if committed && let Some(pending) = pending {
+            crate::events::publish(pending);
+        }
+    }
     pub async fn with_app_tx<T, F>(&self, f: F) -> Result<T, crate::error::AppError>
     where
         F: AsyncFnOnce(&Conn) -> Result<T, crate::error::AppError>,
     {
         self.execute("BEGIN IMMEDIATE", &[]).await?;
+        self.begin_changes();
         match f(self).await {
             Ok(value) => match self.execute("COMMIT", &[]).await {
-                Ok(_) => Ok(value),
+                Ok(_) => {
+                    self.end_changes(true);
+                    Ok(value)
+                }
                 Err(error) => {
                     let _ = self.execute("ROLLBACK", &[]).await;
+                    self.end_changes(false);
                     Err(error.into())
                 }
             },
             Err(error) => {
                 let _ = self.execute("ROLLBACK", &[]).await;
+                self.end_changes(false);
                 Err(error)
             }
         }
@@ -136,16 +171,22 @@ impl Conn {
         F: AsyncFnOnce(&Conn) -> anyhow::Result<T>,
     {
         self.execute("BEGIN IMMEDIATE", &[]).await?;
+        self.begin_changes();
         match f(self).await {
             Ok(value) => match self.execute("COMMIT", &[]).await {
-                Ok(_) => Ok(value),
+                Ok(_) => {
+                    self.end_changes(true);
+                    Ok(value)
+                }
                 Err(err) => {
                     let _ = self.execute("ROLLBACK", &[]).await;
+                    self.end_changes(false);
                     Err(err)
                 }
             },
             Err(err) => {
                 let _ = self.execute("ROLLBACK", &[]).await;
+                self.end_changes(false);
                 Err(err)
             }
         }

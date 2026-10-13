@@ -12,6 +12,8 @@ pub enum AppError {
     PayloadTooLarge,
     /// Password hashing capacity is exhausted.
     TooManyRequests,
+    /// The database writer remained busy beyond the bounded wait.
+    DatabaseBusy,
     /// Too many failed attempts from one address or for one account.
     RateLimited {
         retry_after: u64,
@@ -51,6 +53,7 @@ impl std::fmt::Display for AppError {
             AppError::Forbidden(message) => write!(f, "{message}"),
             AppError::NotFound => write!(f, "not found"),
             AppError::TooManyRequests => write!(f, "Authentication is busy. Try again shortly."),
+            AppError::DatabaseBusy => write!(f, "Database is busy. Try again shortly."),
             AppError::RateLimited { retry_after } => write!(f, "{}", rate_limited(*retry_after)),
             AppError::PayloadTooLarge => write!(f, "payload too large"),
             AppError::Conflict { message, .. } => write!(f, "{message}"),
@@ -61,13 +64,31 @@ impl std::fmt::Display for AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
-        Self::Internal(err)
+        if matches!(
+            err.downcast_ref::<turso::Error>(),
+            Some(turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
+        ) {
+            Self::DatabaseBusy
+        } else {
+            Self::Internal(err)
+        }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
+            AppError::DatabaseBusy => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(axum::http::header::RETRY_AFTER, "1")],
+                    Json(ApiErrorBody {
+                        error: "Database is busy. Try again shortly.".into(),
+                        document_ids: None,
+                    }),
+                )
+                    .into_response();
+            }
             AppError::BadRequest(error) => (
                 StatusCode::BAD_REQUEST,
                 ApiErrorBody {
@@ -168,7 +189,7 @@ pub fn unique_message(err: anyhow::Error, fallback: &str) -> AppError {
     } else if text.contains("unique") {
         AppError::conflict(fallback)
     } else {
-        AppError::Internal(err)
+        err.into()
     }
 }
 

@@ -149,11 +149,14 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 dirty,
                 pending.is_some(),
                 version,
+                collection.is_some(),
             ),
-            move |(blueprint, name, visibility, dirty, pending, version)| {
-                if *dirty && !*pending {
-                    if let Some(version) = version {
-                        match crate::drafts::write(
+            move |(blueprint, name, visibility, dirty, pending, version, ready)| {
+                if *ready && !*pending {
+                    let result = if !*dirty {
+                        crate::drafts::clear_readable::<crate::drafts::SchemaDraft>(&key)
+                    } else if let Some(version) = version {
+                        crate::drafts::write(
                             &key,
                             &crate::drafts::SchemaDraft {
                                 name: name.clone(),
@@ -161,10 +164,13 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                                 blueprint: blueprint.clone(),
                                 version: version.clone(),
                             },
-                        ) {
-                            Ok(()) => draft_error.set(String::new()),
-                            Err(e) => draft_error.set(e),
-                        }
+                        )
+                    } else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => draft_error.set(String::new()),
+                        Err(e) => draft_error.set(e),
                     }
                 }
             },

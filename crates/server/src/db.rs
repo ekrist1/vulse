@@ -28,6 +28,7 @@ pub struct Conn {
     inner: ConnInner,
     /// Collections changed in the open transaction, published on commit.
     changes: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
+    pub(crate) lookup_cache: crate::lookups::Cache,
 }
 
 enum ConnInner {
@@ -59,12 +60,19 @@ impl Db {
             DbInner::Local(database) => Conn {
                 inner: ConnInner::Local(database.connect()?),
                 changes: Default::default(),
+                lookup_cache: Default::default(),
             },
             DbInner::Remote(database) => Conn {
                 inner: ConnInner::Remote(database.connect()?),
                 changes: Default::default(),
+                lookup_cache: Default::default(),
             },
         };
+        if let ConnInner::Local(local) = &conn.inner {
+            // Wait asynchronously for overlapping writers, including standalone
+            // session and asset writes. The wait is bounded for a stuck writer.
+            local.busy_timeout(std::time::Duration::from_secs(5))?;
+        }
         conn.execute("PRAGMA foreign_keys = ON", &[]).await?;
         Ok(conn)
     }
@@ -74,16 +82,33 @@ impl Conn {
     /// Notes that a collection's records or fields changed. Open views are
     /// told once the transaction commits, or right away outside one.
     pub fn changed(&self, collection_id: &str) {
+        self.lookup_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(collection_id);
         let mut changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         match changes.as_mut() {
             Some(pending) => {
                 pending.insert(collection_id.to_string());
             }
-            None => crate::events::publish([collection_id.to_string()]),
+            None => {
+                crate::lookups::invalidate(collection_id);
+                crate::events::publish([collection_id.to_string()]);
+            }
         }
     }
     fn begin_changes(&self) {
+        self.lookup_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.changes.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
+    }
+    pub(crate) fn in_transaction(&self) -> bool {
+        self.changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
     /// Ends the transaction's change list, publishing it if committed.
     fn end_changes(&self, committed: bool) {
@@ -93,14 +118,41 @@ impl Conn {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if committed && let Some(pending) = pending {
+            for id in &pending {
+                crate::lookups::invalidate(id);
+            }
             crate::events::publish(pending);
         }
+        self.lookup_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
     pub async fn with_app_tx<T, F>(&self, f: F) -> Result<T, crate::error::AppError>
     where
         F: AsyncFnOnce(&Conn) -> Result<T, crate::error::AppError>,
     {
-        self.execute("BEGIN IMMEDIATE", &[]).await?;
+        self.with_app_transaction(true, f).await
+    }
+
+    /// A consistent read snapshot without reserving the database's writer.
+    pub async fn with_app_read_tx<T, F>(&self, f: F) -> Result<T, crate::error::AppError>
+    where
+        F: AsyncFnOnce(&Conn) -> Result<T, crate::error::AppError>,
+    {
+        self.with_app_transaction(false, f).await
+    }
+
+    pub async fn with_app_transaction<T, F>(
+        &self,
+        write: bool,
+        f: F,
+    ) -> Result<T, crate::error::AppError>
+    where
+        F: AsyncFnOnce(&Conn) -> Result<T, crate::error::AppError>,
+    {
+        self.execute(if write { "BEGIN IMMEDIATE" } else { "BEGIN" }, &[])
+            .await?;
         self.begin_changes();
         match f(self).await {
             Ok(value) => match self.execute("COMMIT", &[]).await {

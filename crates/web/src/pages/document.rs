@@ -129,9 +129,11 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
                 pending.is_some(),
             ),
             move |(inputs, baseline, version, ready, pending)| {
-                if *ready && !*pending && inputs != baseline {
-                    if let Some(c) = collection {
-                        match crate::drafts::write(
+                if *ready && !*pending {
+                    let result = if inputs == baseline {
+                        crate::drafts::clear_readable::<crate::drafts::RecordDraft>(&key)
+                    } else if let Some(c) = collection {
+                        crate::drafts::write(
                             &key,
                             &crate::drafts::RecordDraft {
                                 blueprint: c.blueprint,
@@ -139,10 +141,13 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
                                 baseline: baseline.clone(),
                                 version: version.clone(),
                             },
-                        ) {
-                            Ok(()) => storage_error.set(String::new()),
-                            Err(e) => storage_error.set(e),
-                        }
+                        )
+                    } else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => storage_error.set(String::new()),
+                        Err(e) => storage_error.set(e),
                     }
                 }
             },

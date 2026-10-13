@@ -40,7 +40,7 @@ pub async fn export_records(
         return Err(AppError::bad("Select at most 100 unique records"));
     }
     let conn = state.db.connect().await?;
-    let (name,bytes)=conn.with_app_tx(async |conn|{
+    let (name,bytes)=conn.with_app_read_tx(async |conn|{
  let collection=workspace_collection(conn,&principal,&id).await?;
  if write.columns.is_empty()||write.columns.iter().collect::<std::collections::HashSet<_>>().len()!=write.columns.len()||write.columns.iter().any(|key|!collection.blueprint.fields.iter().any(|f|f.name==*key)){return Err(AppError::bad("Choose one or more valid export columns"));}
  let(mut from,order,mut params)=crate::records::query_sql(&collection.blueprint,&id,&write.query)?;

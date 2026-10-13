@@ -473,8 +473,8 @@ pub async fn update_collection(
         ],
     )
     .await?;
-    crate::records::sync_collection_cells(conn, id, blueprint).await?;
     conn.changed(id);
+    crate::records::sync_collection_cells(conn, id, blueprint).await?;
     Ok(())
 }
 
@@ -615,9 +615,9 @@ pub async fn insert_document(
         ],
     )
     .await?;
+    conn.changed(collection_id);
     crate::records::sync_stored_document(conn, collection_id, id, body).await?;
     crate::history::snapshot(conn, collection_id, id, "create").await?;
-    conn.changed(collection_id);
     Ok(())
 }
 
@@ -651,11 +651,11 @@ pub async fn update_document_as(
         ],
     )
     .await?;
+    conn.changed(collection_id);
     crate::records::sync_stored_document(conn, collection_id, id, body).await?;
     if previous.as_ref().is_some_and(|old| old.body != *body) {
         crate::history::snapshot(conn, collection_id, id, action).await?;
     }
-    conn.changed(collection_id);
     Ok(())
 }
 

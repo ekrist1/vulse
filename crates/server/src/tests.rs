@@ -12,6 +12,9 @@ use vulse_model::{
 
 use crate::app;
 
+#[path = "tests/beta.rs"]
+mod beta;
+
 struct TestApp {
     app: axum::Router,
     asset_dir: std::path::PathBuf,

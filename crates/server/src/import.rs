@@ -114,7 +114,7 @@ pub async fn import_file(
         .map_err(AppError::bad)?;
     // Re-read and validate inside the write transaction so schema changes cannot bypass validation.
     let result = conn
-        .with_app_tx(async |conn| {
+        .with_app_transaction(commit, async |conn| {
             let collection = workspace_collection(conn, &principal, &id).await?;
             let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
             let mapping = match mapping {

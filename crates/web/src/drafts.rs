@@ -31,6 +31,13 @@ pub fn clear(key: &str) -> Result<(), String> {
         .remove_item(key)
         .map_err(|_| "Could not remove the saved draft".into())
 }
+/// Remove a reverted edit without destroying an unreadable recovery draft.
+pub fn clear_readable<T: DeserializeOwned>(key: &str) -> Result<(), String> {
+    if read::<T>(key)?.is_some() {
+        clear(key)?;
+    }
+    Ok(())
+}
 #[derive(Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct RecordDraft {
     pub blueprint: vulse_model::Blueprint,

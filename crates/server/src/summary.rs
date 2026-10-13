@@ -12,7 +12,7 @@ use vulse_model::{
     SummaryResult, SummaryRow, SummarySpec, apply_summary_formulas, validate_summary,
 };
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, Principal, require_collection};
 use crate::content::workspace_collection;
 use crate::db::{Conn, SqlRow, SqlValue, int_at, opt_number_at, text_at};
 use crate::error::AppError;
@@ -22,6 +22,21 @@ use crate::store;
 /// Groups computed before refusing; only `MAX_SUMMARY_GROUPS` are returned.
 const MAX_COMPUTED_GROUPS: usize = 10_000;
 
+/// Access to referenced collections must match the caller of the summary.
+pub(crate) enum SummaryAccess<'a> {
+    Public,
+    Authenticated(&'a Principal),
+}
+
+impl SummaryAccess<'_> {
+    fn can_read(&self, collection: &CollectionView) -> bool {
+        match self {
+            Self::Public => collection.visibility == vulse_model::Visibility::Public,
+            Self::Authenticated(principal) => require_collection(principal, &collection.id).is_ok(),
+        }
+    }
+}
+
 pub async fn summarize(
     State(state): State<AppState>,
     AuthUser(principal): AuthUser,
@@ -30,7 +45,15 @@ pub async fn summarize(
 ) -> Result<Json<SummaryResult>, AppError> {
     let conn = state.db.connect().await?;
     let collection = workspace_collection(&conn, &principal, &id).await?;
-    Ok(Json(run_summary(&conn, &collection, &request).await?))
+    Ok(Json(
+        run_summary(
+            &conn,
+            &collection,
+            &request,
+            SummaryAccess::Authenticated(&principal),
+        )
+        .await?,
+    ))
 }
 
 /// Runs the summary saved in a view, with the view's search and filters.
@@ -57,13 +80,22 @@ pub async fn view_summary(
         query: config.query,
         summary,
     };
-    Ok(Json(run_summary(&conn, &collection, &request).await?))
+    Ok(Json(
+        run_summary(
+            &conn,
+            &collection,
+            &request,
+            SummaryAccess::Authenticated(&principal),
+        )
+        .await?,
+    ))
 }
 
 pub(crate) async fn run_summary(
     conn: &Conn,
     collection: &CollectionView,
     request: &SummaryRequest,
+    access: SummaryAccess<'_>,
 ) -> Result<SummaryResult, AppError> {
     let spec = &request.summary;
     let blueprint = &collection.blueprint;
@@ -133,7 +165,10 @@ pub(crate) async fn run_summary(
             SummaryOp::Max if date => format!("MAX(NULLIF({alias}.text_value,''))"),
             SummaryOp::Min => format!("MIN({number})"),
             SummaryOp::Max => format!("MAX({number})"),
-            SummaryOp::Count => format!("COUNT({alias}.document_id)"),
+            SummaryOp::Count => format!(
+                "COUNT(CASE WHEN {} THEN {alias}.document_id END)",
+                crate::records::nonempty_cell(&alias)
+            ),
             SummaryOp::CountUnique => format!("COUNT(DISTINCT {alias}.raw_value)"),
             SummaryOp::Formula => continue,
         };
@@ -176,7 +211,7 @@ pub(crate) async fn run_summary(
             rows.push(decode_row(spec, &columns, &spec.group_by, row, keys.len())?);
         }
     }
-    label_groups(conn, collection, spec, &mut rows).await?;
+    label_groups(conn, collection, spec, &mut rows, &access).await?;
     sort_rows(spec, &mut rows);
     let group_count = rows.len() as u64;
     let truncated = rows.len() > MAX_SUMMARY_GROUPS;
@@ -253,6 +288,7 @@ async fn label_groups(
     collection: &CollectionView,
     spec: &SummarySpec,
     rows: &mut [SummaryRow],
+    access: &SummaryAccess<'_>,
 ) -> anyhow::Result<()> {
     let mut titles = HashMap::<(String, String), String>::new();
     for (index, group) in spec.group_by.iter().enumerate() {
@@ -272,6 +308,8 @@ async fn label_groups(
             }
             None => None,
         };
+        // Keep the already-visible reference ID when its title is inaccessible.
+        let target = target.filter(|target| access.can_read(target));
         for row in rows.iter_mut() {
             let value = &row.group[index];
             let label = match (value, &target) {

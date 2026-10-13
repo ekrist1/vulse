@@ -71,7 +71,13 @@ async fn summary_inner(
     let conn = state.db.connect().await?;
     let collection = public_collection(&conn, &path.collection).await?;
     Ok(Json(
-        crate::summary::run_summary(&conn, &collection, &request).await?,
+        crate::summary::run_summary(
+            &conn,
+            &collection,
+            &request,
+            crate::summary::SummaryAccess::Public,
+        )
+        .await?,
     ))
 }
 

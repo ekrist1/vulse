@@ -16,13 +16,21 @@ use crate::db::{Conn, SqlValue, int_at, text_at};
 use crate::error::AppError;
 use crate::store;
 
-struct Cached {
+pub(crate) struct Cached {
     fingerprint: String,
     columns: HashMap<String, Arc<LookupColumn>>,
 }
 
 /// Cached columns by collection id.
-static CACHE: LazyLock<Mutex<HashMap<String, Cached>>> = LazyLock::new(Default::default);
+pub(crate) type Cache = Mutex<HashMap<String, Cached>>;
+static CACHE: LazyLock<Cache> = LazyLock::new(Default::default);
+
+pub(crate) fn invalidate(collection_id: &str) {
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(collection_id);
+}
 
 /// The columns that `blueprint`'s formulas read from collections.
 pub(crate) async fn load(conn: &Conn, blueprint: &Blueprint) -> anyhow::Result<Lookups> {
@@ -49,6 +57,13 @@ async fn columns(
     collection: &CollectionView,
     fields: &[String],
 ) -> anyhow::Result<Vec<(String, Arc<LookupColumn>)>> {
+    // A transaction sees its own writes (or an older read snapshot). Neither
+    // may reuse or populate the cache shared with other requests.
+    let cache = if conn.in_transaction() {
+        &conn.lookup_cache
+    } else {
+        &CACHE
+    };
     let rows = conn
         .query(
             "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM documents WHERE collection_id=?1",
@@ -67,9 +82,13 @@ async fn columns(
     let fields: Vec<&String> = fields
         .iter()
         .filter(|f| collection.blueprint.fields.iter().any(|d| d.name == **f))
+        // Older schemas may contain indirect chains accepted before validation
+        // followed local dependencies. Leave these unresolved, so callers get
+        // a calculation error rather than aggregating fabricated null values.
+        .filter(|f| !reads_collections(&collection.blueprint, f))
         .collect();
     {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cache
             .get(&collection.id)
             .filter(|c| c.fingerprint == fingerprint)
@@ -115,7 +134,7 @@ async fn columns(
             )
         })
         .collect();
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let entry = cache
         .entry(collection.id.clone())
         .or_insert_with(|| Cached {
@@ -135,13 +154,28 @@ async fn columns(
 /// Whether a field reads other collections, which makes it unusable as a
 /// lookup column itself.
 fn reads_collections(blueprint: &Blueprint, field: &str) -> bool {
-    blueprint.fields.iter().any(|f| {
-        f.name == field
-            && f.kind == FieldType::Calculated
-            && f.formula
-                .as_deref()
-                .is_some_and(|formula| !formula_lookups(formula).is_empty())
-    })
+    let mut pending = vec![field.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(formula) = blueprint
+            .fields
+            .iter()
+            .find(|f| f.name == name && f.kind == FieldType::Calculated)
+            .and_then(|f| f.formula.as_deref())
+        else {
+            continue;
+        };
+        if !formula_lookups(formula).is_empty() {
+            return true;
+        }
+        if let Ok(dependencies) = vulse_model::formula_dependencies(formula) {
+            pending.extend(dependencies);
+        }
+    }
+    false
 }
 
 /// An existing collection being changed: its id, its current name and its

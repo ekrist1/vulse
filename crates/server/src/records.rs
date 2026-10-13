@@ -101,6 +101,11 @@ fn like(value: &str) -> String {
             .replace('_', "\\_")
     )
 }
+
+/// Shared by empty/not-empty filters and counts of non-empty values.
+pub(crate) fn nonempty_cell(alias: &str) -> String {
+    format!("{alias}.text_value<>'' AND {alias}.raw_value<>'[]' AND {alias}.raw_value<>'{{}}'")
+}
 pub(crate) fn query_sql(
     blueprint: &Blueprint,
     id: &str,
@@ -120,7 +125,7 @@ pub(crate) fn query_sql(
             .any(|f| f.name == filter.field && f.kind == FieldType::Date);
         let field = parameter(&mut params, text(&filter.field));
         let predicate = if ["empty", "not_empty"].contains(&filter.op.as_str()) {
-            "c.text_value<>'' AND c.raw_value<>'[]' AND c.raw_value<>'{}'".into()
+            nonempty_cell("c")
         } else {
             let value = if filter.op == "contains" {
                 like(&vulse_model::display_value(&filter.value))

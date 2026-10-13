@@ -900,6 +900,24 @@ fn criterion(v: &Value, c: &Value) -> Result<bool, String> {
     }
     compare(v, &b, op)
 }
+/// Calls a formula function on already evaluated arguments, for SQL
+/// expressions. `IF` and `IFERROR` evaluate eagerly; functions that read
+/// lists of other collections are not available.
+pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
+    let name = name.to_ascii_uppercase();
+    if !FUNCTIONS.iter().any(|(n, _)| *n == name) {
+        return Err(format!("unknown function {name}"));
+    }
+    arity(&name, args.len())?;
+    match name.as_str() {
+        "IF" => Ok(args[if truth(&args[0])? { 1 } else { 2 }].clone()),
+        "IFERROR" => Ok(args[0].clone()),
+        "SUMIFS" | "COUNTIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS" | "XLOOKUP" => {
+            Err(format!("{name} is not available in SQL; use WHERE and GROUP BY"))
+        }
+        _ => function(&name, args),
+    }
+}
 fn function(n: &str, a: &[Value]) -> Result<Value, String> {
     let mut values = vec![];
     for v in a {

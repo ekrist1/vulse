@@ -15,6 +15,7 @@ mod pages;
 mod record_cell;
 mod records;
 mod relationships;
+mod sql_editor;
 mod summary;
 
 fn main() {

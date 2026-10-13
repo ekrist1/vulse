@@ -5,7 +5,7 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::confirm::ConfirmProvider;
 use crate::pages::{
-    AcceptPage, AccountPage, CollectionPage, CollectionsPage, DocumentPage, KeysPage, LoginPage,
+    AcceptPage, AccountPage, CollectionPage, CollectionsPage, DocumentPage, KeysPage, LoginPage, SqlPage,
     PeoplePage, SetupPage,
 };
 
@@ -57,6 +57,8 @@ pub enum Route {
     People,
     #[at("/keys")]
     Keys,
+    #[at("/sql")]
+    Sql,
     #[at("/collections/:id")]
     Collection { id: String },
     #[at("/collections/:id/documents/:doc_id")]
@@ -109,6 +111,7 @@ fn switch(route: Route) -> Html {
         Route::Account => html! { <AccountPage /> },
         Route::People => html! { <PeoplePage /> },
         Route::Keys => html! { <KeysPage /> },
+        Route::Sql => html! { <SqlPage /> },
         Route::Collection { id } => html! { <CollectionPage key={id.clone()} id={id.clone()} /> },
         Route::Document { id, doc_id } => {
             html! { <DocumentPage key={format!("{id}/{doc_id}")} id={id.clone()} doc_id={doc_id.clone()} /> }
@@ -156,6 +159,7 @@ pub fn shell(props: &ShellProps) -> Html {
                 if let Some(user) = user {
                     <nav>
                         <Link<Route> to={Route::Home}>{"Collections"}</Link<Route>>
+                        <Link<Route> to={Route::Sql}>{"SQL"}</Link<Route>>
                         <Link<Route> to={Route::Keys}>{"API keys"}</Link<Route>>
                         if user.role == Role::Admin {
                             <Link<Route> to={Route::People}>{"People"}</Link<Route>>

@@ -6,7 +6,7 @@ pub use query::{
 };
 mod formula;
 pub use formula::{
-    Expr as FormulaExpression, FUNCTIONS, LookupColumn, Lookups, calculate_document,
+    Expr as FormulaExpression, FUNCTIONS, call_function, LookupColumn, Lookups, calculate_document,
     calculate_document_with, formula_dependencies, formula_lookups, inspect_formula,
     lookup_references, rename_formula_fields, rename_formula_references, source_document,
     text_value, validate_formulas,
@@ -14,6 +14,12 @@ pub use formula::{
 mod identity;
 mod portable_text;
 mod summary;
+mod vsql;
+pub use vsql::{
+    MAX_SQL_CHANGES, MAX_SQL_ROWS, MAX_SQL_SAMPLE, SQL_AGGREGATES, SQL_KEYWORDS, SQL_RECORD_COLUMNS, Select as SqlSelect, SqlChange,
+    SqlColumn, SqlError, SqlExpr, SqlRequest, SqlResult, SqlRow, Statement as SqlStatement,
+    parse_sql, run_select, sql_assignments, sql_matches,
+};
 pub use summary::{
     ChartKind, DateBucket, MAX_CHART_SERIES, MAX_GROUP_FIELDS, MAX_MEASURES, MAX_SUMMARY_GROUPS,
     SummaryChart, SummaryGroup, SummaryMeasure, SummaryOp, SummaryRequest, SummaryResult,

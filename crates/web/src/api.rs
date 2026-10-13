@@ -434,3 +434,7 @@ pub async fn summarize(
     )
     .await
 }
+
+pub async fn run_sql(request: &vulse_model::SqlRequest) -> Result<vulse_model::SqlResult, String> {
+    send_json(Request::post("/api/v1/sql"), request).await
+}

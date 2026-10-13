@@ -16,6 +16,7 @@ mod public;
 mod records;
 mod relationships;
 mod security;
+mod sql;
 mod state;
 mod store;
 mod summary;
@@ -151,6 +152,7 @@ fn api() -> Router<AppState> {
             "/collections/{id}/documents/{doc_id}/revisions/{revision_id}/restore",
             post(history::restore),
         )
+        .route("/sql", post(sql::run_sql))
         .route("/collections/{id}/query", post(records::query_records))
         .route("/collections/{id}/events", get(events::collection_events))
         .route("/collections/{id}/export", post(export::export_records))

@@ -702,7 +702,7 @@ fn guided_draft(formula: &str, fields: &[FieldDef]) -> Option<Draft> {
     }
 }
 
-fn type_label(f: &FieldDef) -> &'static str {
+pub(crate) fn type_label(f: &FieldDef) -> &'static str {
     match f.kind {
         FieldType::Number => "Number",
         FieldType::String => "Text",

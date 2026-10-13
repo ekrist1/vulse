@@ -4004,3 +4004,95 @@ async fn views_hear_about_changes_to_their_collection_and_what_it_shows() {
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn sql_statements_preview_confirm_and_use_the_record_path() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "sql@example.com", "sql").await;
+    let reports = create_collection(
+        &app,
+        &cookie,
+        "aarsmelding",
+        "private",
+        json!({"fields":[{"name":"aar","type":"number"},{"name":"navn","type":"string","required":true},{"name":"kommune","type":"string"},{"name":"fte","type":"number"},{"name":"double","type":"calculated","formula":"=[fte]*2"}]}),
+    )
+    .await;
+    for (aar, navn, kommune, fte) in [(2018, "A", "Oslo", 2.0), (2019, "B", "Oslo", 3.0), (2023, "C", "Bergen", 4.0), (2024, "D", "Oslo", 5.5)] {
+        create_document(&app, &cookie, &reports.id, json!({"aar":aar,"navn":navn,"kommune":kommune,"fte":fte})).await;
+    }
+    let sql = |who: &str, body: Value| {
+        let app = &app;
+        let who = who.to_string();
+        async move {
+            let response = app.call("POST", "/api/v1/sql", Some(&who), None, Some(body)).await;
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+    // SELECT with grouping, calculated fields and ordering.
+    let (status, body) = sql(&cookie, json!({"sql":"SELECT kommune, COUNT(*) AS n, SUM(double) AS total FROM aarsmelding GROUP BY kommune ORDER BY n DESC"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["columns"], json!(["kommune", "n", "total"]));
+    assert_eq!(body["rows"], json!([["Oslo", 3, 21], ["Bergen", 1, 8]]));
+    // Unknown names and syntax errors explain themselves.
+    let (status, body) = sql(&cookie, json!({"sql":"SELECT year FROM aarsmelding"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("no field 'year'. Its fields are: aar, navn"), "{body}");
+    let (_, body) = sql(&cookie, json!({"sql":"DELETE aarsmelding"})).await;
+    assert!(body["error"].as_str().unwrap().contains("expected FROM (at character 8)"), "{body}");
+
+    // DELETE previews first and changes nothing.
+    let delete = "DELETE FROM aarsmelding WHERE aar < 2020";
+    let (status, preview) = sql(&cookie, json!({"sql":delete})).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["affected"], json!(2));
+    assert_eq!(preview["done"], json!(false));
+    assert_eq!(preview["changes"][0]["title"], json!("A"));
+    let confirmation = preview["confirmation"].as_str().unwrap().to_string();
+    let (_, count) = sql(&cookie, json!({"sql":"SELECT COUNT(*) FROM aarsmelding"})).await;
+    assert_eq!(count["rows"], json!([[4]]));
+    // Viewers can read but not change.
+    let (viewer, _) = register_as(&app, "sql-viewer@example.com", "sqlviewer", Role::Viewer).await;
+    let (status, _) = sql(&viewer, json!({"sql":"SELECT navn FROM aarsmelding"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = sql(&viewer, json!({"sql":delete,"confirm":confirmation})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A confirmation only applies to the previewed records.
+    create_document(&app, &cookie, &reports.id, json!({"aar":2017,"navn":"E"})).await;
+    let (status, body) = sql(&cookie, json!({"sql":delete,"confirm":confirmation})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (_, preview) = sql(&cookie, json!({"sql":delete})).await;
+    assert_eq!(preview["affected"], json!(3));
+    let (status, done) = sql(&cookie, json!({"sql":delete,"confirm":preview["confirmation"]})).await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["done"], json!(true));
+    assert_eq!(done["affected"], json!(3));
+    // Deleted records are in the Trash.
+    let response = app
+        .call("GET", &format!("/api/v1/collections/{}/deleted", reports.id), Some(&cookie), None, None)
+        .await;
+    let (_, trash) = json_of::<Value>(response).await;
+    assert_eq!(trash["items"].as_array().unwrap().len(), 3, "{trash}");
+
+    // UPDATE validates every record and records history.
+    let (_, preview) = sql(&cookie, json!({"sql":"UPDATE aarsmelding SET navn = NULL WHERE kommune = 'Oslo'"})).await;
+    assert_eq!(preview["confirmation"], Value::Null);
+    assert!(preview["problems"][0].as_str().unwrap().contains("navn"), "{preview}");
+    let update = "UPDATE aarsmelding SET fte = fte * 2, kommune = UPPER(kommune) WHERE aar >= 2023 AND kommune LIKE 'b%'";
+    let (_, preview) = sql(&cookie, json!({"sql":update})).await;
+    assert_eq!(preview["affected"], json!(1));
+    assert_eq!(preview["changes"][0]["before"], json!({"fte":4.0,"kommune":"Bergen"}));
+    assert_eq!(preview["changes"][0]["after"], json!({"fte":8,"kommune":"BERGEN"}));
+    let (status, _) = sql(&cookie, json!({"sql":update,"confirm":preview["confirmation"]})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, rows) = sql(&cookie, json!({"sql":"SELECT navn, fte, double, kommune FROM aarsmelding ORDER BY aar"})).await;
+    assert_eq!(rows["rows"], json!([["C", 8, 16, "BERGEN"], ["D", 5.5, 11, "Oslo"]]));
+    // Running it again changes nothing, so there is nothing to confirm.
+    let (_, preview) = sql(&cookie, json!({"sql":"UPDATE aarsmelding SET kommune = 'BERGEN' WHERE navn = 'C'"})).await;
+    assert_eq!(preview["affected"], json!(0));
+    assert_eq!(preview["confirmation"], Value::Null);
+    let (status, body) = sql(&cookie, json!({"sql":"UPDATE aarsmelding SET double = 1"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("calculated"), "{body}");
+}

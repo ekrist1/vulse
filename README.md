@@ -212,6 +212,32 @@ curl -X POST http://127.0.0.1:8080/api/v1/collections/$ID/summary \
 
 `op` is one of `sum`, `average`, `min`, `max`, `count` (without `field` it counts records), `count_unique` or `formula`. A date group takes `"bucket": "day" | "month" | "year"`. The response has `rows` (each with `group` values, readable `labels`, `count`, `values` and any formula `errors`), a `totals` row, `group_count` and `truncated`. `GET /api/v1/collections/{id}/views/{view_id}/summary` runs a saved view's summary. Public collections also accept `POST /api/v1/public/{collection}/summary` without credentials, from any site.
 
+## SQL
+
+**SQL** in the top bar runs Vulse SQL statements on one collection at a time:
+
+```sql
+SELECT kommune, COUNT(*) AS records, ROUND(AVG(aarsverk), 2) AS average
+FROM aarsmelding
+WHERE aar >= 2023 AND eiertype = 'Privat'
+GROUP BY kommune
+ORDER BY records DESC
+LIMIT 20
+
+UPDATE aarsmelding SET eiertype = 'Privat' WHERE eiertype = 'privat'
+
+DELETE FROM aarsmelding WHERE aar < 2020
+```
+
+- **Statements:** `SELECT` (columns or `*`, `WHERE`, `GROUP BY`, `ORDER BY` by expression, alias or position, `LIMIT`, `OFFSET`), `UPDATE … SET field = expression, … [WHERE …]` and `DELETE FROM … [WHERE …]`. One statement at a time; there are no joins, `INSERT` or schema changes.
+- **Names:** a statement's fields are the collection's API field names, plus `id`, `created_at` and `updated_at`. Collection names may contain hyphens (`FROM pensjon-2024`). Quote names that are keywords with double quotes (`"order"`). Text values use single quotes.
+- **Conditions:** `= <> < <= > >=`, `AND`, `OR`, `NOT`, `IN (…)`, `BETWEEN … AND …`, `LIKE` (`%` and `_`, ignoring case), `IS NULL` and `IS NOT NULL` (blank text counts as empty). Numbers and numeric text compare as numbers; `=` on text is case-sensitive. A comparison with an empty value is never true, so `WHERE kommune <> 'Oslo'` skips records without a kommune.
+- **Functions:** `COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` over groups, `COALESCE`, `IFNULL`, `LENGTH`, `SUBSTR`, and the formula functions such as `ROUND`, `UPPER`, `YEAR` or `IF`. Calculated fields can be read, including ones that read other collections, but not set.
+- **Changes are previewed:** running an `UPDATE` or `DELETE` changes nothing. It shows how many records will change and the first 20, with before → after values for updates, and any records that would become invalid (which block the statement). After you confirm, exactly the previewed records are changed in one transaction; if any of them changed in the meantime, you are asked to preview again. Updates are validated like edits in the table and keep each record's previous version in its history; deleted records go to the collection's Trash and can be restored. Records that other records still link to cannot be deleted. One statement can change up to 50,000 records.
+- **Who can run what:** viewers can run `SELECT`; editors and admins can also run `UPDATE` and `DELETE`. Collection-scoped API keys only reach their collection.
+- **Editor:** keywords, functions, text and numbers are highlighted. Suggestions follow what you type: collection names after `FROM` or `UPDATE`, then that collection's fields, keywords and functions (↑ ↓ to choose, Enter or Tab to insert). Ctrl + Enter runs. Templates fill in common statements with the chosen collection's fields, and the statement is kept when you reload.
+- **API:** `POST /api/v1/sql` with `{"sql": "…"}` returns `columns`, `rows` (up to 1,000) and `total` for a `SELECT`, or a preview with `affected`, `changes`, `problems` and a `confirmation`. Send the same statement with `"confirm": "<confirmation>"` to apply it.
+
 ## Rich text and collection API reference
 
 Portable Text fields use a locally bundled [Tiptap](https://tiptap.dev/docs/editor/introduction) editor: headings, bold, italic, underline, strikethrough, inline code, quotes, nested lists (six levels), image uploads, and undo/redo. Paste and drop images directly into the document. Existing Portable Text remains the storage and API format; no database migration is needed. The supported subset excludes link annotations, tables, and code blocks. Trunk builds the JavaScript bundle through a pre-build hook after `npm ci`.

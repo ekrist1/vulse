@@ -1,8 +1,11 @@
 //! Bounded, deterministic formulas over a single document's named fields.
+//! `[collection.field]` reads a whole column of another collection, like a
+//! spreadsheet range on another sheet; the server supplies those as `Lookups`.
 use crate::{Blueprint, FieldType};
 use chrono::{Datelike, Duration, NaiveDate};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 pub const FUNCTIONS: &[(&str, &str)] = &[
     ("SUM", "SUM(values…)"),
@@ -53,6 +56,18 @@ pub const FUNCTIONS: &[(&str, &str)] = &[
     ("SUMIF", "SUMIF(array, criteria, sum_array?)"),
     ("COUNTIF", "COUNTIF(array, criteria)"),
     ("AVERAGEIF", "AVERAGEIF(array, criteria, average_array?)"),
+    ("SUMIFS", "SUMIFS(sum_array, criteria_array, criteria, …)"),
+    ("COUNTIFS", "COUNTIFS(criteria_array, criteria, …)"),
+    (
+        "AVERAGEIFS",
+        "AVERAGEIFS(average_array, criteria_array, criteria, …)",
+    ),
+    ("MINIFS", "MINIFS(min_array, criteria_array, criteria, …)"),
+    ("MAXIFS", "MAXIFS(max_array, criteria_array, criteria, …)"),
+    (
+        "XLOOKUP",
+        "XLOOKUP(value, lookup_array, return_array, if_not_found?)",
+    ),
     ("INDEX", "INDEX(array, position)"),
     ("MATCH", "MATCH(value, array, mode?)"),
 ];
@@ -226,7 +241,8 @@ impl Parser {
                 if self.take(')') {
                     break;
                 }
-                if !self.take(',') {
+                // Spreadsheets in many locales separate arguments with ';'.
+                if !self.take(',') && !self.take(';') {
                     return Err("expected ',' or ')'".into());
                 }
             }
@@ -297,8 +313,21 @@ fn arity(name: &str, n: usize) -> Result<(), String> {
         "FIND" | "SEARCH" | "SUMIF" | "AVERAGEIF" | "MATCH" => (2, 3),
         "IFERROR" | "ROUND" | "ROUNDUP" | "ROUNDDOWN" | "MOD" | "POWER" | "CEILING" | "FLOOR"
         | "EXACT" | "COUNTIF" | "INDEX" => (2, 2),
+        "SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS" => (3, 255),
+        "COUNTIFS" => (2, 254),
+        "XLOOKUP" => (3, 4),
         _ => (1, 1),
     };
+    let pairs = match name {
+        "SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS" => !n.is_multiple_of(2),
+        "COUNTIFS" => n.is_multiple_of(2),
+        _ => true,
+    };
+    if !pairs {
+        return Err(format!(
+            "{name} expects each criteria array to be followed by its criteria"
+        ));
+    }
     if n < min || n > max {
         Err(format!(
             "{name} expects {min}–{max} arguments, received {n}"
@@ -338,6 +367,17 @@ fn compile(bp: &Blueprint) -> Result<HashMap<String, Expr>, String> {
             let mut dependencies = HashSet::new();
             refs(&e, &mut dependencies);
             for n in dependencies {
+                if let Some((collection, field)) = n.split_once('.') {
+                    if crate::check_collection_name(collection).is_err()
+                        || !crate::identity::is_field_name(field)
+                    {
+                        return Err(format!(
+                            "{}: [{n}] must name a collection and a field, like [orders.amount]",
+                            f.name
+                        ));
+                    }
+                    continue;
+                }
                 if !bp.fields.iter().any(|f| f.name == n) {
                     return Err(format!("{}: unknown field [{n}]", f.name));
                 }
@@ -383,8 +423,94 @@ pub fn validate_formulas(bp: &Blueprint) -> Result<(), String> {
     compile(bp).map(|_| ())
 }
 
+/// Columns of other collections that `[collection.field]` references read.
+/// Columns of one collection share a row order, so they line up like ranges.
+#[derive(Clone, Default)]
+pub struct Lookups {
+    columns: HashMap<String, Arc<LookupColumn>>,
+}
+
+/// One field's values across a collection's records, with a lazily built
+/// equality index so criteria such as `[orders.customer] = [id]` stay fast.
+pub struct LookupColumn {
+    collection: String,
+    values: Vec<Value>,
+    index: OnceLock<HashMap<String, Vec<usize>>>,
+}
+
+impl LookupColumn {
+    pub fn new(collection: &str, values: Vec<Value>) -> Self {
+        Self {
+            collection: collection.into(),
+            values,
+            index: OnceLock::new(),
+        }
+    }
+    fn rows(&self, key: &str) -> &[usize] {
+        self.index
+            .get_or_init(|| {
+                let mut index = HashMap::<String, Vec<usize>>::new();
+                for (row, value) in self.values.iter().enumerate() {
+                    index.entry(match_key(value)).or_default().push(row);
+                }
+                index
+            })
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+impl Lookups {
+    pub fn insert(&mut self, collection: &str, field: &str, column: Arc<LookupColumn>) {
+        self.columns.insert(format!("{collection}.{field}"), column);
+    }
+    fn column(&self, name: &str) -> Result<&LookupColumn, String> {
+        self.columns
+            .get(name)
+            .map(Arc::as_ref)
+            .ok_or_else(|| format!("#REF! [{name}] is read from its collection on saved records"))
+    }
+}
+
+/// The `(collection, field)` columns a formula reads from other collections.
+pub fn formula_lookups(formula: &str) -> Vec<(String, String)> {
+    let mut names = HashSet::new();
+    if let Ok(e) = parse(formula) {
+        refs(&e, &mut names);
+    }
+    let found: BTreeSet<_> = names
+        .iter()
+        .filter_map(|n| n.split_once('.'))
+        .map(|(c, f)| (c.to_string(), f.to_string()))
+        .collect();
+    found.into_iter().collect()
+}
+
+/// Every column the calculated fields of a blueprint read from collections.
+pub fn lookup_references(bp: &Blueprint) -> Vec<(String, String)> {
+    let found: BTreeSet<_> = bp
+        .fields
+        .iter()
+        .filter(|f| f.kind == FieldType::Calculated)
+        .filter_map(|f| f.formula.as_deref())
+        .flat_map(formula_lookups)
+        .collect();
+    found.into_iter().collect()
+}
+
 /// Calculates fresh values, ignoring client-supplied calculated values. Errors are kept separate.
+/// References to other collections fail; see `calculate_document_with`.
 pub fn calculate_document(bp: &Blueprint, body: &Value) -> (Value, BTreeMap<String, String>) {
+    calculate_document_with(bp, body, &Lookups::default())
+}
+
+/// Like `calculate_document`, reading `[collection.field]` columns from `lookups`.
+pub fn calculate_document_with(
+    bp: &Blueprint,
+    body: &Value,
+    lookups: &Lookups,
+) -> (Value, BTreeMap<String, String>) {
     let mut out = body.as_object().cloned().unwrap_or_default();
     let mut errors = BTreeMap::new();
     let expressions = match compile(bp) {
@@ -394,9 +520,14 @@ pub fn calculate_document(bp: &Blueprint, body: &Value) -> (Value, BTreeMap<Stri
             return (Value::Object(out), errors);
         }
     };
+    let ctx = Ctx {
+        all: &expressions,
+        body,
+        lookups,
+    };
     let mut cache = HashMap::new();
     for n in expressions.keys() {
-        match resolve(n, &expressions, body, &mut cache) {
+        match resolve(n, &ctx, &mut cache) {
             Ok(v) => {
                 out.insert(n.clone(), v);
             }
@@ -419,38 +550,38 @@ pub fn source_document(bp: &Blueprint, body: &Value) -> Value {
     }
     out
 }
-fn resolve(
-    n: &str,
-    all: &HashMap<String, Expr>,
-    body: &Value,
-    cache: &mut HashMap<String, Result<Value, String>>,
-) -> Result<Value, String> {
+struct Ctx<'a> {
+    all: &'a HashMap<String, Expr>,
+    body: &'a Value,
+    lookups: &'a Lookups,
+}
+type Cache = HashMap<String, Result<Value, String>>;
+fn resolve(n: &str, ctx: &Ctx, cache: &mut Cache) -> Result<Value, String> {
     if let Some(v) = cache.get(n) {
         return v.clone();
     }
-    let result = if let Some(e) = all.get(n) {
-        eval(e, all, body, cache)
+    let result = if let Some(e) = ctx.all.get(n) {
+        eval(e, ctx, cache)
+    } else if n.contains('.') {
+        ctx.lookups
+            .column(n)
+            .map(|column| Value::Array(column.values.clone()))
     } else {
-        Ok(body.get(n).cloned().unwrap_or(Value::Null))
+        Ok(ctx.body.get(n).cloned().unwrap_or(Value::Null))
     };
     cache.insert(n.into(), result.clone());
     result
 }
-fn eval(
-    e: &Expr,
-    all: &HashMap<String, Expr>,
-    body: &Value,
-    cache: &mut HashMap<String, Result<Value, String>>,
-) -> Result<Value, String> {
+fn eval(e: &Expr, ctx: &Ctx, cache: &mut Cache) -> Result<Value, String> {
     match e {
         Expr::Literal(v) => Ok(v.clone()),
-        Expr::Field(n) => resolve(n, all, body, cache),
+        Expr::Field(n) => resolve(n, ctx, cache),
         Expr::Unary(op, a) => {
-            number(num(&eval(a, all, body, cache)?)? * if *op == '-' { -1.0 } else { 1.0 })
+            number(num(&eval(a, ctx, cache)?)? * if *op == '-' { -1.0 } else { 1.0 })
         }
         Expr::Binary(op, a, b) => {
-            let a = eval(a, all, body, cache)?;
-            let b = eval(b, all, body, cache)?;
+            let a = eval(a, ctx, cache)?;
+            let b = eval(b, ctx, cache)?;
             match op.as_str() {
                 "&" => Ok(json!(text_value(&a) + &text_value(&b))),
                 "=" | "<>" | "<" | ">" | "<=" | ">=" => Ok(json!(compare(&a, &b, op)?)),
@@ -475,24 +606,31 @@ fn eval(
         Expr::Call(n, args) => {
             if n == "IF" {
                 return eval(
-                    &args[if truth(&eval(&args[0], all, body, cache)?)? {
+                    &args[if truth(&eval(&args[0], ctx, cache)?)? {
                         1
                     } else {
                         2
                     }],
-                    all,
-                    body,
+                    ctx,
                     cache,
                 );
             }
             if n == "IFERROR" {
-                return eval(&args[0], all, body, cache)
-                    .or_else(|_| eval(&args[1], all, body, cache));
+                return eval(&args[0], ctx, cache).or_else(|_| eval(&args[1], ctx, cache));
+            }
+            if matches!(
+                n.as_str(),
+                "SUMIFS" | "COUNTIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS"
+            ) {
+                return conditional(n, args, ctx, cache);
+            }
+            if n == "XLOOKUP" {
+                return xlookup(args, ctx, cache);
             }
             let mut values = Vec::new();
             let mut bytes = 0usize;
             for a in args {
-                let value = eval(a, all, body, cache)?;
+                let value = eval(a, ctx, cache)?;
                 bytes = bytes.saturating_add(value.to_string().len());
                 if bytes > 1_000_000 {
                     return Err("#VALUE! function inputs exceed 1 MB".into());
@@ -501,6 +639,149 @@ fn eval(
             }
             function(n, &values)
         }
+    }
+}
+
+/// A list argument: another collection's column is borrowed, not copied.
+enum Range<'a> {
+    Column(&'a LookupColumn),
+    List(Vec<Value>),
+}
+impl Range<'_> {
+    fn values(&self) -> &[Value] {
+        match self {
+            Range::Column(column) => &column.values,
+            Range::List(values) => values,
+        }
+    }
+}
+fn range<'a>(e: &Expr, ctx: &Ctx<'a>, cache: &mut Cache) -> Result<Range<'a>, String> {
+    if let Expr::Field(n) = e
+        && n.contains('.')
+    {
+        return ctx.lookups.column(n).map(Range::Column);
+    }
+    Ok(match eval(e, ctx, cache)? {
+        Value::Array(values) => Range::List(values),
+        value => Range::List(vec![value]),
+    })
+}
+/// Ranges must line up row by row, so columns of another collection are not
+/// mixed with other lists or other collections' columns.
+fn aligned(ranges: &[&Range]) -> Result<usize, String> {
+    let len = ranges[0].values().len();
+    if ranges.iter().any(|r| r.values().len() != len) {
+        return Err("#VALUE! arrays must have equal length".into());
+    }
+    let collections: HashSet<Option<&str>> = ranges
+        .iter()
+        .map(|r| match r {
+            Range::Column(column) => Some(column.collection.as_str()),
+            Range::List(_) => None,
+        })
+        .collect();
+    if collections.len() > 1 {
+        return Err("#VALUE! arrays must come from the same collection".into());
+    }
+    Ok(len)
+}
+/// The criteria's equality key, when the criteria is a plain value match.
+fn criteria_key(c: &Value) -> Option<String> {
+    match c {
+        Value::Number(_) | Value::Bool(_) => Some(match_key(c)),
+        Value::String(s) => {
+            let s = s.strip_prefix('=').unwrap_or(s);
+            (!s.is_empty() && !s.starts_with(['<', '>', '=']) && !s.contains(['*', '?', '~']))
+                .then(|| match_key(&json!(s)))
+        }
+        _ => None,
+    }
+}
+/// Values that compare equal in criteria share a key: numbers and numeric
+/// text by value, other text case-insensitively.
+fn match_key(v: &Value) -> String {
+    match as_number(v) {
+        // -0 and 0 are the same value.
+        Some(n) => if n == 0.0 { 0.0 } else { n }.to_string(),
+        None => text_value(v).to_lowercase(),
+    }
+}
+fn as_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
+        _ => None,
+    }
+}
+/// SUMIFS, COUNTIFS, AVERAGEIFS, MINIFS and MAXIFS. Matching rows come from
+/// the most selective indexed criteria, then every criteria is checked.
+fn conditional(n: &str, args: &[Expr], ctx: &Ctx, cache: &mut Cache) -> Result<Value, String> {
+    let (target, pairs) = if n == "COUNTIFS" {
+        (None, args)
+    } else {
+        (Some(range(&args[0], ctx, cache)?), &args[1..])
+    };
+    let mut criteria = Vec::new();
+    for pair in pairs.chunks(2) {
+        criteria.push((range(&pair[0], ctx, cache)?, eval(&pair[1], ctx, cache)?));
+    }
+    let mut ranges: Vec<&Range> = criteria.iter().map(|(r, _)| r).collect();
+    ranges.extend(target.as_ref());
+    let len = aligned(&ranges)?;
+    let mut candidates: Option<&[usize]> = None;
+    for (r, c) in &criteria {
+        if let (Range::Column(column), Some(key)) = (r, criteria_key(c)) {
+            let rows = column.rows(&key);
+            if candidates.is_none_or(|current| rows.len() < current.len()) {
+                candidates = Some(rows);
+            }
+        }
+    }
+    let rows: Box<dyn Iterator<Item = usize>> = match candidates {
+        Some(rows) => Box::new(rows.iter().copied()),
+        None => Box::new(0..len),
+    };
+    let (mut count, mut numeric, mut sum) = (0usize, 0usize, 0.0);
+    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+    'rows: for row in rows {
+        for (r, c) in &criteria {
+            if !criterion(&r.values()[row], c)? {
+                continue 'rows;
+            }
+        }
+        count += 1;
+        if let Some(v) = target.as_ref().and_then(|t| t.values()[row].as_f64()) {
+            numeric += 1;
+            sum += v;
+            min = min.min(v);
+            max = max.max(v);
+        }
+    }
+    match n {
+        "COUNTIFS" => Ok(json!(count)),
+        "SUMIFS" => number(sum),
+        "AVERAGEIFS" if numeric == 0 => Err("#DIV/0!".into()),
+        "AVERAGEIFS" => number(sum / numeric as f64),
+        _ if numeric == 0 => number(0.0),
+        "MINIFS" => number(min),
+        _ => number(max),
+    }
+}
+/// The first row whose lookup value equals `value`, by the criteria rules.
+fn xlookup(args: &[Expr], ctx: &Ctx, cache: &mut Cache) -> Result<Value, String> {
+    let value = eval(&args[0], ctx, cache)?;
+    let lookup = range(&args[1], ctx, cache)?;
+    let result = range(&args[2], ctx, cache)?;
+    aligned(&[&lookup, &result])?;
+    let key = match_key(&value);
+    let found = match &lookup {
+        Range::Column(column) => column.rows(&key).first().copied(),
+        Range::List(values) => values.iter().position(|v| match_key(v) == key),
+    };
+    match found {
+        Some(row) => Ok(result.values()[row].clone()),
+        None if args.len() == 4 => eval(&args[3], ctx, cache),
+        None => Err("#N/A no matching value".into()),
     }
 }
 fn number(n: f64) -> Result<Value, String> {
@@ -610,6 +891,12 @@ fn criterion(v: &Value, c: &Value) -> Result<bool, String> {
     if (op == "=" || op == "<>") && !b.is_number() && rhs.contains(['*', '?', '~']) {
         let matched = wildcard(&text_value(v).to_lowercase(), &rhs.to_lowercase(), false)?;
         return Ok(if op == "<>" { !matched } else { matched });
+    }
+    // Numeric text matches numeric criteria, as in spreadsheets.
+    if b.is_number()
+        && let Some(n) = as_number(v)
+    {
+        return compare(&json!(n), &b, op);
     }
     compare(v, &b, op)
 }
@@ -1057,12 +1344,12 @@ mod tests {
     use super::*;
     fn run(formula: &str) -> Result<Value, String> {
         let expr = parse(formula)?;
-        eval(
-            &expr,
-            &HashMap::new(),
-            &json!({"nums":[1,2,3,4],"blanks":[null,"",2],"words":["a","b","a"]}),
-            &mut HashMap::new(),
-        )
+        let ctx = Ctx {
+            all: &HashMap::new(),
+            body: &json!({"nums":[1,2,3,4],"blanks":[null,"",2],"words":["a","b","a"],"words2":["a","a","b","A"]}),
+            lookups: &Lookups::default(),
+        };
+        eval(&expr, &ctx, &mut HashMap::new())
     }
     #[test]
     fn every_catalog_function_has_a_behavior_test() {
@@ -1117,9 +1404,15 @@ mod tests {
             ("AVERAGEIF([nums],\">2\")", json!(3.5)),
             ("INDEX([nums],2)", json!(2)),
             ("MATCH(3,[nums],0)", json!(3)),
+            ("SUMIFS([nums],[words2],\"a\",[nums],\">1\")", json!(6)),
+            ("COUNTIFS([words2],\"a\")", json!(3)),
+            ("AVERAGEIFS([nums],[words2],\"a\")", json!(7.0 / 3.0)),
+            ("MINIFS([nums],[words2],\"a\")", json!(1)),
+            ("MAXIFS([nums],[words2],\"b\")", json!(3)),
+            ("XLOOKUP(\"b\",[words2],[nums])", json!(3)),
         ];
-        assert_eq!(cases.len(), 50);
-        assert_eq!(FUNCTIONS.len(), 50);
+        assert_eq!(cases.len(), 56);
+        assert_eq!(FUNCTIONS.len(), 56);
         for (name, _) in FUNCTIONS {
             assert!(
                 cases
@@ -1148,6 +1441,8 @@ mod tests {
             "\"broken",
             "1;evil",
             "1e9999",
+            "SUMIFS([nums],[words])",
+            "COUNTIFS([words])",
         ] {
             assert!(parse(s).is_err(), "{s}");
         }
@@ -1182,6 +1477,123 @@ mod tests {
         assert_eq!(run("SEARCH(\"h*o\", \"hello\")").unwrap(), json!(1));
         assert_eq!(run("MATCH(\"b*\", [words], 0)").unwrap(), json!(2));
         assert_eq!(run("\"a\"\"b\" & UPPER(\"c\")").unwrap(), json!("a\"bC"));
+    }
+    fn kindergartens() -> (Blueprint, Lookups) {
+        let bp: Blueprint = serde_json::from_value(json!({"fields":[
+            {"name":"org_nr","type":"string"},
+            {"name":"ar","type":"number"},
+            {"name":"weighted","type":"calculated","formula":
+                "=IFERROR(SUMIFS([basil-arsmelding.arsverk];[basil-arsmelding.org_nr];[org_nr];[basil-arsmelding.ar];[ar]-2);\"\")*7/12+IFERROR(SUMIFS([basil-arsmelding.arsverk];[basil-arsmelding.org_nr];[org_nr];[basil-arsmelding.ar];[ar]-1);\"\")*5/12"},
+            {"name":"kind","type":"calculated","formula":"=XLOOKUP([org_nr],[basil-arsmelding.org_nr],[basil-arsmelding.type],\"unknown\")"},
+            {"name":"reports","type":"calculated","formula":"=COUNTIFS([basil-arsmelding.org_nr],[org_nr])"}
+        ]}))
+        .unwrap();
+        let rows = [
+            (2022, "920143067", 3.0, "Ordinær"),
+            (2023, "920143067", 3.55, "Ordinær"),
+            (2023, "920062407", 27.55, "Familie"),
+            // Numbers stored as text still match numeric criteria.
+            (2023, "828227572", 9.33, "Ordinær"),
+        ];
+        let mut lookups = Lookups::default();
+        let column = |values: Vec<Value>| Arc::new(LookupColumn::new("basil-arsmelding", values));
+        lookups.insert(
+            "basil-arsmelding",
+            "ar",
+            column(rows.iter().map(|r| json!(r.0)).collect()),
+        );
+        lookups.insert(
+            "basil-arsmelding",
+            "org_nr",
+            column(rows.iter().map(|r| json!(r.1)).collect()),
+        );
+        lookups.insert(
+            "basil-arsmelding",
+            "arsverk",
+            column(rows.iter().map(|r| json!(r.2)).collect()),
+        );
+        lookups.insert(
+            "basil-arsmelding",
+            "type",
+            column(rows.iter().map(|r| json!(r.3)).collect()),
+        );
+        (bp, lookups)
+    }
+    #[test]
+    fn formulas_aggregate_columns_of_other_collections() {
+        let (bp, lookups) = kindergartens();
+        crate::validate_blueprint(&bp).unwrap();
+        assert_eq!(
+            lookup_references(&bp),
+            ["arsverk", "org_nr", "ar", "type"]
+                .iter()
+                .map(|f| ("basil-arsmelding".to_string(), f.to_string()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        let (body, errors) =
+            calculate_document_with(&bp, &json!({"org_nr":"920143067","ar":2024}), &lookups);
+        assert!(errors.is_empty(), "{errors:?}");
+        let expected = 3.0 * 7.0 / 12.0 + 3.55 * 5.0 / 12.0;
+        assert!((body["weighted"].as_f64().unwrap() - expected).abs() < 1e-9);
+        assert_eq!(body["kind"], json!("Ordinær"));
+        assert_eq!(body["reports"], json!(2));
+        // An org number given as a number matches text values.
+        let (body, _) =
+            calculate_document_with(&bp, &json!({"org_nr":828227572,"ar":2025}), &lookups);
+        assert!((body["weighted"].as_f64().unwrap() - 9.33 * 7.0 / 12.0).abs() < 1e-9);
+        let (body, _) = calculate_document_with(&bp, &json!({"org_nr":"1","ar":2025}), &lookups);
+        assert_eq!(body["weighted"].as_f64(), Some(0.0));
+        assert_eq!(body["kind"], json!("unknown"));
+        // Without the other collection's data the fields report why.
+        let (body, errors) = calculate_document(&bp, &json!({"org_nr":"1","ar":2025}));
+        assert_eq!(body["reports"], Value::Null);
+        assert!(errors["reports"].contains("#REF!"), "{errors:?}");
+    }
+    #[test]
+    fn indexed_and_scanned_criteria_agree() {
+        let (_, lookups) = kindergartens();
+        let all = HashMap::new();
+        let ctx = |body| Ctx {
+            all: &all,
+            body,
+            lookups: &lookups,
+        };
+        let body = json!({"sums":[3.0,3.55,27.55,9.33],"list":[2022,2023,2023,2023],"orgs":["920143067","920143067","920062407","828227572"]});
+        for (indexed, scanned) in [
+            (
+                "SUMIFS([basil-arsmelding.arsverk],[basil-arsmelding.ar],2023)",
+                "SUMIFS([sums],[list],2023)",
+            ),
+            (
+                "COUNTIFS([basil-arsmelding.org_nr],\"=920143067\")",
+                "COUNTIF([orgs],\"=920143067\")",
+            ),
+            (
+                "COUNTIFS([basil-arsmelding.ar],\">2022\")",
+                "COUNTIF([list],\">2022\")",
+            ),
+            ("COUNTIFS([basil-arsmelding.type],\"ORDINÆR\")", "3"),
+        ] {
+            let a = eval(&parse(indexed).unwrap(), &ctx(&body), &mut HashMap::new()).unwrap();
+            let b = eval(&parse(scanned).unwrap(), &ctx(&body), &mut HashMap::new()).unwrap();
+            assert_eq!(a.as_f64(), b.as_f64(), "{indexed}");
+        }
+        let mismatched = parse("SUMIFS([basil-arsmelding.arsverk],[orgs],1,[list],2)").unwrap();
+        assert!(eval(&mismatched, &ctx(&body), &mut HashMap::new()).is_err());
+    }
+    #[test]
+    fn cross_references_rename_and_validate() {
+        let renamed = rename_formula_references("=[a.b] & \"[a.b]\" & [c]", |n| {
+            n.strip_prefix("a.").map(|f| format!("z.{f}"))
+        });
+        assert_eq!(renamed, "=[z.b] & \"[a.b]\" & [c]");
+        let bp: Blueprint = serde_json::from_value(json!({"fields":[
+            {"name":"x","type":"calculated","formula":"=SUM([Bad Name.field])"}
+        ]}))
+        .unwrap();
+        assert!(crate::validate_blueprint(&bp).is_err());
     }
     #[test]
     fn dependencies_recalculate_and_bad_schemas_are_rejected() {
@@ -1224,6 +1636,13 @@ pub fn rename_formula_fields(
     formula: &str,
     renames: &std::collections::BTreeMap<String, String>,
 ) -> String {
+    rename_formula_references(formula, |name| renames.get(name).cloned())
+}
+
+/// Rewrites each `[name]` that `rename` maps to a new name, leaving string
+/// literals untouched. Used for renamed fields and for `[collection.field]`
+/// references when another collection or its fields are renamed.
+pub fn rename_formula_references(formula: &str, rename: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(formula.len());
     let mut chars = formula.chars().peekable();
     let mut in_string = false;
@@ -1251,7 +1670,7 @@ pub fn rename_formula_fields(
                 name.push(next);
             }
             out.push('[');
-            out.push_str(renames.get(&name).map(String::as_str).unwrap_or(&name));
+            out.push_str(&rename(&name).unwrap_or(name));
             if closed {
                 out.push(']');
             }

@@ -3794,3 +3794,130 @@ async fn changing_field_types_converts_stored_values_on_request() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read(b.id.clone()).await.body["label"], "3.5");
 }
+
+#[tokio::test]
+async fn formulas_read_columns_of_other_collections() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "lookups@example.com", "lookups").await;
+    let reports = create_collection(
+        &app,
+        &cookie,
+        "basil",
+        "private",
+        json!({"fields":[{"name":"ar","type":"number"},{"name":"org_nr","type":"string"},{"name":"arsverk","type":"number"},{"name":"double","type":"calculated","formula":"=[arsverk]*2"}]}),
+    )
+    .await;
+    let weighted = "=IFERROR(SUMIFS([basil.arsverk];[basil.org_nr];[org_nr];[basil.ar];[ar]-2);\"\")*7/12+IFERROR(SUMIFS([basil.arsverk];[basil.org_nr];[org_nr];[basil.ar];[ar]-1);\"\")*5/12";
+    let send = |method: &'static str, path: String, body: Option<Value>| {
+        let app = &app;
+        let cookie = cookie.clone();
+        async move {
+            let response = app.call(method, &path, Some(&cookie), None, body).await;
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+    let post_collection = |blueprint: Value| {
+        send(
+            "POST",
+            "/api/v1/collections".into(),
+            Some(json!({"name":"pensjon","visibility":"private","blueprint":blueprint})),
+        )
+    };
+    // References must name existing, non-chaining fields.
+    for (formula, message) in [
+        ("=SUM([nowhere.amount])", "unknown collection"),
+        ("=SUM([basil.missing])", "has no field"),
+    ] {
+        let (status, body) = post_collection(json!({"fields":[{"name":"x","type":"calculated","formula":formula}]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains(message), "{body}");
+    }
+    let pension = create_collection(
+        &app,
+        &cookie,
+        "pensjon",
+        "private",
+        json!({"fields":[
+            {"name":"org_nr","type":"string"},
+            {"name":"ar","type":"number"},
+            {"name":"weighted","type":"calculated","formula":weighted},
+            {"name":"doubled","type":"calculated","formula":"=SUMIFS([basil.double],[basil.org_nr],[org_nr])"}
+        ]}),
+    )
+    .await;
+    let (status, body) = send(
+        "POST",
+        "/api/v1/collections".into(),
+        Some(json!({"name":"chained","visibility":"private","blueprint":{"fields":[{"name":"x","type":"calculated","formula":"=SUM([pensjon.weighted])"}]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("reads other collections itself"), "{body}");
+
+    let first = create_document(&app, &cookie, &reports.id, json!({"ar":2022,"org_nr":"920143067","arsverk":3})).await;
+    create_document(&app, &cookie, &reports.id, json!({"ar":2023,"org_nr":"920143067","arsverk":3.55})).await;
+    create_document(&app, &cookie, &reports.id, json!({"ar":2023,"org_nr":"920062407","arsverk":27.55})).await;
+    let record = create_document(&app, &cookie, &pension.id, json!({"org_nr":"920143067","ar":2024})).await;
+    let expected = 3.0 * 7.0 / 12.0 + 3.55 * 5.0 / 12.0;
+    assert!((record.body["weighted"].as_f64().unwrap() - expected).abs() < 1e-9, "{:?}", record);
+    assert_eq!(record.body["doubled"].as_f64(), Some(13.1));
+
+    // Reads see changes to the other collection right away.
+    let (status, _) = send(
+        "PUT",
+        format!("/api/v1/collections/{}/documents/{}", reports.id, first.id),
+        Some(json!({"body":{"ar":2022,"org_nr":"920143067","arsverk":6}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let read = |id: String| send("GET", format!("/api/v1/collections/{}/documents/{id}", pension.id), None);
+    let (_, body) = read(record.id.clone()).await;
+    let expected = 6.0 * 7.0 / 12.0 + 3.55 * 5.0 / 12.0;
+    assert!((body["body"]["weighted"].as_f64().unwrap() - expected).abs() < 1e-9, "{body}");
+
+    // Queries list the calculated values too, and saving filters on them.
+    let (status, page) = send(
+        "POST",
+        format!("/api/v1/collections/{}/query", pension.id),
+        Some(json!({"filters":[{"field":"doubled","op":"gt","value":10}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], json!(1), "{page}");
+
+    // Renaming the source collection and its fields rewrites the formulas.
+    let (status, body) = send(
+        "PATCH",
+        format!("/api/v1/collections/{}", reports.id),
+        Some(json!({"name":"basil-arsmelding","blueprint":{"fields":[{"name":"ar","type":"number"},{"name":"org_nr","type":"string"},{"name":"fte","renamed_from":"arsverk","type":"number"},{"name":"double","type":"calculated","formula":"=[fte]*2"}]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = send("GET", format!("/api/v1/collections/{}", pension.id), None).await;
+    let formula = body["blueprint"]["fields"][2]["formula"].as_str().unwrap().to_string();
+    assert!(formula.contains("[basil-arsmelding.fte]") && !formula.contains("[basil."), "{formula}");
+    let (_, body) = read(record.id.clone()).await;
+    assert!((body["body"]["weighted"].as_f64().unwrap() - expected).abs() < 1e-9, "{body}");
+
+    // Fields and collections that formulas read cannot disappear.
+    let (status, body) = send(
+        "PATCH",
+        format!("/api/v1/collections/{}", reports.id),
+        Some(json!({"remove_field_data":true,"blueprint":{"fields":[{"name":"ar","type":"number"},{"name":"org_nr","type":"string"},{"name":"double","type":"calculated","formula":"=2"}]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("pensjon.weighted"), "{body}");
+    let (status, _) = send("DELETE", format!("/api/v1/collections/{}", reports.id), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // Nor may a field that is read start reading other collections itself.
+    let (status, body) = send(
+        "PATCH",
+        format!("/api/v1/collections/{}", reports.id),
+        Some(json!({"blueprint":{"fields":[{"name":"ar","type":"number"},{"name":"org_nr","type":"string"},{"name":"fte","type":"number"},{"name":"double","type":"calculated","formula":"=COUNTIFS([pensjon.ar],[ar])"}]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

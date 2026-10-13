@@ -6,8 +6,10 @@ pub use query::{
 };
 mod formula;
 pub use formula::{
-    Expr as FormulaExpression, FUNCTIONS, calculate_document, formula_dependencies,
-    inspect_formula, rename_formula_fields, source_document, text_value, validate_formulas,
+    Expr as FormulaExpression, FUNCTIONS, LookupColumn, Lookups, calculate_document,
+    calculate_document_with, formula_dependencies, formula_lookups, inspect_formula,
+    lookup_references, rename_formula_fields, rename_formula_references, source_document,
+    text_value, validate_formulas,
 };
 mod identity;
 mod portable_text;
@@ -15,7 +17,7 @@ mod summary;
 pub use summary::{
     ChartKind, DateBucket, MAX_CHART_SERIES, MAX_GROUP_FIELDS, MAX_MEASURES, MAX_SUMMARY_GROUPS,
     SummaryChart, SummaryGroup, SummaryMeasure, SummaryOp, SummaryRequest, SummaryResult,
-    SummaryRow, SummarySpec, apply_summary_formulas, rename_summary_fields, validate_summary,
+    SummaryRow, SummarySpec, apply_summary_formulas, lookup_message, rename_summary_fields, validate_summary,
 };
 
 pub use blueprint::{

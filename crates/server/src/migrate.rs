@@ -9,6 +9,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/004_history.sql")),
     (5, include_str!("../migrations/005_links.sql")),
     (6, include_str!("../migrations/006_workspace.sql")),
+    (7, include_str!("../migrations/007_lookups.sql")),
+    (8, include_str!("../migrations/008_cell_index.sql")),
 ];
 
 pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {

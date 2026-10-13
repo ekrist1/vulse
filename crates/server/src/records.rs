@@ -22,6 +22,7 @@ fn text(value: &str) -> SqlValue {
 pub async fn sync_cells(
     conn: &Conn,
     blueprint: &Blueprint,
+    lookups: &vulse_model::Lookups,
     id: &str,
     body: &serde_json::Value,
 ) -> anyhow::Result<()> {
@@ -30,7 +31,7 @@ pub async fn sync_cells(
         &[text(id)],
     )
     .await?;
-    let (body, _) = vulse_model::calculate_document(blueprint, body);
+    let (body, _) = vulse_model::calculate_document_with(blueprint, body, lookups);
     for field in &blueprint.fields {
         let value = &body[&field.name];
         if value.is_null() {
@@ -45,8 +46,9 @@ pub async fn sync_collection_cells(
     id: &str,
     blueprint: &Blueprint,
 ) -> anyhow::Result<()> {
+    let lookups = crate::lookups::load(conn, blueprint).await?;
     for (document, body) in store::list_document_bodies(conn, id).await? {
-        sync_cells(conn, blueprint, &document, &body).await?;
+        sync_cells(conn, blueprint, &lookups, &document, &body).await?;
         crate::relationships::sync(conn, id, &document, blueprint, &body).await?;
     }
     Ok(())
@@ -57,8 +59,9 @@ pub async fn rebuild_all_cells(conn: &Conn) -> anyhow::Result<()> {
         .await?
     {
         let blueprint = serde_json::from_str(&text_at(&row, 1)?)?;
+        let lookups = crate::lookups::load(conn, &blueprint).await?;
         for (doc, body) in store::list_document_bodies(conn, &text_at(&row, 0)?).await? {
-            sync_cells(conn, &blueprint, &doc, &body).await?;
+            sync_cells(conn, &blueprint, &lookups, &doc, &body).await?;
         }
     }
     Ok(())
@@ -79,7 +82,8 @@ pub async fn sync_stored_document(
         .first()
         .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
     let blueprint = serde_json::from_str(&text_at(row, 0)?)?;
-    sync_cells(conn, &blueprint, id, body).await?;
+    let lookups = crate::lookups::load(conn, &blueprint).await?;
+    sync_cells(conn, &blueprint, &lookups, id, body).await?;
     crate::relationships::sync(conn, collection, id, &blueprint, body).await
 }
 
@@ -200,8 +204,9 @@ pub(crate) async fn run_query(
         .iter()
         .map(store::document_from_row)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
     for doc in &mut items {
-        materialize(&collection.blueprint, doc);
+        materialize(&collection.blueprint, &lookups, doc);
     }
     Ok(RecordPage {
         items,

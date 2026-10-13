@@ -71,8 +71,27 @@ const { signInFreshAdmin } = require("./sign-in.cjs");
     assert.equal(await double.getByLabel("Calculation preview result").innerText(), "24.5");
     await double.getByRole("button", { name: "Edit formula", exact: true }).click();
     await double.getByLabel("Formula", { exact: true }).fill("=[pr");
-    await double.getByRole("button", { name: "price [price] \xB7 Number", exact: true }).click();
+    await double.getByRole("option", { name: /^price \[price\]\s*Number$/ }).click();
     assert.equal(await double.getByLabel("Formula", { exact: true }).inputValue(), "=[price]");
+    // Function names complete from the keyboard and show help for each argument.
+    const formulaBox = double.getByLabel("Formula", { exact: true });
+    await formulaBox.fill("=ro");
+    await double.getByRole("listbox", { name: "Function suggestions" }).waitFor();
+    assert.match(await double.getByRole("option").first().innerText(), /^ROUND\(number, digits\)/);
+    await formulaBox.press("ArrowDown");
+    await formulaBox.press("ArrowUp");
+    await formulaBox.press("Enter");
+    assert.equal(await formulaBox.inputValue(), "=ROUND(");
+    const help = double.getByLabel("Function help");
+    assert.match(await help.innerText(), /ROUND\(number, digits\)[\s\S]*Argument 1: Value to round/);
+    await formulaBox.pressSequentially("[price], ");
+    assert.match(await help.innerText(), /Argument 2: Decimal places/);
+    assert.match(await double.locator(".formula-status").innerText(), /expected/);
+    await formulaBox.pressSequentially("2)");
+    assert.equal(await double.locator(".formula-status").innerText(), "\u2713 Formula is valid");
+    await formulaBox.fill("=[price] * [nope]");
+    assert.equal(await double.locator(".formula-status").innerText(), "Unknown field [nope]");
+    await formulaBox.press("Escape");
     await double.getByLabel("Formula", { exact: true }).fill("=ROUND([price] * [quantity], 2) + 5");
     await double.getByLabel("Formula", { exact: true }).evaluate((area) => {
       const start = area.value.indexOf("[price]");

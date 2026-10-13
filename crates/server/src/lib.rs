@@ -8,6 +8,7 @@ mod error;
 mod export;
 mod history;
 mod import;
+mod lookups;
 mod migrate;
 mod mutations;
 mod public;

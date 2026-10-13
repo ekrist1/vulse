@@ -97,8 +97,9 @@ async fn list_documents_inner(
     let conn = state.db.connect().await?;
     let collection = public_collection(&conn, &path.collection).await?;
     let mut items = store::list_documents(&conn, &collection.id, limit, offset).await?;
+    let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
     for document in &mut items {
-        crate::content::materialize(&collection.blueprint, document);
+        crate::content::materialize(&collection.blueprint, &lookups, document);
     }
     Ok(Json(Page {
         items,
@@ -116,7 +117,8 @@ async fn get_document_inner(
     let mut document = store::find_document(&conn, &collection.id, &path.doc_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    crate::content::materialize(&collection.blueprint, &mut document);
+    let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
+    crate::content::materialize(&collection.blueprint, &lookups, &mut document);
     Ok(Json(document))
 }
 

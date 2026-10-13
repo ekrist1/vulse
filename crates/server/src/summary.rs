@@ -282,7 +282,11 @@ async fn label_groups(
                         let title = store::find_document(conn, &target.id, id)
                             .await?
                             .map(|mut doc| {
-                                crate::content::materialize(&target.blueprint, &mut doc);
+                                crate::content::materialize(
+                                    &target.blueprint,
+                                    &Default::default(),
+                                    &mut doc,
+                                );
                                 vulse_model::record_title(&target.blueprint, &doc.body, &doc.id)
                             })
                             .unwrap_or_else(|| format!("Missing record {id}"));

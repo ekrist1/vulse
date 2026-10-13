@@ -239,6 +239,9 @@ pub struct DocumentFormProps {
     pub collections: Vec<CollectionView>,
     pub inputs: Vec<ValueInput>,
     pub on_change: Callback<Vec<ValueInput>>,
+    /// The saved record, for formulas that read other collections.
+    #[prop_or_default]
+    pub saved: Option<serde_json::Value>,
 }
 
 #[function_component(DocumentForm)]
@@ -249,6 +252,14 @@ pub fn document_form(props: &DocumentFormProps) -> Html {
     html! {
         <div class="fields card">
             { for props.blueprint.fields.iter().enumerate().map(|(index, field)| {
+                if field.kind == FieldType::Calculated && !vulse_model::formula_lookups(field.formula.as_deref().unwrap_or_default()).is_empty() {
+                    // Other collections' values are only read on the server.
+                    let result = match props.saved.as_ref().map(|body| &body[&field.name]) {
+                        Some(value) if !value.is_null() => format!("{} · saved value, updates when you save", vulse_model::text_value(value)),
+                        _ => "Calculated from other collections when the record is saved".into(),
+                    };
+                    return html! { <div class="computed-field"><span class="badge">{"ƒx Calculated"}</span><strong>{field.display_label().to_string()}</strong><output>{result}</output><code>{field.formula.clone().unwrap_or_default()}</code></div> };
+                }
                 if field.kind == FieldType::Calculated {
                     let preview = body_from_inputs(&props.blueprint, &props.inputs).map(|body| vulse_model::calculate_document(&props.blueprint, &body));
                     let result = match preview {

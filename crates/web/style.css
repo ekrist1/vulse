@@ -145,7 +145,7 @@ button.toolbar-toggle.active{background:#e7f4f1;border-color:#9ccfc4;color:var(-
 .summary-section h3{margin:0 0 8px;font-size:.85rem;color:var(--muted);font-weight:650}
 .summary-row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin-bottom:10px}
 .summary-row label{margin:0;flex:1 1 160px;min-width:0}
-.summary-row label.formula-input{flex:3 1 320px}
+.summary-row .formula-input{flex:1 1 100%;order:1;min-width:0}.summary-row .formula-input .formula-label{margin:0}
 .summary-row button{min-height:40px}
 .summary-options{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
 .summary-options label{margin:0;flex:1 1 160px}
@@ -185,3 +185,10 @@ button.toolbar-toggle.active{background:#e7f4f1;border-color:#9ccfc4;color:var(-
 .tooltip-row strong{color:var(--ink);font-variant-numeric:tabular-nums}
 @media(max-width:600px){.summary-panel{padding:0 12px 12px}}
 .table-scroll{position:relative}
+.formula-input{min-width:0}.formula-label{display:block;font-weight:550;margin-bottom:.4rem}.formula-field{position:relative}.formula-field textarea{display:block}
+.formula-completions{position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:30;max-height:280px;overflow:auto;overscroll-behavior:contain;background:#fff;border:1px solid #cbd8dc;border-radius:8px;box-shadow:0 10px 28px #17343a24}
+.formula-option{display:flex;flex-direction:column;gap:2px;padding:8px 12px;cursor:pointer;border-bottom:1px solid #eef3f2}.formula-option:last-child{border-bottom:0}.formula-option strong{font-family:"SFMono-Regular",Consolas,monospace;font-size:13px;font-weight:600;color:var(--ink);overflow-wrap:anywhere}.formula-option span{font-size:12px;color:var(--muted);line-height:1.4}.formula-option:hover,.formula-option.active{background:#e6f4f0}.formula-option.active strong{color:#175e45}
+.formula-signature{margin-top:8px;padding:10px 12px;border:1px solid #d7e6e0;border-left:3px solid var(--accent);border-radius:8px;background:#fff;font-size:13px}.formula-signature>code{display:block;overflow-wrap:anywhere;font-weight:600}.formula-signature p{margin:.35rem 0 0!important;font-size:12px!important}.formula-signature p code{font-size:12px;overflow-wrap:anywhere}
+.formula-status{margin:.4rem 0 0!important;font-size:12px!important}.formula-status.ok{color:#277552}.formula-status.invalid{color:var(--danger)}
+.lookup-builder{margin-top:4px}.lookup-heading{margin:18px 0 8px!important;font-size:14px}.lookup-conditions{display:grid;gap:10px;margin-bottom:12px}.lookup-condition{display:grid;grid-template-columns:minmax(0,1.2fr) auto minmax(0,1.2fr) minmax(0,.8fr) auto;gap:10px;align-items:end;border:1px solid #dce9e5;border-radius:9px;background:#fff;padding:12px 15px}.lookup-condition label{margin:0;font-size:13px}.lookup-equals{padding-bottom:10px;color:var(--muted);font-size:13px}.lookup-condition .text-button{font-size:12px;min-height:34px}.lookup-fallback{max-width:420px;font-size:13px}.lookup-sentence{margin-top:14px!important;padding:10px 12px;border-radius:8px;background:#e8f5ee;color:#175f42;font-size:13px!important}
+@media(max-width:800px){.lookup-condition{grid-template-columns:minmax(0,1fr)}.lookup-equals{padding:0}}

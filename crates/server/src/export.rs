@@ -56,6 +56,7 @@ pub async fn export_records(
  let related=resolve_related(conn,&principal,&collection,&write.related).await?;
  let columns=export_columns(&write.columns,&related);
  let mut lookups=RelatedCache::default();
+ let own=crate::lookups::load(conn,&collection.blueprint).await?;
  let mut bytes=vec![];
  if write.format=="csv"{csv_row(&mut bytes,&columns.iter().map(|c|c.header(&related)).collect::<Vec<_>>())?;}else{bytes.push(b'[');}
  let mut emitted=0;
@@ -64,7 +65,7 @@ pub async fn export_records(
  let rows=conn.query(&format!("SELECT d.id,d.body,d.created_at,d.updated_at {from} ORDER BY {order} LIMIT {limit} OFFSET {offset}"),&page_params).await?;
  if rows.is_empty(){return Err(anyhow::anyhow!("export snapshot changed").into());}
  for row in rows {
-  let mut doc:DocumentView=store::document_from_row(&row)?;materialize(&collection.blueprint,&mut doc);
+  let mut doc:DocumentView=store::document_from_row(&row)?;materialize(&collection.blueprint,&own,&mut doc);
   let mut linked=Vec::with_capacity(related.len());
   for spec in &related{linked.push(lookups.records(conn,spec,&doc.body[&spec.field]).await?);}
   if write.format=="csv"{
@@ -257,6 +258,7 @@ fn export_columns(columns: &[String], related: &[Related]) -> Vec<Column> {
 #[derive(Default)]
 struct RelatedCache {
     bodies: HashMap<(String, String), Option<Value>>,
+    lookups: HashMap<String, vulse_model::Lookups>,
 }
 
 impl RelatedCache {
@@ -278,11 +280,16 @@ impl RelatedCache {
         for id in ids {
             let key = (spec.target.id.clone(), id.clone());
             if !self.bodies.contains_key(&key) {
+                if !self.lookups.contains_key(&spec.target.id) {
+                    let loaded = crate::lookups::load(conn, &spec.target.blueprint).await?;
+                    self.lookups.insert(spec.target.id.clone(), loaded);
+                }
+                let lookups = &self.lookups[&spec.target.id];
                 let body =
                     store::find_document(conn, &spec.target.id, &id)
                         .await?
                         .map(|mut doc| {
-                            materialize(&spec.target.blueprint, &mut doc);
+                            materialize(&spec.target.blueprint, lookups, &mut doc);
                             doc.body
                         });
                 self.bodies.insert(key.clone(), body);

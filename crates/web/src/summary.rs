@@ -11,6 +11,7 @@ use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
 use crate::api;
+use crate::formula_input::{FormulaInput, Suggestion};
 
 /// A useful first summary: grouped by the first text, reference or date
 /// field, summing the first number field.
@@ -391,7 +392,6 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
         .collect();
     let select_value = |e: Event| e.target_unchecked_into::<HtmlSelectElement>().value();
     let input_value = |e: InputEvent| e.target_unchecked_into::<HtmlInputElement>().value();
-    let measure_names: Vec<String> = spec.measures.iter().map(|m| m.name.clone()).collect();
 
     let groups = spec.group_by.iter().enumerate().map(|(index, group)| {
         let is_date = fields.iter().any(|f| f.name == group.field && f.kind == FieldType::Date);
@@ -532,9 +532,9 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
         };
         let on_formula = {
             let (spec, on_change) = (spec.clone(), props.on_change.clone());
-            Callback::from(move |e: InputEvent| {
+            Callback::from(move |formula: String| {
                 let mut next = spec.clone();
-                next.measures[index].formula = Some(input_value(e));
+                next.measures[index].formula = Some(formula);
                 on_change.emit(next);
             })
         };
@@ -553,7 +553,17 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
             }));
             Callback::from(move |_| run())
         };
-        let others: Vec<String> = measure_names.iter().filter(|n| **n != measure.name).cloned().collect();
+        // Other values can be used in the formula by name.
+        let others: Vec<Suggestion> = spec
+            .measures
+            .iter()
+            .filter(|m| m.name != measure.name && !m.name.is_empty())
+            .map(|m| Suggestion {
+                name: m.name.clone(),
+                label: m.name.clone(),
+                detail: describe(&props.fields, m),
+            })
+            .collect();
         html! {<div class="summary-row measure-row" key={format!("measure-{index}")}>
             <label>{"Name"}
                 <input aria-label={format!("Value {} name", index + 1)} value={measure.name.clone()} oninput={on_name}/>
@@ -564,14 +574,7 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
                 </select>
             </label>
             if measure.op == SummaryOp::Formula {
-                <label class="formula-input">{"Formula"}
-                    <input class="code" aria-label={format!("Value {} formula", index + 1)} placeholder="=[total_revenue]/[records]" value={measure.formula.clone().unwrap_or_default()} oninput={on_formula}/>
-                    <span class="field-help">{if others.is_empty() {
-                        "Add another value to use it in a formula.".to_string()
-                    } else {
-                        format!("Use other values in brackets: {}", others.iter().map(|n| format!("[{n}]")).collect::<Vec<_>>().join(", "))
-                    }}</span>
-                </label>
+                <FormulaInput label={format!("Value {} formula", index + 1)} rows={2} library={true} placeholder="=[total_revenue]/[records]" value={measure.formula.clone().unwrap_or_default()} suggestions={others.clone()} on_change={on_formula}/>
             } else {
                 <label>{"Of field"}
                     <select aria-label={format!("Value {} field", index + 1)} onchange={on_field}>

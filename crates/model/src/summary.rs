@@ -263,6 +263,19 @@ pub fn validate_summary(blueprint: &Blueprint, spec: &SummarySpec) -> Result<(),
         }
     }
     crate::validate_formulas(&formula_blueprint(spec))?;
+    for measure in &spec.measures {
+        if let Some((collection, field)) = measure
+            .formula
+            .as_deref()
+            .and_then(|f| crate::formula_lookups(f).into_iter().next())
+        {
+            return Err(format!(
+                "'{}': {}",
+                measure.name,
+                lookup_message(&collection, &field)
+            ));
+        }
+    }
     if let Some(sort) = &spec.sort {
         if !names.contains(sort) && !groups.contains(sort) {
             return Err(format!("cannot sort by unknown summary column '{sort}'"));
@@ -447,4 +460,11 @@ mod tests {
             "measures":[{"name":"first","op":"min","field":"opened"},{"name":"n","op":"count_unique","field":"name"}]}));
         validate_summary(&bp, &dated).unwrap();
     }
+}
+
+/// Why a summary formula cannot use `[collection.field]`, and what to do.
+pub fn lookup_message(collection: &str, field: &str) -> String {
+    format!(
+        "summary formulas can only use this summary's values, not [{collection}.{field}]. Add a calculated field that reads {collection} (for example with SUMIFS) to the records, then summarize that field."
+    )
 }

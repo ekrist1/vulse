@@ -14,8 +14,12 @@ use serde_json::{Map, Value};
 use std::{collections::HashSet, io::Cursor};
 use vulse_model::{Blueprint, FieldType, ImportIssue, ImportResult};
 
-pub const MAX_BYTES: usize = 10 * 1024 * 1024;
-const MAX_ROWS: usize = 1000;
+pub const MAX_BYTES: usize = 50 * 1024 * 1024;
+const MAX_ROWS: usize = 50_000;
+/// Uncompressed size limit for an XLSX workbook and for each worksheet.
+const MAX_EXPANDED: u64 = 200 * 1024 * 1024;
+/// Row problems reported per import; the rest are counted.
+const MAX_ISSUES: usize = 500;
 const MAX_COLUMNS: usize = 200;
 #[derive(Debug)]
 struct Table {
@@ -112,6 +116,7 @@ pub async fn import_file(
     let result = conn
         .with_app_tx(async |conn| {
             let collection = workspace_collection(conn, &principal, &id).await?;
+            let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
             let mapping = match mapping {
                 Some(m) => m,
                 None => table
@@ -228,7 +233,7 @@ pub async fn import_file(
                         Err(e) => return Err(e),
                     }
                     let (computed, errors) =
-                        vulse_model::calculate_document(&collection.blueprint, &body);
+                        vulse_model::calculate_document_with(&collection.blueprint, &body, &lookups);
                     for (field, message) in errors {
                         failed = true;
                         result.errors.push(ImportIssue {
@@ -252,6 +257,15 @@ pub async fn import_file(
                     row: table.first_row,
                     field: None,
                     message: "No data rows found".into(),
+                });
+            }
+            if result.errors.len() > MAX_ISSUES {
+                let more = result.errors.len() - MAX_ISSUES;
+                result.errors.truncate(MAX_ISSUES);
+                result.errors.push(ImportIssue {
+                    row: 0,
+                    field: None,
+                    message: format!("…and {more} more problems. Fix the ones above and preview again."),
                 });
             }
             if commit && result.errors.is_empty() {
@@ -401,7 +415,7 @@ fn excel_datetime(dt: &calamine::ExcelDateTime) -> String {
 }
 fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
     if bytes.len() > MAX_BYTES {
-        return Err("File exceeds 10 MB".into());
+        return Err("File exceeds 50 MB".into());
     }
     if name.to_ascii_lowercase().ends_with(".csv") {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -418,7 +432,7 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
         for row in reader.records() {
             let row = row.map_err(|e| e.to_string())?;
             if rows.len() >= MAX_ROWS {
-                return Err("Maximum 1,000 data rows per import".into());
+                return Err("Maximum 50,000 data rows per import".into());
             }
             rows.push(row.iter().map(str::to_owned).collect());
         }
@@ -451,7 +465,7 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
     }
     let range = book.worksheet_range(&selected).map_err(|e| e.to_string())?;
     if range.height() > MAX_ROWS + 1 || range.width() > MAX_COLUMNS {
-        return Err("Maximum 1,000 rows and 200 columns per worksheet".into());
+        return Err("Maximum 50,000 rows and 200 columns per worksheet".into());
     }
     let first_row = range.start().map(|(row, _)| row as usize + 2).unwrap_or(2);
     let mut rows = range.rows();
@@ -514,8 +528,8 @@ fn preflight_xlsx(bytes: &[u8]) -> Result<(), String> {
         total = total
             .checked_add(entry.size())
             .ok_or("Workbook is too large")?;
-        if total > 50 * 1024 * 1024 {
-            return Err("Expanded workbook exceeds 50 MB".into());
+        if total > MAX_EXPANDED {
+            return Err("Expanded workbook exceeds 200 MB".into());
         }
         if !entry.name().starts_with("xl/worksheets/") || !entry.name().ends_with(".xml") {
             continue;
@@ -523,11 +537,11 @@ fn preflight_xlsx(bytes: &[u8]) -> Result<(), String> {
         let mut xml = Vec::new();
         entry
             .by_ref()
-            .take(50 * 1024 * 1024 + 1)
+            .take(MAX_EXPANDED + 1)
             .read_to_end(&mut xml)
             .map_err(|e| e.to_string())?;
-        if xml.len() > 50 * 1024 * 1024 {
-            return Err("Expanded worksheet exceeds 50 MB".into());
+        if xml.len() as u64 > MAX_EXPANDED {
+            return Err("Expanded worksheet exceeds 200 MB".into());
         }
         let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
         loop {
@@ -683,7 +697,9 @@ mod tests {
         let csv = parse_file("data.csv", b"\xef\xbb\xbftitle,price\n\"a,b\",12\n", "").unwrap();
         assert_eq!(csv.headers[0], "title");
         assert_eq!(csv.rows[0][0], "a,b");
-        let huge = "a\n".to_owned() + &"1\n".repeat(1001);
+        let most = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS);
+        assert_eq!(parse_file("data.csv", most.as_bytes(), "").unwrap().rows.len(), MAX_ROWS);
+        let huge = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS + 1);
         assert!(parse_file("data.csv", huge.as_bytes(), "").is_err());
     }
 }

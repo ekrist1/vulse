@@ -64,6 +64,7 @@ pub async fn create_collection(
     let created_at = timeutil::now_rfc3339();
     conn.with_app_tx(async |conn| {
         ensure_targets(conn, &body.blueprint, &name).await?;
+        crate::lookups::check(conn, None, &name, &body.blueprint).await?;
         store::insert_collection(
             conn,
             &id,
@@ -125,8 +126,15 @@ pub async fn update_collection(
             let renames =
                 take_field_renames(&mut blueprint, &current.blueprint).map_err(AppError::bad)?;
             retarget_self(&mut blueprint, &current.name, &name);
+            crate::lookups::rename(&mut blueprint, &current.name, &name, &renames);
             prepare_blueprint(&blueprint, &name)?;
             ensure_targets(conn, &blueprint, &name).await?;
+            let previous = crate::lookups::Previous {
+                id: &id,
+                name: &current.name,
+                renames: &renames,
+            };
+            crate::lookups::check(conn, Some(previous), &name, &blueprint).await?;
             // Stored values of removed fields are only deleted on request.
             let removed: Vec<String> = current
                 .blueprint
@@ -303,13 +311,15 @@ pub async fn update_collection(
             if !renames.is_empty() {
                 crate::records::rename_view_fields(conn, &id, &renames).await?;
             }
-            if name != current.name {
+            // References and formulas elsewhere follow the new names.
+            if name != current.name || !renames.is_empty() {
                 for mut related in crate::relationships::all_collections(conn).await? {
                     if related.id == id {
                         continue;
                     }
                     let original = related.blueprint.clone();
                     retarget_self(&mut related.blueprint, &current.name, &name);
+                    crate::lookups::rename(&mut related.blueprint, &current.name, &name, &renames);
                     if original != related.blueprint {
                         store::update_collection(
                             conn,
@@ -344,6 +354,7 @@ pub async fn delete_collection(
                 return Err(AppError::conflict(format!("Collection '{}' has fields referencing this collection. Remove those fields first.",related.name)));
             }
         }
+        crate::lookups::check_delete(conn,&id,&current.name).await?;
         let keys=store::asset_keys(conn,&id).await?;
         store::delete_collection(conn,&id).await?;
         Ok(keys)
@@ -366,8 +377,9 @@ pub async fn list_documents(
     let conn = state.db.connect().await?;
     let collection = workspace_collection(&conn, &principal, &id).await?;
     let mut items = store::list_documents(&conn, &id, limit, offset).await?;
+    let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
     for document in &mut items {
-        materialize(&collection.blueprint, document);
+        materialize(&collection.blueprint, &lookups, document);
     }
     Ok(Json(Page {
         items,
@@ -394,7 +406,8 @@ pub async fn create_document(
             let mut document = store::find_document(conn, &id, &document_id)
                 .await?
                 .ok_or(AppError::NotFound)?;
-            materialize(&collection.blueprint, &mut document);
+            let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+            materialize(&collection.blueprint, &lookups, &mut document);
             Ok(document)
         })
         .await?;
@@ -411,7 +424,8 @@ pub async fn get_document(
     let mut document = store::find_document(&conn, &collection.id, &doc_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    materialize(&collection.blueprint, &mut document);
+    let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
+    materialize(&collection.blueprint, &lookups, &mut document);
     Ok(Json(document))
 }
 
@@ -435,7 +449,8 @@ pub async fn update_document(
             let mut document = store::find_document(conn, &id, &doc_id)
                 .await?
                 .ok_or(AppError::NotFound)?;
-            materialize(&collection.blueprint, &mut document);
+            let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+            materialize(&collection.blueprint, &lookups, &mut document);
             Ok(document)
         })
         .await?;
@@ -546,8 +561,14 @@ fn retarget_self(blueprint: &mut Blueprint, old_name: &str, new_name: &str) {
     }
 }
 
-pub(crate) fn materialize(blueprint: &Blueprint, document: &mut DocumentView) {
-    let (body, errors) = vulse_model::calculate_document(blueprint, &document.body);
+/// Fills in calculated fields; `lookups` holds the columns their formulas
+/// read from collections (see `crate::lookups::load`).
+pub(crate) fn materialize(
+    blueprint: &Blueprint,
+    lookups: &vulse_model::Lookups,
+    document: &mut DocumentView,
+) {
+    let (body, errors) = vulse_model::calculate_document_with(blueprint, &document.body, lookups);
     document.body = body;
     document.calculation_errors = errors;
 }

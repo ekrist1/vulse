@@ -193,8 +193,9 @@ pub(crate) async fn run_bulk(
             after.clone(),
         )
         .await?;
+        let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
         for doc in &mut after {
-            materialize(&collection.blueprint, doc);
+            materialize(&collection.blueprint, &lookups, doc);
         }
         Ok(MutationResult {
             documents: after,
@@ -225,7 +226,7 @@ pub async fn undo_action(
         for doc in &snapshot.before {if !store::document_exists(conn,&id,&doc.id).await?{store::insert_document(conn,&doc.id,&id,&doc.body,&doc.created_at).await?;}store::update_document(conn,&id,&doc.id,&doc.body,&now).await?;}
         for doc in &snapshot.before {check_body(conn,&id,&collection.name,&collection.blueprint,&doc.body).await?;}
         conn.execute("DELETE FROM record_actions WHERE id=?1",&[text(&action_id)]).await?;
-        let mut documents=vec![];for doc in &snapshot.before {let mut current=store::find_document(conn,&id,&doc.id).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&mut current);documents.push(current);}
+        let lookups=crate::lookups::load(conn,&collection.blueprint).await?;let mut documents=vec![];for doc in &snapshot.before {let mut current=store::find_document(conn,&id,&doc.id).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&lookups,&mut current);documents.push(current);}
         Ok(MutationResult{affected:snapshot.before.len().max(snapshot.after.len()),documents,undo_id:String::new()})
     }).await?;
     Ok(Json(result))

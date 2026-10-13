@@ -71,6 +71,21 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         )
     });
     *latest.borrow_mut() = ((*name).clone(), *visibility, edited.clone());
+    // Formulas can read other collections, which may have been created or
+    // changed since this page loaded.
+    {
+        let collections = collections.clone();
+        use_effect_with((*tab).clone(), move |tab| {
+            if tab == "fields" {
+                let collections = collections.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Ok(items) = api::collections().await {
+                        collections.set(items);
+                    }
+                });
+            }
+        });
+    }
     let refresh = use_state(|| 0usize);
     {
         let id = props.id.clone();
@@ -795,7 +810,7 @@ fn field_row(props: &FieldRowProps) -> Html {
                 </label>
             }
             if field.kind == FieldType::Calculated {
-                <FormulaEditor records={props.records.clone()} field={field.clone()} fields={props.fields.clone()} on_change={patch.clone()}/>
+                <FormulaEditor records={props.records.clone()} field={field.clone()} fields={props.fields.clone()} collections={props.collections.clone()} current={props.current.clone()} on_change={patch.clone()}/>
             }
             <div class="row field-actions">
                 <button class="secondary" type="button" disabled={props.index == 0} onclick={Callback::from({

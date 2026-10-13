@@ -86,7 +86,7 @@ pub async fn restore(
  check_body(conn,&id,&collection.name,&collection.blueprint,&source).await?;
  store::update_document(conn,&id,&doc,&source,&timeutil::now_rfc3339()).await?;
  snapshot(conn,&id,&doc,"restore").await?;
- let mut result=store::find_document(conn,&id,&doc).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&mut result);Ok(result)
+ let mut result=store::find_document(conn,&id,&doc).await?.ok_or(AppError::NotFound)?;let lookups=crate::lookups::load(conn,&collection.blueprint).await?;materialize(&collection.blueprint,&lookups,&mut result);Ok(result)
  }).await?;
     Ok(Json(result))
 }

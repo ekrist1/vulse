@@ -393,6 +393,7 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
                         blueprint={collection.blueprint.clone()}
                         collections={(*collections).clone()}
                         inputs={(*inputs).clone()}
+                        saved={(*current).as_ref().map(|d| d.body.clone())}
                         on_change={Callback::from({
                             let inputs = inputs.clone();let latest=latest.clone();
                             move |next:Vec<ValueInput>|{*latest.borrow_mut()=next.clone();inputs.set(next)}

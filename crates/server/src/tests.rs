@@ -725,6 +725,22 @@ async fn record_tables_sort_empty_values_last_and_follow_changes() {
             .0,
         2
     );
+    // Filters joined by OR form a group that the other filters narrow down.
+    assert_eq!(
+        titles(json!({"filters":[{"field":"score","op":"eq","value":1},{"field":"score","op":"eq","value":3,"or":true}],"sort_field":"title","descending":false}))
+            .await,
+        (2, "ac".into())
+    );
+    assert_eq!(
+        titles(json!({"filters":[{"field":"score","op":"eq","value":1},{"field":"score","op":"eq","value":3,"or":true},{"field":"title","op":"eq","value":"c"}]}))
+            .await,
+        (1, "c".into())
+    );
+    assert_eq!(
+        titles(json!({"filters":[{"field":"title","op":"eq","value":"x"},{"field":"score","op":"empty","or":true},{"field":"double","op":"gt","value":5,"or":true}],"sort_field":"title","descending":false}))
+            .await,
+        (3, "cxy".into())
+    );
     assert_eq!(titles(json!({"search":"Y"})).await, (1, "y".into()));
 
     // Renaming a field rebuilds the table with the values under the new name.

@@ -9,6 +9,25 @@ pub struct RecordFilter {
     pub op: String,
     #[serde(default)]
     pub value: Value,
+    /// Joins this filter to the previous one with OR instead of AND. Filters
+    /// joined by OR form a group, and the groups must all match, so
+    /// `a, or b, c` means `(a OR b) AND c`. Ignored on the first filter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub or: bool,
+}
+
+/// Removes a filter without merging its neighbours' groups: when the removed
+/// filter started a group, the next filter starts it instead.
+pub fn remove_filter(filters: &mut Vec<RecordFilter>, index: usize) {
+    if index >= filters.len() {
+        return;
+    }
+    let removed = filters.remove(index);
+    if !removed.or
+        && let Some(next) = filters.get_mut(index)
+    {
+        next.or = false;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,4 +208,29 @@ pub fn display_value(value: &Value) -> String {
         return blocks.iter().map(text).collect::<Vec<_>>().join(" ");
     }
     crate::text_value(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_filter_keeps_its_neighbours_groups_apart() {
+        let filter = |field: &str, or: bool| RecordFilter {
+            field: field.into(),
+            op: "empty".into(),
+            value: Value::Null,
+            or,
+        };
+        // a AND (b OR c): removing b leaves a AND c, not a OR c.
+        let mut filters = vec![filter("a", false), filter("b", false), filter("c", true)];
+        remove_filter(&mut filters, 1);
+        assert_eq!(filters, vec![filter("a", false), filter("c", false)]);
+        // (a OR b) AND c: removing b leaves a AND c.
+        let mut filters = vec![filter("a", false), filter("b", true), filter("c", false)];
+        remove_filter(&mut filters, 1);
+        assert_eq!(filters, vec![filter("a", false), filter("c", false)]);
+        remove_filter(&mut filters, 5);
+        assert_eq!(filters.len(), 2);
+    }
 }

@@ -335,6 +335,15 @@ pub fn records_panel(props: &RecordsProps) -> Html {
             }
         });
     }
+    // Filter rows are reused by position, so after a removal a row can hold
+    // another filter. Yew only moves `selected` attributes, which browsers
+    // ignore once someone has picked an option, so the dropdowns would keep
+    // showing the removed filter's choices.
+    let filter_rows = use_node_ref();
+    {
+        let filter_rows = filter_rows.clone();
+        use_effect(move || sync_selects(&filter_rows));
+    }
     let change = Callback::from({
         let query = query.clone();
         move |mut next: RecordQuery| {
@@ -541,19 +550,19 @@ pub fn records_panel(props: &RecordsProps) -> Html {
             if !*summary_mode {{toggle("export","Export".to_string())}}
             <span class="records-count muted" role="status">{if *loading{"Loading…".into()}else{format!("{} matching records",page.total)}}</span>
         </div>
-        if *panel!=Some("filters")&&!query.filters.is_empty(){<div class="filter-chips">{for query.filters.iter().enumerate().map(|(index,filter)|{let label=filter_summary(fields,filter);html!{<span class="filter-chip"><button type="button" class="chip-edit" onclick={Callback::from({let panel=panel.clone();move |_|panel.set(Some("filters"))})}>{label.clone()}</button><button type="button" class="chip-remove" aria-label={format!("Remove filter {label}")} onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();next.filters.remove(index);change.emit(next);}})}>{"×"}</button></span>}})}<button type="button" class="text-button" onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();next.filters.clear();change.emit(next);}})}>{"Clear filters"}</button></div>}
+        if *panel!=Some("filters")&&!query.filters.is_empty(){<div class="filter-chips">{for query.filters.iter().enumerate().map(|(index,filter)|{let label=filter_summary(fields,filter);html!{<>if index>0{<span class="filter-join muted">{if filter.or{"or"}else{"and"}}</span>}<span class="filter-chip"><button type="button" class="chip-edit" onclick={Callback::from({let panel=panel.clone();move |_|panel.set(Some("filters"))})}>{label.clone()}</button><button type="button" class="chip-remove" aria-label={format!("Remove filter {label}")} onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();vulse_model::remove_filter(&mut next.filters,index);change.emit(next);}})}>{"×"}</button></span></>}})}<button type="button" class="text-button" onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();next.filters.clear();change.emit(next);}})}>{"Clear filters"}</button></div>}
         if let Some(open)=*panel {<div class="records-panel" id="records-panel">
-            if open=="filters" {<div class="record-filters">{for query.filters.iter().enumerate().map(|(index,filter)|{
+            if open=="filters" {<div class="record-filters" ref={filter_rows.clone()}>{for query.filters.iter().enumerate().map(|(index,filter)|{
             let patch=Callback::from({let query=(*query).clone();let change=change.clone();move |next:RecordFilter|{let mut query=query.clone();query.filters[index]=next;change.emit(query);}});
             let date_field=fields.iter().find(|f|f.name==filter.field).is_some_and(|f|f.kind==FieldType::Date);
             let date=date_field&&filter.op!="contains";
             let numeric=!date&&(fields.iter().find(|f|f.name==filter.field).is_some_and(|f|f.kind==FieldType::Number)||["gt","gte","lt","lte"].contains(&filter.op.as_str()));
             let boolean=fields.iter().find(|f|f.name==filter.field).is_some_and(|f|f.kind==FieldType::Boolean)&&["eq","neq"].contains(&filter.op.as_str());
-            html!{<div class="record-filter"><select aria-label={format!("Filter {} field",index+1)} onchange={Callback::from({let filter=filter.clone();let patch=patch.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=filter.clone();next.field=input.value();next.op="contains".into();next.value=serde_json::json!("");patch.emit(next);}})}>{for fields.iter().map(|f|html!{<option value={f.name.clone()} selected={filter.field==f.name}>{f.display_label().to_string()}</option>})}</select>
+            html!{<div class="record-filter">if index==0{<span class="filter-join">{"Where"}</span>}else{<select class="filter-join" aria-label={format!("Filter {} join",index+1)} onchange={Callback::from({let filter=filter.clone();let patch=patch.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=filter.clone();next.or=input.value()=="or";patch.emit(next);}})}><option value="and" selected={!filter.or}>{"And"}</option><option value="or" selected={filter.or}>{"Or"}</option></select>}<select aria-label={format!("Filter {} field",index+1)} onchange={Callback::from({let filter=filter.clone();let patch=patch.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=filter.clone();next.field=input.value();next.op="contains".into();next.value=serde_json::json!("");patch.emit(next);}})}>{for fields.iter().map(|f|html!{<option value={f.name.clone()} selected={filter.field==f.name}>{f.display_label().to_string()}</option>})}</select>
                 <select aria-label={format!("Filter {} operator",index+1)} onchange={Callback::from({let filter=filter.clone();let patch=patch.clone();let kind=fields.iter().find(|f|f.name==filter.field).map(|f|f.kind);move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=filter.clone();next.op=input.value();if kind==Some(FieldType::Date)&&next.op!="contains"{if !next.value.as_str().is_some_and(vulse_model::is_date){next.value=serde_json::json!(today());}}else if ["gt","gte","lt","lte"].contains(&next.op.as_str())||kind==Some(FieldType::Number){next.value=serde_json::json!(0);}else if kind==Some(FieldType::Boolean){next.value=serde_json::json!(true);}patch.emit(next);}})}>{for [("contains","Contains"),("eq","Equals"),("neq","Does not equal"),("gt","Greater than"),("gte","At least"),("lt","Less than"),("lte","At most"),("empty","Is empty"),("not_empty","Is not empty")].into_iter().filter(|(op,_)|!["gt","gte","lt","lte"].contains(op)||fields.iter().find(|f|f.name==filter.field).is_some_and(|f|matches!(f.kind,FieldType::Number|FieldType::Calculated|FieldType::Date))).map(|(op,label)|html!{<option value={op} selected={filter.op==op}>{if date_field{date_label(op,label)}else{label}}</option>})}</select>
                 if !["empty","not_empty"].contains(&filter.op.as_str()){if boolean {<select aria-label={format!("Filter {} value",index+1)} onchange={Callback::from({let filter=filter.clone();let patch=patch.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=filter.clone();next.value=serde_json::json!(input.value()=="true");patch.emit(next);}})}><option value="true" selected={filter.value==true}>{"True"}</option><option value="false" selected={filter.value==false}>{"False"}</option></select>}else{<input aria-label={format!("Filter {} value",index+1)} type={if date{"date"}else if numeric&&filter.op!="contains"{"number"}else{"text"}} step="any" value={display_value(&filter.value)} oninput={Callback::from({let filter=filter.clone();let patch=patch.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=filter.clone();next.value=if numeric&&next.op!="contains"{serde_json::from_str(&input.value()).unwrap_or(serde_json::Value::String(input.value()))}else{serde_json::Value::String(input.value())};patch.emit(next);}})}/>}}
-                <button type="button" class="secondary" aria-label={format!("Remove filter {}",index+1)} onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();next.filters.remove(index);change.emit(next);}})}>{"Remove"}</button></div>}
-        })}<div class="row"><button type="button" class="secondary" disabled={fields.is_empty()||query.filters.len()>=20} onclick={Callback::from({let fields=fields.clone();let query=(*query).clone();let change=change.clone();move |_|{if let Some(field)=fields.first(){let mut next=query.clone();next.filters.push(RecordFilter{field:field.name.clone(),op:"contains".into(),value:serde_json::json!("")});change.emit(next);}}})}>{"+ Add filter"}</button></div></div>}
+                <button type="button" class="secondary" aria-label={format!("Remove filter {}",index+1)} onclick={Callback::from({let query=(*query).clone();let change=change.clone();move |_|{let mut next=query.clone();vulse_model::remove_filter(&mut next.filters,index);change.emit(next);}})}>{"Remove"}</button></div>}
+        })}<div class="row"><button type="button" class="secondary" disabled={fields.is_empty()||query.filters.len()>=20} onclick={Callback::from({let fields=fields.clone();let query=(*query).clone();let change=change.clone();move |_|{if let Some(field)=fields.first(){let mut next=query.clone();next.filters.push(RecordFilter{field:field.name.clone(),op:"contains".into(),value:serde_json::json!(""),or:false});change.emit(next);}}})}>{"+ Add filter"}</button></div></div>}
             if open=="sort" {<div class="records-controls">
         <label>{"Sort by"}<select aria-label="Sort by" onchange={Callback::from({let query=(*query).clone();let change=change.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=query.clone();next.sort_field=input.value();change.emit(next);}})}>{for [("created_at","Created"),("updated_at","Updated"),("id","Record ID")].into_iter().map(|(key,label)|html!{<option value={key} selected={query.sort_field==key}>{label}</option>})}{for fields.iter().map(|f|html!{<option value={f.name.clone()} selected={query.sort_field==f.name}>{f.display_label().to_string()}</option>})}</select></label>
         <label>{"Order"}<select aria-label="Sort order" onchange={Callback::from({let query=(*query).clone();let change=change.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=query.clone();next.descending=input.value()=="desc";change.emit(next);}})}><option value="asc" selected={!query.descending}>{"Ascending"}</option><option value="desc" selected={query.descending}>{"Descending"}</option></select></label>
@@ -578,6 +587,34 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         <div class="table-footer"><span class="muted">{format!("{} records · Page {} of {}",page.total,current+1,pages)}</span><div class="row"><label class="page-size">{"Rows"}<select aria-label="Rows per page" onchange={Callback::from({let query=(*query).clone();let change=change.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=query.clone();next.limit=input.value().parse().unwrap_or(25);change.emit(next);}})}>{for [25,50,100].into_iter().map(|size|html!{<option value={size.to_string()} selected={query.limit==size}>{size}</option>})}</select></label><button type="button" class="secondary" disabled={query.offset==0||*loading} onclick={Callback::from({let query=query.clone();move |_|{let mut next=(*query).clone();next.offset=next.offset.saturating_sub(next.limit);query.set(next);}})}>{"Previous"}</button><button type="button" class="secondary" disabled={current+1>=pages||*loading} onclick={Callback::from({let query=query.clone();move |_|{let mut next=(*query).clone();next.offset+=next.limit;query.set(next);}})}>{"Next"}</button></div></div>
         </>}
     </section>}
+}
+
+/// Shows each dropdown's `selected` option, whatever was picked in it before.
+fn sync_selects(root: &NodeRef) {
+    use wasm_bindgen::JsCast;
+    let Some(selects) = root
+        .cast::<web_sys::Element>()
+        .and_then(|root| root.query_selector_all("select").ok())
+    else {
+        return;
+    };
+    for index in 0..selects.length() {
+        let Some(select) = selects
+            .item(index)
+            .and_then(|node| node.dyn_into::<HtmlSelectElement>().ok())
+        else {
+            continue;
+        };
+        if let Some(value) = select
+            .query_selector("option[selected]")
+            .ok()
+            .flatten()
+            .and_then(|option| option.get_attribute("value"))
+            && select.value() != value
+        {
+            select.set_value(&value);
+        }
+    }
 }
 
 /// Today's date in the browser's time zone, as `YYYY-MM-DD`.

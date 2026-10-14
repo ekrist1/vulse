@@ -125,6 +125,8 @@ pub(crate) fn query_sql(
             "(lower(r.id) LIKE {p} ESCAPE '\\' OR r.search LIKE {p} ESCAPE '\\')"
         ));
     }
+    // Filters joined by OR share a group; the groups are joined by AND.
+    let mut groups: Vec<Vec<String>> = vec![];
     for filter in &query.filters {
         let is_date = blueprint
             .fields
@@ -168,12 +170,20 @@ pub(crate) fn query_sql(
         };
         // Records without a value match neither a condition nor its opposite,
         // so negations count a missing value as not matching.
-        conditions.push(if matches!(filter.op.as_str(), "empty" | "neq") {
+        let condition = if matches!(filter.op.as_str(), "empty" | "neq") {
             format!("NOT COALESCE(({predicate}),0)")
         } else {
             format!("({predicate})")
-        });
+        };
+        match groups.last_mut() {
+            Some(group) if filter.or => group.push(condition),
+            _ => groups.push(vec![condition]),
+        }
     }
+    conditions.extend(groups.into_iter().map(|group| match group.as_slice() {
+        [single] => single.clone(),
+        _ => format!("({})", group.join(" OR ")),
+    }));
     if conditions.is_empty() {
         conditions.push("1".into());
     }

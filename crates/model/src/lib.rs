@@ -1,7 +1,7 @@
 mod blueprint;
 mod query;
 pub use query::{
-    RecordFilter, RecordPage, RecordQuery, SavedView, SavedViewWrite, display_value,
+    RecordFilter, RecordPage, RecordQuery, SavedView, SavedViewWrite, display_value, remove_filter,
     validate_query, validate_view,
 };
 mod formula;

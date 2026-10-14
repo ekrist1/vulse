@@ -311,6 +311,7 @@ fn drill_filters(fields: &[FieldDef], spec: &SummarySpec, row: &SummaryRow) -> V
             field: group.field.clone(),
             op: op.into(),
             value,
+            or: false,
         };
         match (group.bucket, value) {
             (_, Value::Null) => filters.push(filter("empty", Value::String(String::new()))),

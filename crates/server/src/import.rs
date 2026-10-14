@@ -196,7 +196,7 @@ pub async fn import_file(
                     if cell.trim().is_empty() {
                         continue;
                     }
-                    match convert(f.kind, &decimal_comma(f.kind, cell)) {
+                    match decimal_comma(f.kind, cell).and_then(|c| convert(f.kind, &c)) {
                         Ok(v) => {
                             obj.insert(target.clone(), v);
                         }
@@ -376,13 +376,30 @@ fn validate_mapping(
     Ok(())
 }
 /// Decimal-comma locales write 33,47 in files; a lone comma without a point
-/// in a number cell is read as the decimal mark.
-fn decimal_comma(kind: FieldType, cell: &str) -> std::borrow::Cow<'_, str> {
-    if kind == FieldType::Number && cell.matches(',').count() == 1 && !cell.contains('.') {
-        cell.replace(',', ".").into()
-    } else {
-        cell.into()
+/// in a number cell is read as the decimal mark. `1,234` could also be an
+/// English thousands separator, so that shape is refused rather than guessed.
+fn decimal_comma(kind: FieldType, cell: &str) -> Result<std::borrow::Cow<'_, str>, String> {
+    if kind != FieldType::Number || cell.matches(',').count() != 1 || cell.contains('.') {
+        return Ok(cell.into());
     }
+    let trimmed = cell.trim();
+    let unsigned = trimmed.trim_start_matches(['-', '+']);
+    if let Some((whole, fraction)) = unsigned.split_once(',') {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if digits(whole)
+            && whole.len() <= 3
+            && whole != "0"
+            && fraction.len() == 3
+            && digits(fraction)
+        {
+            return Err(format!(
+                "'{trimmed}' is ambiguous: it could be {} or {}. Write it without the thousands comma, or with a point as the decimal mark",
+                trimmed.replace(',', ""),
+                trimmed.replace(',', ".")
+            ));
+        }
+    }
+    Ok(cell.replace(',', ".").into())
 }
 pub(crate) fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
     match kind {
@@ -682,6 +699,11 @@ mod tests {
         assert_eq!(second.headers, vec!["title"]);
         assert_eq!(second.rows[0][0], "Hello");
         assert!(parse_file("data.xlsx", &bytes, "Missing", true).is_err());
+        // Without a header row, row 1 is data and keeps its spreadsheet row number.
+        let headerless = parse_file("data.xlsx", &bytes, "Second", false).unwrap();
+        assert_eq!(headerless.headers, vec!["Column 1"]);
+        assert_eq!(headerless.rows, vec![vec!["title"], vec!["Hello"]]);
+        assert_eq!(headerless.first_row, 1);
         let error = workbook(r#"<c r="A2" t="e"><v>#DIV/0!</v></c>"#);
         assert!(
             parse_file("data.xlsx", &error, "", true)
@@ -728,14 +750,22 @@ mod tests {
     }
     #[test]
     fn numbers_accept_a_decimal_comma() {
-        let number = |cell| convert(FieldType::Number, &decimal_comma(FieldType::Number, cell));
+        let number = |cell| {
+            decimal_comma(FieldType::Number, cell).and_then(|c| convert(FieldType::Number, &c))
+        };
         assert_eq!(number("33,47").unwrap(), serde_json::json!(33.47));
         assert_eq!(number(" -0,5 ").unwrap(), serde_json::json!(-0.5));
+        assert_eq!(number("0,125").unwrap(), serde_json::json!(0.125));
+        assert_eq!(number("1234,567").unwrap(), serde_json::json!(1234.567));
         assert_eq!(number("12.5").unwrap(), serde_json::json!(12.5));
-        for bad in ["1,234.5", "1,2,3", ",5", "abc"] {
+        for bad in [
+            "1,234.5", "1,2,3", ",5", "abc", "1,234", "-12,500", "999,000",
+        ] {
             assert!(number(bad).is_err(), "{bad}");
         }
-        assert_eq!(decimal_comma(FieldType::String, "3,5"), "3,5");
+        assert!(number("1,234").unwrap_err().contains("1234 or 1.234"));
+        assert_eq!(decimal_comma(FieldType::String, "3,5").unwrap(), "3,5");
+        assert_eq!(decimal_comma(FieldType::String, "1,234").unwrap(), "1,234");
     }
     #[test]
     fn spreadsheet_and_text_dates_convert_to_iso_dates() {

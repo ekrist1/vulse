@@ -1212,12 +1212,29 @@ async fn import_csv(
     commit: bool,
     mapping: Option<Value>,
 ) -> axum::response::Response {
+    import_csv_with(app, cookie, id, csv, commit, mapping, &[]).await
+}
+
+async fn import_csv_with(
+    app: &TestApp,
+    cookie: Option<&str>,
+    id: &str,
+    csv: &str,
+    commit: bool,
+    mapping: Option<Value>,
+    options: &[(&str, &str)],
+) -> axum::response::Response {
     let mut body = format!(
         "--vulse-import\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--vulse-import\r\nContent-Disposition: form-data; name=\"commit\"\r\n\r\n{commit}\r\n"
     );
     if let Some(m) = mapping {
         body.push_str(&format!(
             "--vulse-import\r\nContent-Disposition: form-data; name=\"mapping\"\r\n\r\n{m}\r\n"
+        ));
+    }
+    for (name, value) in options {
+        body.push_str(&format!(
+            "--vulse-import\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
         ));
     }
     body.push_str("--vulse-import--\r\n");
@@ -1233,6 +1250,85 @@ async fn import_csv(
         .oneshot(builder.body(Body::from(body)).unwrap())
         .await
         .unwrap()
+}
+#[tokio::test]
+async fn imports_files_without_a_header_row() {
+    use vulse_model::ImportResult;
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "headerless@example.com", "headerless").await;
+    let c = create_collection(
+        &app,
+        &cookie,
+        "parts",
+        "private",
+        json!({"fields":[{"name":"title","type":"string","required":true},{"name":"price","type":"number","required":true}]}),
+    )
+    .await;
+    let mapping = || Some(json!(["title", "price"]));
+    let no_headers = [("has_headers", "false")];
+    // The first line is data, so a bad value on line 2 is reported as row 2.
+    let (status, preview) = json_of::<ImportResult>(
+        import_csv_with(
+            &app,
+            Some(&cookie),
+            &c.id,
+            "Alpha,4\nBeta,NaN\n",
+            false,
+            mapping(),
+            &no_headers,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview.headers, vec!["Column 1", "Column 2"]);
+    assert_eq!(preview.row_count, 2);
+    assert_eq!(preview.errors.len(), 1);
+    assert_eq!(preview.errors[0].row, 2);
+    assert_eq!(preview.errors[0].field.as_deref(), Some("price"));
+    let (_, done) = json_of::<ImportResult>(
+        import_csv_with(
+            &app,
+            Some(&cookie),
+            &c.id,
+            "Alpha,4\nBeta,5\n",
+            true,
+            mapping(),
+            &no_headers,
+        )
+        .await,
+    )
+    .await;
+    assert!(done.errors.is_empty());
+    assert_eq!(done.imported, 2);
+    let (_, page) = json_of::<Page<DocumentView>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/documents", c.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let mut titles: Vec<_> = page.items.iter().map(|d| d.body["title"].clone()).collect();
+    titles.sort_by_key(|t| t.to_string());
+    assert_eq!(titles, vec![json!("Alpha"), json!("Beta")]);
+    assert_eq!(
+        import_csv_with(
+            &app,
+            Some(&cookie),
+            &c.id,
+            "Gamma,1\n",
+            false,
+            mapping(),
+            &[("has_headers", "no")]
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 #[tokio::test]
 async fn imports_preview_validate_authorize_and_commit_atomically() {

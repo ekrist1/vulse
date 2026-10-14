@@ -3818,7 +3818,10 @@ async fn formulas_read_columns_of_other_collections() {
             let response = app.call(method, &path, Some(&cookie), None, body).await;
             let status = response.status();
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
         }
     };
     let post_collection = |blueprint: Value| {
@@ -3833,7 +3836,9 @@ async fn formulas_read_columns_of_other_collections() {
         ("=SUM([nowhere.amount])", "unknown collection"),
         ("=SUM([basil.missing])", "has no field"),
     ] {
-        let (status, body) = post_collection(json!({"fields":[{"name":"x","type":"calculated","formula":formula}]})).await;
+        let (status, body) =
+            post_collection(json!({"fields":[{"name":"x","type":"calculated","formula":formula}]}))
+                .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains(message), "{body}");
     }
@@ -3857,14 +3862,48 @@ async fn formulas_read_columns_of_other_collections() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("reads other collections itself"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("reads other collections itself"),
+        "{body}"
+    );
 
-    let first = create_document(&app, &cookie, &reports.id, json!({"ar":2022,"org_nr":"920143067","arsverk":3})).await;
-    create_document(&app, &cookie, &reports.id, json!({"ar":2023,"org_nr":"920143067","arsverk":3.55})).await;
-    create_document(&app, &cookie, &reports.id, json!({"ar":2023,"org_nr":"920062407","arsverk":27.55})).await;
-    let record = create_document(&app, &cookie, &pension.id, json!({"org_nr":"920143067","ar":2024})).await;
+    let first = create_document(
+        &app,
+        &cookie,
+        &reports.id,
+        json!({"ar":2022,"org_nr":"920143067","arsverk":3}),
+    )
+    .await;
+    create_document(
+        &app,
+        &cookie,
+        &reports.id,
+        json!({"ar":2023,"org_nr":"920143067","arsverk":3.55}),
+    )
+    .await;
+    create_document(
+        &app,
+        &cookie,
+        &reports.id,
+        json!({"ar":2023,"org_nr":"920062407","arsverk":27.55}),
+    )
+    .await;
+    let record = create_document(
+        &app,
+        &cookie,
+        &pension.id,
+        json!({"org_nr":"920143067","ar":2024}),
+    )
+    .await;
     let expected = 3.0 * 7.0 / 12.0 + 3.55 * 5.0 / 12.0;
-    assert!((record.body["weighted"].as_f64().unwrap() - expected).abs() < 1e-9, "{:?}", record);
+    assert!(
+        (record.body["weighted"].as_f64().unwrap() - expected).abs() < 1e-9,
+        "{:?}",
+        record
+    );
     assert_eq!(record.body["doubled"].as_f64(), Some(13.1));
 
     // Reads see changes to the other collection right away.
@@ -3875,10 +3914,19 @@ async fn formulas_read_columns_of_other_collections() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let read = |id: String| send("GET", format!("/api/v1/collections/{}/documents/{id}", pension.id), None);
+    let read = |id: String| {
+        send(
+            "GET",
+            format!("/api/v1/collections/{}/documents/{id}", pension.id),
+            None,
+        )
+    };
     let (_, body) = read(record.id.clone()).await;
     let expected = 6.0 * 7.0 / 12.0 + 3.55 * 5.0 / 12.0;
-    assert!((body["body"]["weighted"].as_f64().unwrap() - expected).abs() < 1e-9, "{body}");
+    assert!(
+        (body["body"]["weighted"].as_f64().unwrap() - expected).abs() < 1e-9,
+        "{body}"
+    );
 
     // Queries list the calculated values too, and saving filters on them.
     let (status, page) = send(
@@ -3899,10 +3947,19 @@ async fn formulas_read_columns_of_other_collections() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, body) = send("GET", format!("/api/v1/collections/{}", pension.id), None).await;
-    let formula = body["blueprint"]["fields"][2]["formula"].as_str().unwrap().to_string();
-    assert!(formula.contains("[basil-arsmelding.fte]") && !formula.contains("[basil."), "{formula}");
+    let formula = body["blueprint"]["fields"][2]["formula"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        formula.contains("[basil-arsmelding.fte]") && !formula.contains("[basil."),
+        "{formula}"
+    );
     let (_, body) = read(record.id.clone()).await;
-    assert!((body["body"]["weighted"].as_f64().unwrap() - expected).abs() < 1e-9, "{body}");
+    assert!(
+        (body["body"]["weighted"].as_f64().unwrap() - expected).abs() < 1e-9,
+        "{body}"
+    );
 
     // Fields and collections that formulas read cannot disappear.
     let (status, body) = send(
@@ -3912,8 +3969,16 @@ async fn formulas_read_columns_of_other_collections() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("pensjon.weighted"), "{body}");
-    let (status, _) = send("DELETE", format!("/api/v1/collections/{}", reports.id), None).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("pensjon.weighted"),
+        "{body}"
+    );
+    let (status, _) = send(
+        "DELETE",
+        format!("/api/v1/collections/{}", reports.id),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
     // Nor may a field that is read start reading other collections itself.
     let (status, body) = send(
@@ -4000,7 +4065,13 @@ async fn views_hear_about_changes_to_their_collection_and_what_it_shows() {
     assert!(next_event().await.contains(&view.id));
     // Signed-out requests are refused like any read.
     let response = app
-        .call("GET", &format!("/api/v1/collections/{}/events", view.id), None, None, None)
+        .call(
+            "GET",
+            &format!("/api/v1/collections/{}/events", view.id),
+            None,
+            None,
+            None,
+        )
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
@@ -4017,14 +4088,27 @@ async fn sql_statements_preview_confirm_and_use_the_record_path() {
         json!({"fields":[{"name":"aar","type":"number"},{"name":"navn","type":"string","required":true},{"name":"kommune","type":"string"},{"name":"fte","type":"number"},{"name":"double","type":"calculated","formula":"=[fte]*2"}]}),
     )
     .await;
-    for (aar, navn, kommune, fte) in [(2018, "A", "Oslo", 2.0), (2019, "B", "Oslo", 3.0), (2023, "C", "Bergen", 4.0), (2024, "D", "Oslo", 5.5)] {
-        create_document(&app, &cookie, &reports.id, json!({"aar":aar,"navn":navn,"kommune":kommune,"fte":fte})).await;
+    for (aar, navn, kommune, fte) in [
+        (2018, "A", "Oslo", 2.0),
+        (2019, "B", "Oslo", 3.0),
+        (2023, "C", "Bergen", 4.0),
+        (2024, "D", "Oslo", 5.5),
+    ] {
+        create_document(
+            &app,
+            &cookie,
+            &reports.id,
+            json!({"aar":aar,"navn":navn,"kommune":kommune,"fte":fte}),
+        )
+        .await;
     }
     let sql = |who: &str, body: Value| {
         let app = &app;
         let who = who.to_string();
         async move {
-            let response = app.call("POST", "/api/v1/sql", Some(&who), None, Some(body)).await;
+            let response = app
+                .call("POST", "/api/v1/sql", Some(&who), None, Some(body))
+                .await;
             let status = response.status();
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
             (status, serde_json::from_slice::<Value>(&bytes).unwrap())
@@ -4038,9 +4122,21 @@ async fn sql_statements_preview_confirm_and_use_the_record_path() {
     // Unknown names and syntax errors explain themselves.
     let (status, body) = sql(&cookie, json!({"sql":"SELECT year FROM aarsmelding"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("no field 'year'. Its fields are: aar, navn"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("no field 'year'. Its fields are: aar, navn"),
+        "{body}"
+    );
     let (_, body) = sql(&cookie, json!({"sql":"DELETE aarsmelding"})).await;
-    assert!(body["error"].as_str().unwrap().contains("expected FROM (at character 8)"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("expected FROM (at character 8)"),
+        "{body}"
+    );
 
     // DELETE previews first and changes nothing.
     let delete = "DELETE FROM aarsmelding WHERE aar < 2020";
@@ -4064,35 +4160,76 @@ async fn sql_statements_preview_confirm_and_use_the_record_path() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (_, preview) = sql(&cookie, json!({"sql":delete})).await;
     assert_eq!(preview["affected"], json!(3));
-    let (status, done) = sql(&cookie, json!({"sql":delete,"confirm":preview["confirmation"]})).await;
+    let (status, done) = sql(
+        &cookie,
+        json!({"sql":delete,"confirm":preview["confirmation"]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{done}");
     assert_eq!(done["done"], json!(true));
     assert_eq!(done["affected"], json!(3));
     // Deleted records are in the Trash.
     let response = app
-        .call("GET", &format!("/api/v1/collections/{}/deleted", reports.id), Some(&cookie), None, None)
+        .call(
+            "GET",
+            &format!("/api/v1/collections/{}/deleted", reports.id),
+            Some(&cookie),
+            None,
+            None,
+        )
         .await;
     let (_, trash) = json_of::<Value>(response).await;
     assert_eq!(trash["items"].as_array().unwrap().len(), 3, "{trash}");
 
     // UPDATE validates every record and records history.
-    let (_, preview) = sql(&cookie, json!({"sql":"UPDATE aarsmelding SET navn = NULL WHERE kommune = 'Oslo'"})).await;
+    let (_, preview) = sql(
+        &cookie,
+        json!({"sql":"UPDATE aarsmelding SET navn = NULL WHERE kommune = 'Oslo'"}),
+    )
+    .await;
     assert_eq!(preview["confirmation"], Value::Null);
-    assert!(preview["problems"][0].as_str().unwrap().contains("navn"), "{preview}");
+    assert!(
+        preview["problems"][0].as_str().unwrap().contains("navn"),
+        "{preview}"
+    );
     let update = "UPDATE aarsmelding SET fte = fte * 2, kommune = UPPER(kommune) WHERE aar >= 2023 AND kommune LIKE 'b%'";
     let (_, preview) = sql(&cookie, json!({"sql":update})).await;
     assert_eq!(preview["affected"], json!(1));
-    assert_eq!(preview["changes"][0]["before"], json!({"fte":4.0,"kommune":"Bergen"}));
-    assert_eq!(preview["changes"][0]["after"], json!({"fte":8,"kommune":"BERGEN"}));
-    let (status, _) = sql(&cookie, json!({"sql":update,"confirm":preview["confirmation"]})).await;
+    assert_eq!(
+        preview["changes"][0]["before"],
+        json!({"fte":4.0,"kommune":"Bergen"})
+    );
+    assert_eq!(
+        preview["changes"][0]["after"],
+        json!({"fte":8,"kommune":"BERGEN"})
+    );
+    let (status, _) = sql(
+        &cookie,
+        json!({"sql":update,"confirm":preview["confirmation"]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let (_, rows) = sql(&cookie, json!({"sql":"SELECT navn, fte, double, kommune FROM aarsmelding ORDER BY aar"})).await;
-    assert_eq!(rows["rows"], json!([["C", 8, 16, "BERGEN"], ["D", 5.5, 11, "Oslo"]]));
+    let (_, rows) = sql(
+        &cookie,
+        json!({"sql":"SELECT navn, fte, double, kommune FROM aarsmelding ORDER BY aar"}),
+    )
+    .await;
+    assert_eq!(
+        rows["rows"],
+        json!([["C", 8, 16, "BERGEN"], ["D", 5.5, 11, "Oslo"]])
+    );
     // Running it again changes nothing, so there is nothing to confirm.
-    let (_, preview) = sql(&cookie, json!({"sql":"UPDATE aarsmelding SET kommune = 'BERGEN' WHERE navn = 'C'"})).await;
+    let (_, preview) = sql(
+        &cookie,
+        json!({"sql":"UPDATE aarsmelding SET kommune = 'BERGEN' WHERE navn = 'C'"}),
+    )
+    .await;
     assert_eq!(preview["affected"], json!(0));
     assert_eq!(preview["confirmation"], Value::Null);
     let (status, body) = sql(&cookie, json!({"sql":"UPDATE aarsmelding SET double = 1"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("calculated"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("calculated"),
+        "{body}"
+    );
 }

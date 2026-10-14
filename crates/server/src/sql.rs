@@ -147,11 +147,7 @@ async fn target(
 
 /// Every record, with calculated values, as SQL rows.
 async fn records(conn: &Conn, collection: &CollectionView) -> Result<Vec<SqlRow>, AppError> {
-    Ok(documents(conn, collection)
-        .await?
-        .iter()
-        .map(row)
-        .collect())
+    Ok(documents(conn, collection).await?.iter().map(row).collect())
 }
 
 async fn documents(

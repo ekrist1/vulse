@@ -413,14 +413,39 @@ fn excel_datetime(dt: &calamine::ExcelDateTime) -> String {
         format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}")
     }
 }
+/// Picks `,`, `;` or tab by counting each outside quotes on the header line,
+/// since spreadsheets in decimal-comma locales export semicolon-separated CSV.
+fn csv_delimiter(text: &str) -> u8 {
+    let mut counts = [(b',', 0), (b';', 0), (b'\t', 0)];
+    let mut quoted = false;
+    for byte in text.bytes() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'\n' | b'\r' if !quoted => break,
+            _ if !quoted => {
+                if let Some(entry) = counts.iter_mut().find(|(d, _)| *d == byte) {
+                    entry.1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .filter(|(_, n)| *n > 0)
+        .map_or(b',', |(d, _)| *d)
+}
 fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
     if bytes.len() > MAX_BYTES {
         return Err("File exceeds 50 MB".into());
     }
     if name.to_ascii_lowercase().ends_with(".csv") {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-        std::str::from_utf8(bytes).map_err(|_| "CSV must use UTF-8 encoding")?;
-        let mut reader = csv::ReaderBuilder::new().from_reader(bytes);
+        let text = std::str::from_utf8(bytes).map_err(|_| "CSV must use UTF-8 encoding")?;
+        let mut reader = csv::ReaderBuilder::new()
+            .delimiter(csv_delimiter(text))
+            .from_reader(bytes);
         let headers = reader
             .headers()
             .map_err(|e| e.to_string())?
@@ -697,8 +722,21 @@ mod tests {
         let csv = parse_file("data.csv", b"\xef\xbb\xbftitle,price\n\"a,b\",12\n", "").unwrap();
         assert_eq!(csv.headers[0], "title");
         assert_eq!(csv.rows[0][0], "a,b");
+        let csv = "year;name;share;kind;a;b\n2023;Byfjordparken;27,55;Ordinaer;;\n2023;Småbergan;8;Ordinaer;;\n";
+        let csv = parse_file("data.csv", csv.as_bytes(), "").unwrap();
+        assert_eq!(csv.headers.len(), 6);
+        assert_eq!(csv.rows[0][2], "27,55");
+        assert_eq!(csv.rows[1][2], "8");
+        assert_eq!(csv_delimiter("\"a;b\",c\n1,2"), b',');
+        assert_eq!(csv_delimiter("a\tb\n"), b'\t');
         let most = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS);
-        assert_eq!(parse_file("data.csv", most.as_bytes(), "").unwrap().rows.len(), MAX_ROWS);
+        assert_eq!(
+            parse_file("data.csv", most.as_bytes(), "")
+                .unwrap()
+                .rows
+                .len(),
+            MAX_ROWS
+        );
         let huge = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS + 1);
         assert!(parse_file("data.csv", huge.as_bytes(), "").is_err());
     }

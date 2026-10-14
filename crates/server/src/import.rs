@@ -196,7 +196,7 @@ pub async fn import_file(
                     if cell.trim().is_empty() {
                         continue;
                     }
-                    match convert(f.kind, cell) {
+                    match convert(f.kind, &decimal_comma(f.kind, cell)) {
                         Ok(v) => {
                             obj.insert(target.clone(), v);
                         }
@@ -374,6 +374,15 @@ fn validate_mapping(
         }
     }
     Ok(())
+}
+/// Decimal-comma locales write 33,47 in files; a lone comma without a point
+/// in a number cell is read as the decimal mark.
+fn decimal_comma(kind: FieldType, cell: &str) -> std::borrow::Cow<'_, str> {
+    if kind == FieldType::Number && cell.matches(',').count() == 1 && !cell.contains('.') {
+        cell.replace(',', ".").into()
+    } else {
+        cell.into()
+    }
 }
 pub(crate) fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
     match kind {
@@ -716,6 +725,17 @@ mod tests {
             zip.write_all(data.as_bytes()).unwrap();
         }
         zip.finish().unwrap().into_inner()
+    }
+    #[test]
+    fn numbers_accept_a_decimal_comma() {
+        let number = |cell| convert(FieldType::Number, &decimal_comma(FieldType::Number, cell));
+        assert_eq!(number("33,47").unwrap(), serde_json::json!(33.47));
+        assert_eq!(number(" -0,5 ").unwrap(), serde_json::json!(-0.5));
+        assert_eq!(number("12.5").unwrap(), serde_json::json!(12.5));
+        for bad in ["1,234.5", "1,2,3", ",5", "abc"] {
+            assert!(number(bad).is_err(), "{bad}");
+        }
+        assert_eq!(decimal_comma(FieldType::String, "3,5"), "3,5");
     }
     #[test]
     fn spreadsheet_and_text_dates_convert_to_iso_dates() {

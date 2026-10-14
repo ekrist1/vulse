@@ -44,6 +44,7 @@ pub async fn import_file(
     let mut commit = false;
     let mut mode = String::from("append");
     let mut match_field = String::new();
+    let mut has_headers = true;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -101,6 +102,16 @@ pub async fn import_file(
                 }
                 commit = value == "true";
             }
+            "has_headers" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad(e.to_string()))?;
+                if value != "true" && value != "false" {
+                    return Err(AppError::bad("has_headers must be true or false"));
+                }
+                has_headers = value == "true";
+            }
             _ => return Err(AppError::bad("unknown import option")),
         }
     }
@@ -108,7 +119,7 @@ pub async fn import_file(
         return Err(AppError::bad("mode must be append or upsert"));
     }
     let (name, bytes) = file.ok_or_else(|| AppError::bad("missing file"))?;
-    let table = tokio::task::spawn_blocking(move || parse_file(&name, &bytes, &sheet))
+    let table = tokio::task::spawn_blocking(move || parse_file(&name, &bytes, &sheet, has_headers))
         .await
         .map_err(|e| anyhow::anyhow!(e))?
         .map_err(AppError::bad)?;
@@ -436,7 +447,7 @@ fn csv_delimiter(text: &str) -> u8 {
         .filter(|(_, n)| *n > 0)
         .map_or(b',', |(d, _)| *d)
 }
-fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
+fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Result<Table, String> {
     if bytes.len() > MAX_BYTES {
         return Err("File exceeds 50 MB".into());
     }
@@ -445,28 +456,39 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "CSV must use UTF-8 encoding")?;
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(csv_delimiter(text))
+            .has_headers(false)
             .from_reader(bytes);
-        let headers = reader
-            .headers()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        validate_headers(&headers)?;
+        let mut records = reader.records();
+        let headers = if has_headers {
+            let first = records.next().ok_or("CSV file is empty")?;
+            first
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(str::to_owned)
+                .collect()
+        } else {
+            vec![]
+        };
         let mut rows = vec![];
-        for row in reader.records() {
+        for row in records {
             let row = row.map_err(|e| e.to_string())?;
             if rows.len() >= MAX_ROWS {
                 return Err("Maximum 50,000 data rows per import".into());
             }
-            rows.push(row.iter().map(str::to_owned).collect());
+            rows.push(row.iter().map(str::to_owned).collect::<Vec<_>>());
         }
+        let headers = if has_headers {
+            headers
+        } else {
+            numbered_headers(rows.first().map_or(0, Vec::len))
+        };
+        validate_headers(&headers)?;
         return Ok(Table {
             headers,
             rows,
             sheets: vec![],
             sheet: String::new(),
-            first_row: 2,
+            first_row: if has_headers { 2 } else { 1 },
         });
     }
     if !name.to_ascii_lowercase().ends_with(".xlsx") {
@@ -489,17 +511,21 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
         return Err("Unknown worksheet".into());
     }
     let range = book.worksheet_range(&selected).map_err(|e| e.to_string())?;
-    if range.height() > MAX_ROWS + 1 || range.width() > MAX_COLUMNS {
+    let header_rows = usize::from(has_headers);
+    if range.height() > MAX_ROWS + header_rows || range.width() > MAX_COLUMNS {
         return Err("Maximum 50,000 rows and 200 columns per worksheet".into());
     }
-    let first_row = range.start().map(|(row, _)| row as usize + 2).unwrap_or(2);
+    let first_row = range.start().map_or(1, |(row, _)| row as usize + 1) + header_rows;
     let mut rows = range.rows();
-    let headers = rows
-        .next()
-        .ok_or("Worksheet is empty")?
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    let headers = if has_headers {
+        rows.next()
+            .ok_or("Worksheet is empty")?
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        numbered_headers(range.width())
+    };
     validate_headers(&headers)?;
     let rows = rows
         .enumerate()
@@ -523,6 +549,10 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str) -> Result<Table, String> {
         sheet: selected,
         first_row,
     })
+}
+/// Names columns of a file without a header row.
+fn numbered_headers(count: usize) -> Vec<String> {
+    (1..=count).map(|i| format!("Column {i}")).collect()
 }
 fn validate_headers(headers: &[String]) -> Result<(), String> {
     if headers.is_empty() || headers.len() > MAX_COLUMNS {
@@ -636,16 +666,16 @@ mod tests {
     #[test]
     fn parses_xlsx_worksheets_and_cached_formula_values() {
         let bytes = workbook(r#"<c r="A2"><f>10+2</f><v>12</v></c>"#);
-        let first = parse_file("data.xlsx", &bytes, "").unwrap();
+        let first = parse_file("data.xlsx", &bytes, "", true).unwrap();
         assert_eq!(first.sheets, vec!["First", "Second"]);
         assert_eq!(first.rows[0][0], "12");
-        let second = parse_file("data.xlsx", &bytes, "Second").unwrap();
+        let second = parse_file("data.xlsx", &bytes, "Second", true).unwrap();
         assert_eq!(second.headers, vec!["title"]);
         assert_eq!(second.rows[0][0], "Hello");
-        assert!(parse_file("data.xlsx", &bytes, "Missing").is_err());
+        assert!(parse_file("data.xlsx", &bytes, "Missing", true).is_err());
         let error = workbook(r#"<c r="A2" t="e"><v>#DIV/0!</v></c>"#);
         assert!(
-            parse_file("data.xlsx", &error, "")
+            parse_file("data.xlsx", &error, "", true)
                 .unwrap_err()
                 .contains("Row 2")
         );
@@ -689,7 +719,7 @@ mod tests {
     }
     #[test]
     fn spreadsheet_and_text_dates_convert_to_iso_dates() {
-        let table = parse_file("dates.xlsx", &dated_workbook(), "").unwrap();
+        let table = parse_file("dates.xlsx", &dated_workbook(), "", true).unwrap();
         assert_eq!(table.rows[0], vec!["2025-10-13", "2025-10-13T12:00:00"]);
         assert_eq!(
             convert(FieldType::Date, &table.rows[0][0]).unwrap(),
@@ -714,30 +744,43 @@ mod tests {
     #[test]
     fn rejects_sparse_workbooks_and_invalid_csv() {
         let bytes = workbook(r#"<c r="XFD1048576"><v>12</v></c>"#);
-        assert!(parse_file("data.xlsx", &bytes, "").is_err());
+        assert!(parse_file("data.xlsx", &bytes, "", true).is_err());
         for csv in ["a,a\n1,2\n", "a,b\n1\n", ",b\n1,2\n"] {
-            assert!(parse_file("data.csv", csv.as_bytes(), "").is_err());
+            assert!(parse_file("data.csv", csv.as_bytes(), "", true).is_err());
         }
-        assert!(parse_file("data.xlsx", b"not a workbook", "").is_err());
-        let csv = parse_file("data.csv", b"\xef\xbb\xbftitle,price\n\"a,b\",12\n", "").unwrap();
+        assert!(parse_file("data.xlsx", b"not a workbook", "", true).is_err());
+        let csv = parse_file(
+            "data.csv",
+            b"\xef\xbb\xbftitle,price\n\"a,b\",12\n",
+            "",
+            true,
+        )
+        .unwrap();
         assert_eq!(csv.headers[0], "title");
         assert_eq!(csv.rows[0][0], "a,b");
         let csv = "year;name;share;kind;a;b\n2023;Byfjordparken;27,55;Ordinaer;;\n2023;Småbergan;8;Ordinaer;;\n";
-        let csv = parse_file("data.csv", csv.as_bytes(), "").unwrap();
+        let csv = parse_file("data.csv", csv.as_bytes(), "", true).unwrap();
         assert_eq!(csv.headers.len(), 6);
         assert_eq!(csv.rows[0][2], "27,55");
         assert_eq!(csv.rows[1][2], "8");
         assert_eq!(csv_delimiter("\"a;b\",c\n1,2"), b',');
+        let csv = "2023;920143067;Åmot montessoribarnehage SA;Åmot kommune;Privat;3422;3,55;Ordinaer;;;\n2023;989009427;Småbergan barnehage ;Trondheim kommune;Privat;5001;8;Ordinaer;;;\n";
+        let csv = parse_file("data.csv", csv.as_bytes(), "", false).unwrap();
+        assert_eq!(csv.headers.len(), 11);
+        assert_eq!(csv.headers[0], "Column 1");
+        assert_eq!(csv.rows.len(), 2);
+        assert_eq!(csv.rows[0][6], "3,55");
+        assert_eq!(csv.first_row, 1);
         assert_eq!(csv_delimiter("a\tb\n"), b'\t');
         let most = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS);
         assert_eq!(
-            parse_file("data.csv", most.as_bytes(), "")
+            parse_file("data.csv", most.as_bytes(), "", true)
                 .unwrap()
                 .rows
                 .len(),
             MAX_ROWS
         );
         let huge = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS + 1);
-        assert!(parse_file("data.csv", huge.as_bytes(), "").is_err());
+        assert!(parse_file("data.csv", huge.as_bytes(), "", true).is_err());
     }
 }

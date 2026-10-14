@@ -264,16 +264,29 @@ async fn error_from(response: Response) -> String {
         })
 }
 
+/// The choices sent with an import file.
+pub struct ImportOptions<'a> {
+    pub mapping: Option<&'a [Option<String>]>,
+    pub sheet: &'a str,
+    pub commit: bool,
+    pub mode: &'a str,
+    pub match_field: &'a str,
+    pub has_headers: bool,
+}
+
 pub async fn import_file(
     id: &str,
     file: &File,
-    mapping: Option<&[Option<String>]>,
-    sheet: &str,
-    commit: bool,
-    mode: &str,
-    match_field: &str,
-    has_headers: bool,
+    options: ImportOptions<'_>,
 ) -> Result<vulse_model::ImportResult, String> {
+    let ImportOptions {
+        mapping,
+        sheet,
+        commit,
+        mode,
+        match_field,
+        has_headers,
+    } = options;
     let form = FormData::new().map_err(|e| format!("{e:?}"))?;
     form.append_with_blob_and_filename("file", file, &file.name())
         .map_err(|e| format!("{e:?}"))?;

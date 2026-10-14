@@ -10,14 +10,14 @@ use axum::extract::State;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use vulse_model::{
-    CollectionView, DocumentView, FieldType, MAX_SQL_CHANGES, MAX_SQL_SAMPLE, Role,
-    SQL_RECORD_COLUMNS, SqlChange, SqlRequest, SqlResult, SqlRow, SqlStatement, parse_sql,
-    record_title, run_select, sql_assignments, sql_matches,
+    Blueprint, CollectionView, DocumentView, FieldDef, FieldType, MAX_SQL_CHANGES, MAX_SQL_SAMPLE,
+    Role, SQL_RECORD_COLUMNS, SqlChange, SqlExpr, SqlRequest, SqlResult, SqlRow, SqlStatement,
+    parse_sql, record_title, run_select, sql_assignments, sql_matches,
 };
 
 use crate::auth::{AuthUser, Principal, require_collection, require_role};
 use crate::content::{check_body, materialize};
-use crate::db::{Conn, SqlValue};
+use crate::db::{Conn, SqlValue, opt_text_at, text_at};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::store;
@@ -41,7 +41,7 @@ pub async fn run_sql(
     let conn = state.db.connect().await?;
     let collection = target(&conn, &principal, &statement).await?;
     if let SqlStatement::Select(select) = &statement {
-        let records = records(&conn, &collection).await?;
+        let records = records(&conn, &collection, &statement).await?;
         let mut fields = vec!["id".to_string()];
         fields.extend(collection.blueprint.fields.iter().map(|f| f.name.clone()));
         let (columns, rows, total) =
@@ -145,19 +145,89 @@ async fn target(
     Ok(collection)
 }
 
-/// Every record, with calculated values, as SQL rows.
-async fn records(conn: &Conn, collection: &CollectionView) -> Result<Vec<SqlRow>, AppError> {
-    Ok(documents(conn, collection).await?.iter().map(row).collect())
+/// The records a `SELECT` may match, as SQL rows with the fields it reads.
+async fn records(
+    conn: &Conn,
+    collection: &CollectionView,
+    statement: &SqlStatement,
+) -> Result<Vec<SqlRow>, AppError> {
+    let blueprint = &collection.blueprint;
+    let read: Vec<&FieldDef> = match statement {
+        SqlStatement::Select(select) if select.columns.is_empty() => {
+            blueprint.fields.iter().collect()
+        }
+        _ => {
+            let names = statement.fields();
+            blueprint
+                .fields
+                .iter()
+                .filter(|f| names.contains(&f.name))
+                .collect()
+        }
+    };
+    // Values read from other collections are only current when calculated
+    // now, so those statements read the record bodies.
+    if read
+        .iter()
+        .any(|f| crate::lookups::reads_collections(blueprint, &f.name))
+    {
+        return Ok(documents(conn, collection, statement)
+            .await?
+            .iter()
+            .map(row)
+            .collect());
+    }
+    let (condition, params) = narrowing(blueprint, statement.filter());
+    let mut columns = vec![
+        "r.id".to_string(),
+        "r.created_at".into(),
+        "r.updated_at".into(),
+    ];
+    columns.extend(
+        read.iter()
+            .map(|f| format!("r.{}", crate::rows::column(&f.name, 'r'))),
+    );
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT {} FROM {} r WHERE {condition} ORDER BY r.created_at, r.id",
+                columns.join(", "),
+                crate::rows::table(&collection.id)
+            ),
+            &params,
+        )
+        .await?;
+    rows.iter()
+        .map(|values| {
+            let mut out = SqlRow::new();
+            for (index, name) in SQL_RECORD_COLUMNS.iter().enumerate() {
+                out.insert(name.to_string(), Value::String(text_at(values, index)?));
+            }
+            for (offset, field) in read.iter().enumerate() {
+                if let Some(raw) = opt_text_at(values, 3 + offset)? {
+                    out.insert(field.name.clone(), serde_json::from_str(&raw)?);
+                }
+            }
+            Ok(out)
+        })
+        .collect::<anyhow::Result<_>>()
+        .map_err(Into::into)
 }
 
+/// The records a statement may match, with calculated values.
 async fn documents(
     conn: &Conn,
     collection: &CollectionView,
+    statement: &SqlStatement,
 ) -> Result<Vec<DocumentView>, AppError> {
+    let (condition, params) = narrowing(&collection.blueprint, statement.filter());
     let rows = conn
         .query(
-            "SELECT id, body, created_at, updated_at FROM documents WHERE collection_id=?1 ORDER BY created_at, id",
-            &[SqlValue::Text(collection.id.clone())],
+            &format!(
+                "SELECT d.id, d.body, d.created_at, d.updated_at FROM {} r JOIN documents d ON d.id=r.id WHERE {condition} ORDER BY r.created_at, r.id",
+                crate::rows::table(&collection.id)
+            ),
+            &params,
         )
         .await?;
     let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
@@ -168,6 +238,211 @@ async fn documents(
         out.push(doc);
     }
     Ok(out)
+}
+
+/// A condition on the record table (aliased `r`) that every record matching
+/// `filter` meets, so only those records are read. It may let through more
+/// records than match; the statement's own `WHERE` still decides. Parts it
+/// cannot express are left out, which only widens it.
+fn narrowing(blueprint: &Blueprint, filter: Option<&SqlExpr>) -> (String, Vec<SqlValue>) {
+    let mut params = Vec::new();
+    let condition = filter
+        .and_then(|e| narrow(blueprint, e, &mut params))
+        .unwrap_or_else(|| "1".into());
+    (condition, params)
+}
+
+fn narrow(blueprint: &Blueprint, e: &SqlExpr, params: &mut Vec<SqlValue>) -> Option<String> {
+    // A part that cannot be expressed takes back the values it bound.
+    let bound = params.len();
+    let condition = narrow_part(blueprint, e, params);
+    if condition.is_none() {
+        params.truncate(bound);
+    }
+    condition
+}
+
+fn narrow_part(blueprint: &Blueprint, e: &SqlExpr, params: &mut Vec<SqlValue>) -> Option<String> {
+    let mut bind = |params: &mut Vec<SqlValue>, value: SqlValue| {
+        params.push(value);
+        format!("?{}", params.len())
+    };
+    match e {
+        SqlExpr::Binary(op, a, b) if op == "AND" => {
+            match (narrow(blueprint, a, params), narrow(blueprint, b, params)) {
+                (Some(a), Some(b)) => Some(format!("({a} AND {b})")),
+                (one, other) => one.or(other),
+            }
+        }
+        SqlExpr::Binary(op, a, b) if op == "OR" => {
+            let a = narrow(blueprint, a, params)?;
+            let b = narrow(blueprint, b, params)?;
+            Some(format!("({a} OR {b})"))
+        }
+        SqlExpr::Binary(op, a, b) => match (a.as_ref(), b.as_ref()) {
+            (SqlExpr::Field(f), SqlExpr::Literal(v)) => {
+                compare(blueprint, f, op, v, params, &mut bind)
+            }
+            (SqlExpr::Literal(v), SqlExpr::Field(f)) => {
+                compare(blueprint, f, flipped(op), v, params, &mut bind)
+            }
+            _ => None,
+        },
+        SqlExpr::IsNull(a, not) => {
+            let SqlExpr::Field(f) = a.as_ref() else {
+                return None;
+            };
+            let text = match column(blueprint, f)? {
+                Column::Record(_) if *not => return None,
+                Column::Record(_) => return Some("0".into()),
+                Column::Field(field) => field.text,
+            };
+            // Blank text counts as empty too.
+            Some(if *not {
+                format!("{text} IS NOT NULL")
+            } else {
+                format!("({text} IS NULL OR {text}='')")
+            })
+        }
+        SqlExpr::In(a, list, false) => {
+            let SqlExpr::Field(f) = a.as_ref() else {
+                return None;
+            };
+            let parts = list
+                .iter()
+                .map(|item| match item {
+                    SqlExpr::Literal(v) => compare(blueprint, f, "=", v, params, &mut bind),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (!parts.is_empty()).then(|| format!("({})", parts.join(" OR ")))
+        }
+        SqlExpr::Between(a, low, high, false) => narrow(
+            blueprint,
+            &SqlExpr::Binary(
+                "AND".into(),
+                Box::new(SqlExpr::Binary(">=".into(), a.clone(), low.clone())),
+                Box::new(SqlExpr::Binary("<=".into(), a.clone(), high.clone())),
+            ),
+            params,
+        ),
+        SqlExpr::Like(a, pattern, false) => {
+            let (SqlExpr::Field(f), SqlExpr::Literal(Value::String(pattern))) =
+                (a.as_ref(), pattern.as_ref())
+            else {
+                return None;
+            };
+            let target = match column(blueprint, f)? {
+                Column::Record(c) => c,
+                Column::Field(field) if field.plain_text => field.text,
+                Column::Field(_) => return None,
+            };
+            let p = bind(params, SqlValue::Text(pattern.to_lowercase()));
+            Some(format!("{target} LIKE {p}"))
+        }
+        _ => None,
+    }
+}
+
+enum Column {
+    /// `id`, `created_at` or `updated_at`: always set, compared as stored.
+    Record(String),
+    Field(FieldColumns),
+}
+
+struct FieldColumns {
+    text: String,
+    number: String,
+    numeric: bool,
+    /// Whether values compare as their lowercase text column: plain text
+    /// whose display is the value itself.
+    plain_text: bool,
+    date: bool,
+}
+
+fn column(blueprint: &Blueprint, name: &str) -> Option<Column> {
+    if SQL_RECORD_COLUMNS.contains(&name) {
+        return Some(Column::Record(format!("r.{name}")));
+    }
+    let field = blueprint.fields.iter().find(|f| f.name == name)?;
+    Some(Column::Field(FieldColumns {
+        text: format!("r.{}", crate::rows::column(name, 't')),
+        number: format!("r.{}", crate::rows::column(name, 'n')),
+        numeric: field.kind == FieldType::Number,
+        plain_text: matches!(
+            field.kind,
+            FieldType::String | FieldType::Date | FieldType::Reference | FieldType::Asset
+        ),
+        date: field.kind == FieldType::Date,
+    }))
+}
+
+/// The operator with its sides swapped: `5 < x` is `x > 5`.
+fn flipped(op: &str) -> &str {
+    match op {
+        "<" => ">",
+        ">" => "<",
+        "<=" => ">=",
+        ">=" => "<=",
+        op => op,
+    }
+}
+
+/// `field op literal`. Vulse SQL compares numbers, and text that reads as
+/// a number, by value, and anything else as case-sensitive text.
+fn compare(
+    blueprint: &Blueprint,
+    field: &str,
+    op: &str,
+    literal: &Value,
+    params: &mut Vec<SqlValue>,
+    bind: &mut impl FnMut(&mut Vec<SqlValue>, SqlValue) -> String,
+) -> Option<String> {
+    if !["=", "<>", "<", ">", "<=", ">="].contains(&op) {
+        return None;
+    }
+    let number = match literal {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
+        _ => return None,
+    };
+    let text = match literal {
+        Value::String(s) => s.clone(),
+        _ => literal.to_string(),
+    };
+    match column(blueprint, field)? {
+        // Stored ids and timestamps never read as numbers.
+        Column::Record(_) if number.is_some() => None,
+        Column::Record(_) if op == "<>" => None,
+        Column::Record(c) => {
+            let p = bind(params, SqlValue::Text(text));
+            Some(format!("{c}{op}{p}"))
+        }
+        Column::Field(f) => match number {
+            Some(n) if f.numeric => {
+                let p = bind(params, SqlValue::Real(n));
+                Some(format!("{}{op}{p}", f.number))
+            }
+            // Text values compare as text against a number, so they pass.
+            Some(n) => {
+                let p = bind(params, SqlValue::Real(n));
+                Some(format!(
+                    "({}{op}{p} OR ({} IS NULL AND {} IS NOT NULL))",
+                    f.number, f.number, f.text
+                ))
+            }
+            None if op == "=" && f.plain_text => {
+                let p = bind(params, SqlValue::Text(text.to_lowercase()));
+                Some(format!("{}={p}", f.text))
+            }
+            // ISO dates order the same in either case.
+            None if op != "<>" && f.date => {
+                let p = bind(params, SqlValue::Text(text.to_lowercase()));
+                Some(format!("{}{op}{p}", f.text))
+            }
+            None => None,
+        },
+    }
 }
 
 fn row(doc: &DocumentView) -> SqlRow {
@@ -186,7 +461,7 @@ async fn plan(
 ) -> Result<Vec<Planned>, AppError> {
     let blueprint = &collection.blueprint;
     let mut plan = Vec::new();
-    for doc in documents(conn, collection).await? {
+    for doc in documents(conn, collection, statement).await? {
         let row = row(&doc);
         if !sql_matches(statement.filter(), &row).map_err(AppError::bad)? {
             continue;

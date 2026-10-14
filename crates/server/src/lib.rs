@@ -15,6 +15,7 @@ mod mutations;
 mod public;
 mod records;
 mod relationships;
+mod rows;
 mod security;
 mod sql;
 mod state;

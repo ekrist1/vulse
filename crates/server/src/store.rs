@@ -449,6 +449,7 @@ pub async fn insert_collection(
         ],
     )
     .await?;
+    crate::rows::create(conn, id, blueprint).await?;
     Ok(())
 }
 
@@ -460,6 +461,7 @@ pub async fn update_collection(
     blueprint: &Blueprint,
     updated_at: &str,
 ) -> anyhow::Result<()> {
+    let previous = find_collection(conn, id).await?;
     conn.execute(
         "UPDATE collections
          SET name = ?1, visibility = ?2, blueprint = ?3, updated_at = ?4
@@ -474,13 +476,17 @@ pub async fn update_collection(
     )
     .await?;
     conn.changed(id);
-    crate::records::sync_collection_cells(conn, id, blueprint).await?;
+    // Labels, help texts and collection settings don't change stored values.
+    if previous.is_none_or(|old| crate::rows::shape_changed(&old.blueprint, blueprint)) {
+        crate::records::sync_collection_cells(conn, id, blueprint).await?;
+    }
     Ok(())
 }
 
 pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM collections WHERE id = ?1", &[text(id)])
         .await?;
+    crate::rows::drop(conn, id).await?;
     conn.changed(id);
     Ok(())
 }
@@ -513,7 +519,7 @@ pub async fn find_collection(conn: &Conn, id: &str) -> anyhow::Result<Option<Col
             &[text(id)],
         )
         .await?;
-    optional_row(rows, |row| collection_from_row(row))
+    optional_row(rows, collection_from_row)
 }
 
 pub async fn find_collection_by_name(
@@ -527,7 +533,7 @@ pub async fn find_collection_by_name(
             &[text(name)],
         )
         .await?;
-    optional_row(rows, |row| collection_from_row(row))
+    optional_row(rows, collection_from_row)
 }
 
 pub async fn list_documents(
@@ -583,7 +589,7 @@ pub async fn find_document(
             &[text(id), text(collection_id)],
         )
         .await?;
-    optional_row(rows, |row| document_from_row(row))
+    optional_row(rows, document_from_row)
 }
 
 pub async fn document_exists(conn: &Conn, collection_id: &str, id: &str) -> anyhow::Result<bool> {
@@ -667,21 +673,34 @@ pub async fn delete_document(conn: &Conn, collection_id: &str, id: &str) -> anyh
             &[text(id), text(collection_id)],
         )
         .await?;
+    crate::rows::remove(conn, collection_id, id).await?;
     conn.changed(collection_id);
     Ok(changed > 0)
 }
 
-pub async fn insert_asset(
-    conn: &Conn,
-    id: &str,
-    uploaded_by: &str,
-    collection_id: &str,
-    filename: &str,
-    content_type: &str,
-    byte_size: i64,
-    storage_key: &str,
-    created_at: &str,
-) -> anyhow::Result<()> {
+/// An uploaded file's metadata, as stored in `assets`.
+pub struct NewAsset<'a> {
+    pub id: &'a str,
+    pub uploaded_by: &'a str,
+    pub collection_id: &'a str,
+    pub filename: &'a str,
+    pub content_type: &'a str,
+    pub byte_size: i64,
+    pub storage_key: &'a str,
+    pub created_at: &'a str,
+}
+
+pub async fn insert_asset(conn: &Conn, asset: &NewAsset<'_>) -> anyhow::Result<()> {
+    let NewAsset {
+        id,
+        uploaded_by,
+        collection_id,
+        filename,
+        content_type,
+        byte_size,
+        storage_key,
+        created_at,
+    } = *asset;
     conn.execute(
         "INSERT INTO assets
          (id, owner_id, collection_id, filename, content_type, byte_size, storage_key, created_at)

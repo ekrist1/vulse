@@ -543,14 +543,13 @@ fn ref_select(props: &RefSelectProps) -> Html {
                     selected.set(None);
                     let (target, value) = (target.clone(), value.clone());
                     wasm_bindgen_futures::spawn_local(async move {
-                        if let Some(target) = target {
-                            if !value.is_empty() {
+                        if let Some(target) = target
+                            && !value.is_empty() {
                                 match api::document(&target.id, &value).await {
                                     Ok(d) => selected.set(Some(d)),
                                     Err(e) => error.set(e),
                                 }
                             }
-                        }
                     });
                 }
             },
@@ -560,25 +559,23 @@ fn ref_select(props: &RefSelectProps) -> Html {
         // Focus the search box when "Change" reveals it.
         let input = input.clone();
         use_effect_with(*changing, move |changing| {
-            if *changing {
-                if let Some(element) = input.cast::<HtmlInputElement>() {
+            if *changing
+                && let Some(element) = input.cast::<HtmlInputElement>() {
                     let _ = element.focus();
                 }
-            }
         });
     }
     {
         // Keep the keyboard-highlighted option visible.
         let list_id = (*list_id).clone();
         use_effect_with(*active, move |active| {
-            if let Some(index) = active {
-                if let Some(element) = web_sys::window()
+            if let Some(index) = active
+                && let Some(element) = web_sys::window()
                     .and_then(|w| w.document())
                     .and_then(|d| d.get_element_by_id(&format!("{list_id}-{index}")))
                 {
                     element.scroll_into_view_with_bool(false);
                 }
-            }
         });
     }
     let blueprint = target.as_ref().map(|c| c.blueprint.clone());

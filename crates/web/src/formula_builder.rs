@@ -860,16 +860,14 @@ impl Draft {
         };
         match &e {
             Expr::Binary(op, a, b) if op == "*" => {
-                if matches!(b.as_ref(),Expr::Literal(v) if v.as_f64()==Some(100.0)) {
-                    if let Expr::Binary(op, part, total) = a.as_ref() {
-                        if op == "/" {
+                if matches!(b.as_ref(),Expr::Literal(v) if v.as_f64()==Some(100.0))
+                    && let Expr::Binary(op, part, total) = a.as_ref()
+                        && op == "/" {
                             return Some(Self {
                                 task: "percentage".into(),
                                 inputs: vec![simple(part)?, simple(total)?],
                             });
                         }
-                    }
-                }
                 Some(Self {
                     task: "multiply".into(),
                     inputs: vec![simple(a)?, simple(b)?],
@@ -950,7 +948,8 @@ fn calculation_input(props: &InputProps) -> Html {
             ("boolean", "True / false"),
         ],
     };
-    html! {<div class="calculation-input"><label>{props.argument.label.clone()}<select aria-label={format!("{label} source")} value={binding.source.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();let fields=props.fields.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.source=select.value();if next.source=="boolean"{next.value="true".into();}if let Some(f)=next.source.strip_prefix("field:").and_then(|n|fields.iter().find(|f|f.name==n)){next.comparison=if f.kind==FieldType::String{"="}else if f.kind==FieldType::Boolean{"truthy"}else{">"}.into();next.compare_value=if f.kind==FieldType::String{json!("Example").to_string()}else{"0".into()};}change.emit(next);}})}>
+    html! {<div class="calculation-input"><label>{props.argument.label.clone()}<select aria-label={format!("{label} source")} value={binding.source.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();let fields=props.fields.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.source=select.value();if next.source=="boolean"{next.value="true".into();}
+                if let Some(f)=next.source.strip_prefix("field:").and_then(|n|fields.iter().find(|f|f.name==n)){next.comparison=if f.kind==FieldType::String{"="}else if f.kind==FieldType::Boolean{"truthy"}else{">"}.into();next.compare_value=if f.kind==FieldType::String{json!("Example").to_string()}else{"0".into()};}change.emit(next);}})}>
         <option value="" selected={binding.source.is_empty()}>{"Choose a field or fixed value…"}</option><optgroup label="Collection fields">{for props.fields.iter().filter(|f|compatible(kind,f)).map(|f|html!{<option value={format!("field:{}",f.name)} selected={binding.source==format!("field:{}",f.name)}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</optgroup><optgroup label="Fixed values">{for fixed_sources.into_iter().map(|(value,text)|html!{<option {value} selected={binding.source==value}>{text}</option>})}</optgroup></select></label>
         if !binding.source.is_empty() && !binding.source.starts_with("field:") {
             if binding.source=="boolean" {<label class="calculation-fixed"><span class="muted">{"Fixed value"}</span><select aria-label={format!("{label} fixed value")} value={binding.value.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.value=select.value();change.emit(next);}})}><option value="true" selected={binding.value=="true"}>{"True"}</option><option value="false" selected={binding.value=="false"}>{"False"}</option></select></label>}
@@ -1246,13 +1245,11 @@ fn preview_schema(field: &FieldDef, fields: &[FieldDef]) -> (Blueprint, Vec<Fiel
         if !names.insert(name.clone()) {
             continue;
         }
-        if let Some(f) = fields.iter().find(|f| f.name == name) {
-            if let Some(formula) = &f.formula {
-                if let Ok(deps) = vulse_model::formula_dependencies(formula) {
+        if let Some(f) = fields.iter().find(|f| f.name == name)
+            && let Some(formula) = &f.formula
+                && let Ok(deps) = vulse_model::formula_dependencies(formula) {
                     pending.extend(deps);
                 }
-            }
-        }
     }
     let schema = Blueprint {
         title_field: None,

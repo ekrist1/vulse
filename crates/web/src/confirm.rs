@@ -106,11 +106,10 @@ pub fn confirm_provider(props: &ConfirmProviderProps) -> Html {
     {
         let dialog = dialog.clone();
         use_effect_with((*request).clone(), move |request| {
-            if let Some(element) = dialog.cast::<HtmlDialogElement>() {
-                if request.is_some() && !element.open() {
+            if let Some(element) = dialog.cast::<HtmlDialogElement>()
+                && request.is_some() && !element.open() {
                     let _ = element.show_modal();
                 }
-            }
         });
     }
     let confirmer = Confirmer { open };

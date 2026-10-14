@@ -11,6 +11,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../migrations/006_workspace.sql")),
     (7, include_str!("../migrations/007_lookups.sql")),
     (8, include_str!("../migrations/008_cell_index.sql")),
+    (9, include_str!("../migrations/009_record_tables.sql")),
 ];
 
 pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
@@ -32,8 +33,8 @@ pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
         if existing.is_empty() {
             conn.with_tx(async |conn| {
                 conn.execute_batch(sql).await?;
-                if *version == 2 {
-                    crate::records::rebuild_all_cells(conn).await?;
+                if *version == 9 {
+                    crate::records::rebuild_all_tables(conn).await?;
                 }
                 if *version == 5 {
                     crate::relationships::rebuild(conn).await?;

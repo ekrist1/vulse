@@ -19,50 +19,36 @@ fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.into())
 }
 
-pub async fn sync_cells(
-    conn: &Conn,
-    blueprint: &Blueprint,
-    lookups: &vulse_model::Lookups,
-    id: &str,
-    body: &serde_json::Value,
-) -> anyhow::Result<()> {
-    conn.execute(
-        "DELETE FROM document_cells WHERE document_id = ?1",
-        &[text(id)],
-    )
-    .await?;
-    let (body, _) = vulse_model::calculate_document_with(blueprint, body, lookups);
-    for field in &blueprint.fields {
-        let value = &body[&field.name];
-        if value.is_null() {
-            continue;
-        }
-        conn.execute("INSERT INTO document_cells(document_id,field,text_value,raw_value,number_value) VALUES(?1,?2,?3,?4,?5)", &[text(id),text(&field.name),text(&vulse_model::display_value(value).to_lowercase()),text(&value.to_string()),if value.is_number(){text(&value.to_string())}else{SqlValue::Null}]).await?;
-    }
-    Ok(())
-}
 pub async fn sync_collection_cells(
     conn: &Conn,
     id: &str,
     blueprint: &Blueprint,
 ) -> anyhow::Result<()> {
     let lookups = crate::lookups::load(conn, blueprint).await?;
+    crate::rows::rebuild(conn, id, blueprint, &lookups).await?;
+    if !crate::relationships::has_links(blueprint) {
+        // Nothing to link from; drop links of fields that were removed.
+        conn.execute(
+            "DELETE FROM document_links WHERE source_id IN (SELECT id FROM documents WHERE collection_id=?1)",
+            &[text(id)],
+        )
+        .await?;
+        return Ok(());
+    }
     for (document, body) in store::list_document_bodies(conn, id).await? {
-        sync_cells(conn, blueprint, &lookups, &document, &body).await?;
         crate::relationships::sync(conn, id, &document, blueprint, &body).await?;
     }
     Ok(())
 }
-pub async fn rebuild_all_cells(conn: &Conn) -> anyhow::Result<()> {
+/// Rebuilds every collection's record table from the record bodies.
+pub async fn rebuild_all_tables(conn: &Conn) -> anyhow::Result<()> {
     for row in conn
         .query("SELECT id,blueprint FROM collections", &[])
         .await?
     {
         let blueprint = serde_json::from_str(&text_at(&row, 1)?)?;
         let lookups = crate::lookups::load(conn, &blueprint).await?;
-        for (doc, body) in store::list_document_bodies(conn, &text_at(&row, 0)?).await? {
-            sync_cells(conn, &blueprint, &lookups, &doc, &body).await?;
-        }
+        crate::rows::rebuild(conn, &text_at(&row, 0)?, &blueprint, &lookups).await?;
     }
     Ok(())
 }
@@ -83,7 +69,7 @@ pub async fn sync_stored_document(
         .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
     let blueprint = serde_json::from_str(&text_at(row, 0)?)?;
     let lookups = crate::lookups::load(conn, &blueprint).await?;
-    sync_cells(conn, &blueprint, &lookups, id, body).await?;
+    crate::rows::sync(conn, collection, &blueprint, &lookups, id, body).await?;
     crate::relationships::sync(conn, collection, id, &blueprint, body).await
 }
 
@@ -103,29 +89,51 @@ fn like(value: &str) -> String {
 }
 
 /// Shared by empty/not-empty filters and counts of non-empty values.
-pub(crate) fn nonempty_cell(alias: &str) -> String {
-    format!("{alias}.text_value<>'' AND {alias}.raw_value<>'[]' AND {alias}.raw_value<>'{{}}'")
+pub(crate) fn nonempty_cell(field: &str) -> String {
+    let (t, r) = (
+        crate::rows::column(field, 't'),
+        crate::rows::column(field, 'r'),
+    );
+    format!("r.{t}<>'' AND r.{r}<>'[]' AND r.{r}<>'{{}}'")
 }
+
+/// A record query over a collection's record table, aliased `r`.
+pub(crate) struct QueryPlan {
+    pub table: String,
+    /// The `WHERE` condition.
+    pub filter: String,
+    pub params: Vec<SqlValue>,
+    /// A complete `ORDER BY`, with empty values last.
+    pub order: String,
+    /// The sorted column and direction when no grouping applies; pages then
+    /// read it through its index.
+    sort: Option<(String, bool)>,
+}
+
 pub(crate) fn query_sql(
     blueprint: &Blueprint,
     id: &str,
     query: &RecordQuery,
-) -> Result<(String, String, Vec<SqlValue>), AppError> {
+) -> Result<QueryPlan, AppError> {
+    use crate::rows::column;
     validate_query(blueprint, query).map_err(AppError::bad)?;
-    let mut params = vec![text(id)];
-    let mut conditions = vec!["d.collection_id=?1".to_string()];
+    let mut params = vec![];
+    let mut conditions = vec![];
     if !query.search.trim().is_empty() {
         let p = parameter(&mut params, text(&like(query.search.trim())));
-        conditions.push(format!("(lower(d.id) LIKE {p} ESCAPE '\\' OR EXISTS(SELECT 1 FROM document_cells c WHERE c.document_id=d.id AND c.text_value LIKE {p} ESCAPE '\\'))"));
+        conditions.push(format!(
+            "(lower(r.id) LIKE {p} ESCAPE '\\' OR r.search LIKE {p} ESCAPE '\\')"
+        ));
     }
     for filter in &query.filters {
         let is_date = blueprint
             .fields
             .iter()
             .any(|f| f.name == filter.field && f.kind == FieldType::Date);
-        let field = parameter(&mut params, text(&filter.field));
+        let t = format!("r.{}", column(&filter.field, 't'));
+        let n = format!("r.{}", column(&filter.field, 'n'));
         let predicate = if ["empty", "not_empty"].contains(&filter.op.as_str()) {
-            nonempty_cell("c")
+            nonempty_cell(&filter.field)
         } else {
             let value = if filter.op == "contains" {
                 like(&vulse_model::display_value(&filter.value))
@@ -134,14 +142,12 @@ pub(crate) fn query_sql(
             };
             let p = parameter(&mut params, text(&value));
             match filter.op.as_str() {
-                "contains" => format!("c.text_value LIKE {p} ESCAPE '\\'"),
-                "eq" | "neq" if filter.value.is_number() => format!(
-                    "c.number_value IS NOT NULL AND CAST(c.number_value AS REAL)=CAST({p} AS REAL)"
-                ),
-                "eq" | "neq" => format!("c.text_value={p}"),
+                "contains" => format!("{t} LIKE {p} ESCAPE '\\'"),
+                "eq" | "neq" if filter.value.is_number() => format!("{n}=CAST({p} AS REAL)"),
+                "eq" | "neq" => format!("{t}={p}"),
                 // ISO dates order correctly as text.
                 op if is_date => format!(
-                    "c.text_value<>'' AND c.text_value{}{p}",
+                    "{t}<>'' AND {t}{}{p}",
                     match op {
                         "gt" => ">",
                         "gte" => ">=",
@@ -150,7 +156,7 @@ pub(crate) fn query_sql(
                     }
                 ),
                 op => format!(
-                    "c.number_value IS NOT NULL AND CAST(c.number_value AS REAL){}CAST({p} AS REAL)",
+                    "{n}{}CAST({p} AS REAL)",
                     match op {
                         "gt" => ">",
                         "gte" => ">=",
@@ -160,55 +166,88 @@ pub(crate) fn query_sql(
                 ),
             }
         };
-        conditions.push(format!("{}EXISTS(SELECT 1 FROM document_cells c WHERE c.document_id=d.id AND c.field={field} AND {predicate})",if matches!(filter.op.as_str(),"empty"|"neq"){"NOT "}else{""}));
+        // Records without a value match neither a condition nor its opposite,
+        // so negations count a missing value as not matching.
+        conditions.push(if matches!(filter.op.as_str(), "empty" | "neq") {
+            format!("NOT COALESCE(({predicate}),0)")
+        } else {
+            format!("({predicate})")
+        });
     }
-    let where_sql = conditions.join(" AND ");
-    let mut joins = String::new();
-    let mut order = vec![];
-    if !query.group_field.is_empty() {
-        let p = parameter(&mut params, text(&query.group_field));
-        joins.push_str(&format!(
-            " LEFT JOIN document_cells g ON g.document_id=d.id AND g.field={p}"
-        ));
-        order.push("g.text_value ASC".into());
+    if conditions.is_empty() {
+        conditions.push("1".into());
     }
     let direction = if query.descending { "DESC" } else { "ASC" };
-    if ["created_at", "updated_at", "id"].contains(&query.sort_field.as_str()) {
-        order.push(format!("d.{} {direction}", query.sort_field));
+    let sorted = if ["created_at", "updated_at", "id"].contains(&query.sort_field.as_str()) {
+        format!("r.{}", query.sort_field)
     } else {
-        let p = parameter(&mut params, text(&query.sort_field));
-        joins.push_str(&format!(
-            " LEFT JOIN document_cells s ON s.document_id=d.id AND s.field={p}"
-        ));
-        order.push("(s.document_id IS NULL) ASC".into());
-        let numeric = blueprint
+        let field = blueprint
             .fields
             .iter()
             .find(|f| f.name == query.sort_field)
-            .is_some_and(|f| matches!(f.kind, FieldType::Number | FieldType::Calculated));
-        order.push(format!("{} {direction}",if numeric{"CASE WHEN s.number_value IS NOT NULL THEN CAST(s.number_value AS REAL) ELSE s.text_value END"}else{"s.text_value"}));
+            .ok_or_else(|| AppError::bad("unknown sort field"))?;
+        format!("r.{}", crate::rows::sort_column(field))
+    };
+    let mut order = vec![];
+    if !query.group_field.is_empty() {
+        order.push(format!("r.{} ASC", column(&query.group_field, 't')));
     }
-    order.push("d.id ASC".into());
-    let from = format!("FROM documents d{joins} WHERE {where_sql}");
-    Ok((from, order.join(","), params))
+    order.push(format!("({sorted} IS NULL) ASC"));
+    order.push(format!("{sorted} {direction}"));
+    order.push(format!("r.id {direction}"));
+    Ok(QueryPlan {
+        table: crate::rows::table(id),
+        filter: conditions.join(" AND "),
+        params,
+        order: order.join(","),
+        sort: query
+            .group_field
+            .is_empty()
+            .then_some((sorted, query.descending)),
+    })
 }
 pub(crate) async fn run_query(
     conn: &Conn,
     collection: &vulse_model::CollectionView,
     query: &RecordQuery,
 ) -> Result<RecordPage, AppError> {
-    let (from, order, mut params) = query_sql(&collection.blueprint, &collection.id, query)?;
+    let plan = query_sql(&collection.blueprint, &collection.id, query)?;
+    let QueryPlan {
+        table,
+        filter,
+        params,
+        ..
+    } = &plan;
     let count = conn
-        .query(&format!("SELECT count(*) {from}"), &params)
+        .query(
+            &format!("SELECT count(*) FROM {table} r WHERE {filter}"),
+            params,
+        )
         .await?;
     let total = int_at(&count[0], 0)? as u64;
-    let limit = parameter(&mut params, SqlValue::Integer(query.limit as i64));
-    let offset = parameter(&mut params, SqlValue::Integer(query.offset as i64));
-    let rows=conn.query(&format!("SELECT d.id,d.body,d.created_at,d.updated_at {from} ORDER BY {order} LIMIT {limit} OFFSET {offset}"),&params).await?;
-    let mut items = rows
-        .iter()
-        .map(store::document_from_row)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let ids = page_ids(conn, &plan, query.limit as i64, query.offset as i64).await?;
+    let mut items = Vec::with_capacity(ids.len());
+    if !ids.is_empty() {
+        let slots: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT id,body,created_at,updated_at FROM documents WHERE id IN ({})",
+                    slots.join(",")
+                ),
+                &ids.iter().map(|id| text(id)).collect::<Vec<_>>(),
+            )
+            .await?;
+        let mut found = rows
+            .iter()
+            .map(store::document_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for id in &ids {
+            if let Some(index) = found.iter().position(|doc| doc.id == *id) {
+                items.push(found.swap_remove(index));
+            }
+        }
+    }
     let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
     for doc in &mut items {
         materialize(&collection.blueprint, &lookups, doc);
@@ -219,6 +258,79 @@ pub(crate) async fn run_query(
         limit: query.limit,
         offset: query.offset,
     })
+}
+
+/// The ids on one page. Without grouping, records with a value are read in
+/// index order and records without one follow, so no page sorts the whole
+/// collection.
+async fn page_ids(
+    conn: &Conn,
+    plan: &QueryPlan,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<String>, AppError> {
+    let QueryPlan {
+        table,
+        filter,
+        params,
+        order,
+        sort,
+    } = plan;
+    let page = async |condition: &str, order: &str, limit: i64, offset: i64| {
+        let mut params = params.clone();
+        let limit = parameter(&mut params, SqlValue::Integer(limit));
+        let offset = parameter(&mut params, SqlValue::Integer(offset));
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT r.id FROM {table} r WHERE {filter}{condition} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+                ),
+                &params,
+            )
+            .await?;
+        rows.iter()
+            .map(|row| text_at(row, 0))
+            .collect::<anyhow::Result<Vec<_>>>()
+    };
+    let Some((column, descending)) = sort else {
+        return Ok(page("", order, limit, offset).await?);
+    };
+    if *descending {
+        // Empty values sort lowest, so they already come last.
+        return Ok(page("", &format!("{column} DESC, r.id DESC"), limit, offset).await?);
+    }
+    let mut ids = page(
+        &format!(" AND {column} IS NOT NULL"),
+        &format!("{column}, r.id"),
+        limit,
+        offset,
+    )
+    .await?;
+    if (ids.len() as i64) < limit {
+        let with_values = if ids.is_empty() {
+            let rows = conn
+                .query(
+                    &format!(
+                        "SELECT count(*) FROM {table} r WHERE {filter} AND {column} IS NOT NULL"
+                    ),
+                    params,
+                )
+                .await?;
+            int_at(&rows[0], 0)?
+        } else {
+            offset + ids.len() as i64
+        };
+        ids.extend(
+            page(
+                &format!(" AND {column} IS NULL"),
+                "r.id",
+                limit - ids.len() as i64,
+                (offset - with_values).max(0),
+            )
+            .await?,
+        );
+    }
+    Ok(ids)
 }
 pub async fn query_records(
     State(state): State<AppState>,

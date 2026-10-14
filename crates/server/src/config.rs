@@ -32,11 +32,10 @@ impl Config {
         }
         let public_url =
             nonempty("VULSE_PUBLIC_URL").map(|url| url.trim_end_matches('/').to_string());
-        if let Some(url) = &public_url {
-            if !url.starts_with("https://") && !url.starts_with("http://") {
+        if let Some(url) = &public_url
+            && !url.starts_with("https://") && !url.starts_with("http://") {
                 anyhow::bail!("VULSE_PUBLIC_URL must start with https:// or http://");
             }
-        }
         let cookie_secure = match nonempty("VULSE_COOKIE_SECURE") {
             Some(value) => flag("VULSE_COOKIE_SECURE", &value)?,
             None => public_url
@@ -79,11 +78,10 @@ impl Config {
                 .context("missing Turso auth token")?;
             crate::db::Db::open_remote(url, token).await
         } else {
-            if let Some(parent) = self.db_path.parent() {
-                if !parent.as_os_str().is_empty() {
+            if let Some(parent) = self.db_path.parent()
+                && !parent.as_os_str().is_empty() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-            }
             crate::db::Db::open_local(&self.db_path).await
         }
     }

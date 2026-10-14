@@ -87,19 +87,17 @@ pub async fn upload_asset(
         )));
     }
     let created_at = timeutil::now_rfc3339();
-    if let Err(err) = store::insert_asset(
-        &conn,
-        &asset_id,
-        &principal.user_id,
-        &collection.id,
-        &filename,
-        &content_type,
-        data.len() as i64,
-        &storage_key,
-        &created_at,
-    )
-    .await
-    {
+    let asset = store::NewAsset {
+        id: &asset_id,
+        uploaded_by: &principal.user_id,
+        collection_id: &collection.id,
+        filename: &filename,
+        content_type: &content_type,
+        byte_size: data.len() as i64,
+        storage_key: &storage_key,
+        created_at: &created_at,
+    };
+    if let Err(err) = store::insert_asset(&conn, &asset).await {
         let _ = tokio::fs::remove_file(&path).await;
         return Err(err.into());
     }

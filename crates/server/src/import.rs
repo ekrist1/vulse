@@ -169,7 +169,7 @@ pub async fn import_file(
                 if !collection.blueprint.fields.iter().any(|f|f.name==match_field&&matches!(f.kind,FieldType::String|FieldType::Number)){return Err(AppError::bad("Choose a string or number field for matching records"));}
                 if !mapping.iter().any(|m|m.as_deref()==Some(match_field.as_str())){return Err(AppError::bad("The matching field must be mapped to an imported column"));}
                 for(doc,body)in store::list_document_bodies(conn,&id).await? {
-                    if let Some(key)=match_key(&body[&match_field]){if existing.insert(key,(doc,body)).is_some(){result.errors.push(ImportIssue{row:0,field:Some(match_field.clone()),message:"Existing records contain duplicate matching values. Resolve them before importing updates.".into()});}}
+                    if let Some(key)=match_key(&body[&match_field])&& existing.insert(key,(doc,body)).is_some(){result.errors.push(ImportIssue{row:0,field:Some(match_field.clone()),message:"Existing records contain duplicate matching values. Resolve them before importing updates.".into()});}
                 }
             }
             let mut seen_keys=HashSet::new();

@@ -12,6 +12,8 @@ use vulse_model::{
 
 use crate::app;
 
+#[path = "tests/bench.rs"]
+mod bench;
 #[path = "tests/beta.rs"]
 mod beta;
 
@@ -644,6 +646,172 @@ async fn patches_bulk_and_undo_are_atomic_and_conflict_aware() {
         .status(),
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn record_tables_sort_empty_values_last_and_follow_changes() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "rows@example.com", "rows").await;
+    let c = create_collection(
+        &app,
+        &cookie,
+        "scores",
+        "private",
+        json!({"fields":[{"name":"title","type":"string","required":true},{"name":"score","type":"number"},{"name":"double","type":"calculated","formula":"=[score]*2"}]}),
+    )
+    .await;
+    for (title, score) in [
+        ("c", json!(3)),
+        ("a", json!(1)),
+        ("x", Value::Null),
+        ("b", json!(2)),
+        ("y", Value::Null),
+    ] {
+        let mut body = json!({"title": title});
+        if !score.is_null() {
+            body["score"] = score;
+        }
+        create_document(&app, &cookie, &c.id, body).await;
+    }
+    let endpoint = format!("/api/v1/collections/{}/query", c.id);
+    let titles = async |query: Value| {
+        let (status, page) = json_of::<vulse_model::RecordPage>(
+            app.call("POST", &endpoint, Some(&cookie), None, Some(query.clone()))
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        let titles: Vec<String> = page
+            .items
+            .iter()
+            .map(|d| d.body["title"].as_str().unwrap().to_string())
+            .collect();
+        (page.total, titles.join(""))
+    };
+    // Pages cross from records with a value to records without one.
+    let ascending = |offset: u32, limit: u32| json!({"sort_field":"score","descending":false,"offset":offset,"limit":limit});
+    assert_eq!(titles(ascending(0, 2)).await, (5, "ab".into()));
+    let (_, page) = titles(ascending(2, 2)).await;
+    assert!(page == "cx" || page == "cy", "{page}");
+    let (_, rest) = titles(ascending(3, 2)).await;
+    assert_eq!(rest.len(), 2);
+    assert!(rest.contains('x') && rest.contains('y'));
+    assert_eq!(titles(ascending(4, 2)).await.1.len(), 1);
+    assert_eq!(titles(ascending(5, 2)).await.1, "");
+    let (_, descending) = titles(json!({"sort_field":"score","descending":true})).await;
+    assert!(descending.starts_with("cba"), "{descending}");
+    let (_, calculated) = titles(json!({"sort_field":"double","descending":false})).await;
+    // An empty score counts as 0 in the formula.
+    assert!(calculated.ends_with("abc"), "{calculated}");
+    let (_, grouped) =
+        titles(json!({"group_field":"score","sort_field":"title","descending":false})).await;
+    assert_eq!(grouped.len(), 5);
+    // Negated filters include records without a value.
+    assert_eq!(
+        titles(json!({"filters":[{"field":"score","op":"neq","value":2}]}))
+            .await
+            .0,
+        4
+    );
+    assert_eq!(
+        titles(json!({"filters":[{"field":"score","op":"empty"}]}))
+            .await
+            .0,
+        2
+    );
+    assert_eq!(
+        titles(json!({"filters":[{"field":"double","op":"gte","value":4}]}))
+            .await
+            .0,
+        2
+    );
+    assert_eq!(titles(json!({"search":"Y"})).await, (1, "y".into()));
+
+    // Renaming a field rebuilds the table with the values under the new name.
+    let response = app
+        .call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", c.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":{"fields":[{"name":"title","type":"string","required":true},{"name":"points","type":"number","renamed_from":"score"}]}})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        titles(json!({"sort_field":"points","descending":true,"limit":3})).await,
+        (5, "cba".into())
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"sort_field":"score"}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Deleted records leave the table; a deleted collection drops it.
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &endpoint,
+            Some(&cookie),
+            None,
+            Some(json!({"filters":[{"field":"title","op":"eq","value":"a"}]})),
+        )
+        .await,
+    )
+    .await;
+    let response = app
+        .call(
+            "DELETE",
+            &format!(
+                "/api/v1/collections/{}/documents/{}",
+                c.id, page.items[0].id
+            ),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert!(response.status().is_success());
+    assert_eq!(titles(json!({})).await.0, 4);
+    let conn = app.db.connect().await.unwrap();
+    let tables = async || {
+        conn.query(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'rows_%'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .len()
+    };
+    assert_eq!(tables().await, 1);
+    // Rebuilding from the record bodies restores a lost table.
+    conn.execute(&format!("DROP TABLE {}", crate::rows::table(&c.id)), &[])
+        .await
+        .unwrap();
+    crate::records::rebuild_all_tables(&conn).await.unwrap();
+    assert_eq!(
+        titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
+        (4, "b".into())
+    );
+    let response = app
+        .call(
+            "DELETE",
+            &format!("/api/v1/collections/{}", c.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert!(response.status().is_success());
+    assert_eq!(tables().await, 0);
 }
 
 #[tokio::test]
@@ -4170,6 +4338,190 @@ async fn views_hear_about_changes_to_their_collection_and_what_it_shows() {
         )
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn sql_reads_through_the_record_table_match_full_evaluation() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "narrow@example.com", "narrow").await;
+    let c = create_collection(
+        &app,
+        &cookie,
+        "things",
+        "private",
+        json!({"fields":[
+            {"name":"name","type":"string","required":true},
+            {"name":"city","type":"string"},
+            {"name":"score","type":"number"},
+            {"name":"code","type":"string"},
+            {"name":"due","type":"date"},
+            {"name":"flag","type":"boolean"},
+            {"name":"tags","type":"array","items":"string"},
+            {"name":"calc_n","type":"calculated","formula":"=[score]*2"},
+            {"name":"calc_t","type":"calculated","formula":"=UPPER([city])"}
+        ]}),
+    )
+    .await;
+    for body in [
+        json!({"name":"Alpha","city":"Oslo","score":10,"code":"12","due":"2024-01-05","flag":true,"tags":["a","b"]}),
+        json!({"name":"beta","city":"oslo","score":2.5,"code":"007","due":"2023-12-31","flag":false}),
+        json!({"name":"Gamma","city":"","score":-1,"code":"abc"}),
+        json!({"name":"delta"}),
+        json!({"name":"Échelle","city":"Bergen","score":100,"code":"1e2","due":"2025-06-01","tags":[]}),
+        json!({"name":"100","city":"Trondheim","score":0,"code":" 5 ","flag":true}),
+    ] {
+        create_document(&app, &cookie, &c.id, body).await;
+    }
+    let (_, page) = json_of::<Page<DocumentView>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/documents?limit=100", c.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    let rows: Vec<vulse_model::SqlRow> = page
+        .items
+        .iter()
+        .map(|doc| {
+            let mut row = doc.body.as_object().cloned().unwrap();
+            row.insert("id".into(), json!(doc.id));
+            row.insert("created_at".into(), json!(doc.created_at));
+            row.insert("updated_at".into(), json!(doc.updated_at));
+            row
+        })
+        .collect();
+    // Values read from the record table equal the record bodies.
+    let (_, all) = json_of::<Value>(
+        app.call(
+            "POST",
+            "/api/v1/sql",
+            Some(&cookie),
+            None,
+            Some(json!({"sql":"SELECT * FROM things"})),
+        )
+        .await,
+    )
+    .await;
+    let columns: Vec<String> = serde_json::from_value(all["columns"].clone()).unwrap();
+    assert_eq!(all["rows"].as_array().unwrap().len(), rows.len());
+    for found in all["rows"].as_array().unwrap() {
+        let row = rows.iter().find(|r| r["id"] == found[0]).unwrap();
+        for (index, column) in columns.iter().enumerate() {
+            let expected = row.get(column).cloned().unwrap_or(Value::Null);
+            let same = match (expected.as_f64(), found[index].as_f64()) {
+                (Some(a), Some(b)) => a == b,
+                _ => expected == found[index],
+            };
+            assert!(same, "{column}: {expected} vs {}", found[index]);
+        }
+    }
+    let first = &page.items[0].id;
+    let wheres = [
+        "score > 5",
+        "5 < score",
+        "score = 10",
+        "score <> 10",
+        "score >= 2.5 AND city = 'Oslo'",
+        "city = 'oslo'",
+        "city = 'Oslo'",
+        "city <> 'Oslo'",
+        "city IS NULL",
+        "city IS NOT NULL",
+        "city LIKE 'o%'",
+        "name LIKE '_cH%'",
+        "name LIKE 'é%'",
+        "code = 12",
+        "code > 6",
+        "code < 'b'",
+        "code = '12'",
+        "code IN (12, 'abc')",
+        "code BETWEEN 5 AND 100",
+        "score BETWEEN 0 AND 10",
+        "score NOT BETWEEN 0 AND 10",
+        "score IN (2.5, 100)",
+        "score NOT IN (2.5)",
+        "due > '2024-01-01'",
+        "due <= '2024-01-05'",
+        "due = '2023-12-31'",
+        "due > 2000",
+        "flag IS NULL",
+        "flag IS NOT NULL",
+        "tags IS NULL",
+        "tags IS NOT NULL",
+        "calc_n > 10",
+        "calc_n = 20",
+        "calc_t = 'OSLO'",
+        "calc_t LIKE 'os%'",
+        "name = '100'",
+        "name = 100",
+        "name > 50",
+        "created_at > '2000'",
+        "updated_at IS NOT NULL",
+        "id IS NULL",
+        "score > 5 OR city = 'Bergen'",
+        "score > 5 OR LENGTH(name) = 4",
+        "NOT score > 5",
+        "COALESCE(city, 'x') = 'x'",
+        "score * 2 > 10",
+        "-score < 0",
+        "city = 'Oslo' AND (score > 5 OR code = 'abc')",
+        "name = 'Échelle'",
+        "name = 'échelle'",
+        "code = 5",
+        "code = 100",
+        "score = '10'",
+        "'Oslo' = city",
+        "10 <= score",
+    ];
+    let mut checks: Vec<String> = wheres.iter().map(|w| w.to_string()).collect();
+    checks.push(format!("id = '{first}'"));
+    checks.push(format!("id IN ('{first}', 'missing')"));
+    for clause in checks {
+        let statement =
+            vulse_model::parse_sql(&format!("SELECT id FROM things WHERE {clause}")).unwrap();
+        let mut expected: Vec<String> = rows
+            .iter()
+            .filter(|row| vulse_model::sql_matches(statement.filter(), row).unwrap())
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        expected.sort();
+        let response = app
+            .call(
+                "POST",
+                "/api/v1/sql",
+                Some(&cookie),
+                None,
+                Some(json!({"sql": format!("SELECT id FROM things WHERE {clause}")})),
+            )
+            .await;
+        let (status, body) = json_of::<Value>(response).await;
+        assert_eq!(status, StatusCode::OK, "{clause}: {body}");
+        let mut found: Vec<String> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, expected, "{clause}");
+        // Updates and deletes plan over the same records.
+        let response = app
+            .call(
+                "POST",
+                "/api/v1/sql",
+                Some(&cookie),
+                None,
+                Some(json!({"sql": format!("DELETE FROM things WHERE {clause}")})),
+            )
+            .await;
+        let (status, body) = json_of::<Value>(response).await;
+        assert_eq!(status, StatusCode::OK, "{clause}: {body}");
+        assert_eq!(body["affected"], json!(expected.len()), "{clause}");
+    }
 }
 
 #[tokio::test]

@@ -197,12 +197,11 @@ pub fn records_panel(props: &RecordsProps) -> Html {
             let confirm = confirm.clone();
             working.set(true);
             wasm_bindgen_futures::spawn_local(async move {
-                if let Some(request) = ask {
-                    if !confirm.ask(request).await {
+                if let Some(request) = ask
+                    && !confirm.ask(request).await {
                         working.set(false);
                         return;
                     }
-                }
                 match api::bulk_records(&id, &body).await {
                     Ok(result) => {
                         picked.set(vec![]);
@@ -531,7 +530,8 @@ pub fn records_panel(props: &RecordsProps) -> Html {
             {toggle("filters",if query.filters.is_empty(){"Filter".to_string()}else{format!("Filter · {}",query.filters.len())})}
             <div class="mode-switch" role="group" aria-label="Show records as">
                 <button type="button" aria-pressed={(!*summary_mode).to_string()} onclick={Callback::from({let mode=summary_mode.clone();move |_|mode.set(false)})}>{"Table"}</button>
-                <button type="button" aria-pressed={summary_mode.to_string()} onclick={Callback::from({let mode=summary_mode.clone();let spec=summary_spec.clone();let panel=panel.clone();let fields=fields.clone();move |_|{if spec.is_none(){spec.set(Some(crate::summary::default_spec(&fields)));}if matches!(*panel,Some("sort")|Some("columns")|Some("export")){panel.set(None);}mode.set(true);}})}>{"Summary"}</button>
+                <button type="button" aria-pressed={summary_mode.to_string()} onclick={Callback::from({let mode=summary_mode.clone();let spec=summary_spec.clone();let panel=panel.clone();let fields=fields.clone();move |_|{if spec.is_none(){spec.set(Some(crate::summary::default_spec(&fields)));}
+                if matches!(*panel,Some("sort")|Some("columns")|Some("export")){panel.set(None);}mode.set(true);}})}>{"Summary"}</button>
             </div>
             if !*summary_mode {
                 {toggle("sort",if query.group_field.is_empty(){"Sort".to_string()}else{"Sort · grouped".to_string()})}

@@ -356,12 +356,11 @@ pub fn normalize_marks(marks: &mut Vec<MarkRange>) {
     });
     let mut merged: Vec<MarkRange> = Vec::new();
     for mark in marks.drain(..) {
-        if let Some(last) = merged.last_mut() {
-            if last.mark == mark.mark && mark.start <= last.end {
+        if let Some(last) = merged.last_mut()
+            && last.mark == mark.mark && mark.start <= last.end {
                 last.end = last.end.max(mark.end);
                 continue;
             }
-        }
         merged.push(mark);
     }
     *marks = merged;
@@ -491,11 +490,10 @@ fn validate_text_block(obj: &Map<String, Value>, index: usize) -> Result<(), Str
             return Err(format!("block {index} level must be between 1 and 6"));
         }
     }
-    if let Some(mark_defs) = obj.get("markDefs") {
-        if mark_defs.as_array().is_none_or(|items| !items.is_empty()) {
+    if let Some(mark_defs) = obj.get("markDefs")
+        && mark_defs.as_array().is_none_or(|items| !items.is_empty()) {
             return Err(format!("block {index} markDefs must be an empty array"));
         }
-    }
     let children = obj
         .get("children")
         .and_then(Value::as_array)
@@ -556,11 +554,10 @@ fn validate_image_block(obj: &Map<String, Value>, index: usize) -> Result<String
         .and_then(Value::as_object)
         .ok_or_else(|| format!("block {index} asset must be an object"))?;
     reject_unknown(asset, &["_type", "_ref"], &format!("block {index} asset"))?;
-    if let Some(kind) = asset.get("_type") {
-        if kind.as_str() != Some("reference") {
+    if let Some(kind) = asset.get("_type")
+        && kind.as_str() != Some("reference") {
             return Err(format!("block {index} asset _type must be reference"));
         }
-    }
     let asset_id = require_str(asset, "_ref")?;
     if is_uuid(asset_id) {
         Ok(asset_id.to_string())
@@ -601,12 +598,11 @@ fn range_covered(marks: &[MarkRange], mark: Mark, start: usize, end: usize) -> b
     covered.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start_at, end_at) in covered {
-        if let Some(last) = merged.last_mut() {
-            if start_at <= last.1 {
+        if let Some(last) = merged.last_mut()
+            && start_at <= last.1 {
                 last.1 = last.1.max(end_at);
                 continue;
             }
-        }
         merged.push((start_at, end_at));
     }
     merged

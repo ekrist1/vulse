@@ -105,27 +105,10 @@ pub(crate) async fn run_summary(
     query.sort_field = "created_at".into();
     query.group_field = String::new();
     query.offset = 0;
-    let (from, _, mut params) = crate::records::query_sql(blueprint, &collection.id, &query)?;
-    let filters = from
-        .strip_prefix("FROM documents d")
-        .ok_or_else(|| anyhow::anyhow!("unexpected query shape"))?
-        .to_string();
-
-    let mut joins = String::new();
-    let mut aliases = HashMap::<String, String>::new();
-    let mut join = |field: &str, params: &mut Vec<SqlValue>| -> String {
-        if let Some(alias) = aliases.get(field) {
-            return alias.clone();
-        }
-        params.push(SqlValue::Text(field.to_string()));
-        let alias = format!("c{}", aliases.len());
-        joins.push_str(&format!(
-            " LEFT JOIN document_cells {alias} ON {alias}.document_id=d.id AND {alias}.field=?{}",
-            params.len()
-        ));
-        aliases.insert(field.to_string(), alias.clone());
-        alias
-    };
+    let plan = crate::records::query_sql(blueprint, &collection.id, &query)?;
+    let params = plan.params;
+    let from = format!(" FROM {} r WHERE {}", plan.table, plan.filter);
+    let column = |field: &str, part: char| format!("r.{}", crate::rows::column(field, part));
     let kind = |name: &str| {
         blueprint
             .fields
@@ -139,13 +122,13 @@ pub(crate) async fn run_summary(
         .group_by
         .iter()
         .map(|group| {
-            let alias = join(&group.field, &mut params);
+            let text = column(&group.field, 't');
             match group.bucket {
                 Some(bucket) => format!(
-                    "CASE WHEN {alias}.text_value<>'' THEN substr({alias}.text_value,1,{}) END",
+                    "CASE WHEN {text}<>'' THEN substr({text},1,{}) END",
                     bucket.width()
                 ),
-                None => format!("{alias}.raw_value"),
+                None => column(&group.field, 'r'),
             }
         })
         .collect();
@@ -155,21 +138,21 @@ pub(crate) async fn run_summary(
         let Some(field) = measure.field.as_deref() else {
             continue;
         };
-        let alias = join(field, &mut params);
-        let number = format!("CAST({alias}.number_value AS REAL)");
+        let number = column(field, 'n');
+        let text = column(field, 't');
         let date = kind(field) == Some(FieldType::Date);
         let expression = match measure.op {
             SummaryOp::Sum => format!("SUM({number})"),
             SummaryOp::Average => format!("AVG({number})"),
-            SummaryOp::Min if date => format!("MIN(NULLIF({alias}.text_value,''))"),
-            SummaryOp::Max if date => format!("MAX(NULLIF({alias}.text_value,''))"),
+            SummaryOp::Min if date => format!("MIN(NULLIF({text},''))"),
+            SummaryOp::Max if date => format!("MAX(NULLIF({text},''))"),
             SummaryOp::Min => format!("MIN({number})"),
             SummaryOp::Max => format!("MAX({number})"),
             SummaryOp::Count => format!(
-                "COUNT(CASE WHEN {} THEN {alias}.document_id END)",
-                crate::records::nonempty_cell(&alias)
+                "COUNT(CASE WHEN {} THEN r.id END)",
+                crate::records::nonempty_cell(field)
             ),
-            SummaryOp::CountUnique => format!("COUNT(DISTINCT {alias}.raw_value)"),
+            SummaryOp::CountUnique => format!("COUNT(DISTINCT {})", column(field, 'r')),
             SummaryOp::Formula => continue,
         };
         columns.push((measure.name.clone(), expression));
@@ -181,7 +164,7 @@ pub(crate) async fn run_summary(
         parts.join(",")
     };
 
-    let totals_sql = format!("SELECT {} FROM documents d{joins}{filters}", select(&[]));
+    let totals_sql = format!("SELECT {}{from}", select(&[]));
     let totals = conn.query(&totals_sql, &params).await?;
     let totals = decode_row(
         spec,
@@ -196,7 +179,7 @@ pub(crate) async fn run_summary(
         rows.push(totals.clone());
     } else {
         let sql = format!(
-            "SELECT {} FROM documents d{joins}{filters} GROUP BY {} LIMIT {}",
+            "SELECT {}{from} GROUP BY {} LIMIT {}",
             select(&keys),
             keys.join(","),
             MAX_COMPUTED_GROUPS + 1

@@ -48,17 +48,7 @@ pub async fn sync(
         .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
     let name = text_at(row, 0)?;
     for field in &blueprint.fields {
-        if !matches!(
-            field.kind,
-            vulse_model::FieldType::Reference
-                | vulse_model::FieldType::Asset
-                | vulse_model::FieldType::PortableText
-        ) && !(field.kind == vulse_model::FieldType::Array
-            && matches!(
-                field.items,
-                Some(vulse_model::ArrayItems::Reference | vulse_model::ArrayItems::Asset)
-            ))
-        {
+        if !links(field) {
             continue;
         }
         let mut single = field.clone();
@@ -96,6 +86,22 @@ pub async fn sync(
         }
     }
     Ok(())
+}
+/// Whether a field can link to records or assets.
+fn links(field: &vulse_model::FieldDef) -> bool {
+    matches!(
+        field.kind,
+        vulse_model::FieldType::Reference
+            | vulse_model::FieldType::Asset
+            | vulse_model::FieldType::PortableText
+    ) || (field.kind == vulse_model::FieldType::Array
+        && matches!(
+            field.items,
+            Some(vulse_model::ArrayItems::Reference | vulse_model::ArrayItems::Asset)
+        ))
+}
+pub(crate) fn has_links(blueprint: &Blueprint) -> bool {
+    blueprint.fields.iter().any(links)
 }
 async fn insert_link(
     conn: &Conn,

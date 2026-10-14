@@ -43,7 +43,8 @@ pub async fn export_records(
     let (name,bytes)=conn.with_app_read_tx(async |conn|{
  let collection=workspace_collection(conn,&principal,&id).await?;
  if write.columns.is_empty()||write.columns.iter().collect::<std::collections::HashSet<_>>().len()!=write.columns.len()||write.columns.iter().any(|key|!collection.blueprint.fields.iter().any(|f|f.name==*key)){return Err(AppError::bad("Choose one or more valid export columns"));}
- let(mut from,order,mut params)=crate::records::query_sql(&collection.blueprint,&id,&write.query)?;
+ let plan=crate::records::query_sql(&collection.blueprint,&id,&write.query)?;
+ let mut from=format!("FROM {} r JOIN documents d ON d.id=r.id WHERE {}",plan.table,plan.filter);let order=plan.order;let mut params=plan.params;
  if !write.ids.is_empty(){
    // Selection is explicit and authorized separately from the current filter.
    from="FROM documents d WHERE d.collection_id=?1".into();params=vec![SqlValue::Text(id.clone())];

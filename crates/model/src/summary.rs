@@ -276,11 +276,10 @@ pub fn validate_summary(blueprint: &Blueprint, spec: &SummarySpec) -> Result<(),
             ));
         }
     }
-    if let Some(sort) = &spec.sort {
-        if !names.contains(sort) && !groups.contains(sort) {
+    if let Some(sort) = &spec.sort
+        && !names.contains(sort) && !groups.contains(sort) {
             return Err(format!("cannot sort by unknown summary column '{sort}'"));
         }
-    }
     if let Some(chart) = &spec.chart {
         if chart.measures.is_empty() || chart.measures.len() > MAX_CHART_SERIES {
             return Err("a chart shows 1 to 4 summary values".into());
@@ -345,11 +344,17 @@ pub fn rename_summary_fields(spec: &mut SummarySpec, renames: &BTreeMap<String, 
             measure.field = Some(next.clone());
         }
     }
-    if let Some(next) = spec.sort.as_ref().and_then(|s| renames.get(s)) {
-        if spec.group_by.iter().any(|g| g.field == *next) {
+    if let Some(next) = spec.sort.as_ref().and_then(|s| renames.get(s))
+        && spec.group_by.iter().any(|g| g.field == *next) {
             spec.sort = Some(next.clone());
         }
-    }
+}
+
+/// Why a summary formula cannot use `[collection.field]`, and what to do.
+pub fn lookup_message(collection: &str, field: &str) -> String {
+    format!(
+        "summary formulas can only use this summary's values, not [{collection}.{field}]. Add a calculated field that reads {collection} (for example with SUMIFS) to the records, then summarize that field."
+    )
 }
 
 #[cfg(test)]
@@ -460,11 +465,4 @@ mod tests {
             "measures":[{"name":"first","op":"min","field":"opened"},{"name":"n","op":"count_unique","field":"name"}]}));
         validate_summary(&bp, &dated).unwrap();
     }
-}
-
-/// Why a summary formula cannot use `[collection.field]`, and what to do.
-pub fn lookup_message(collection: &str, field: &str) -> String {
-    format!(
-        "summary formulas can only use this summary's values, not [{collection}.{field}]. Add a calculated field that reads {collection} (for example with SUMIFS) to the records, then summarize that field."
-    )
 }

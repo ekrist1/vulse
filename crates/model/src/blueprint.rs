@@ -145,8 +145,8 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
             }
         }
     }
-    if let Some(title) = &blueprint.title_field {
-        if !blueprint.fields.iter().any(|field| {
+    if let Some(title) = &blueprint.title_field
+        && !blueprint.fields.iter().any(|field| {
             field.name == *title
                 && matches!(
                     field.kind,
@@ -161,7 +161,6 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
                 "record title must select a text, number, boolean, date or calculated field".into(),
             );
         }
-    }
     crate::validate_formulas(blueprint)
 }
 
@@ -208,11 +207,10 @@ pub fn take_field_renames(
             field.formula = Some(crate::rename_formula_fields(formula, &renames));
         }
     }
-    if let Some(title) = &blueprint.title_field {
-        if let Some(next) = renames.get(title) {
+    if let Some(title) = &blueprint.title_field
+        && let Some(next) = renames.get(title) {
             blueprint.title_field = Some(next.clone());
         }
-    }
     Ok(renames)
 }
 

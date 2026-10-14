@@ -149,13 +149,12 @@ pub fn require_role(principal: &Principal, role: Role) -> Result<(), AppError> {
 }
 
 pub fn require_collection(principal: &Principal, collection_id: &str) -> Result<(), AppError> {
-    if let Some(scope) = &principal.collection_scope {
-        if scope != collection_id {
+    if let Some(scope) = &principal.collection_scope
+        && scope != collection_id {
             return Err(AppError::Forbidden(
                 "this api key is limited to one collection".into(),
             ));
         }
-    }
     Ok(())
 }
 
@@ -439,14 +438,13 @@ pub async fn create_key(
         ));
     }
     let conn = state.db.connect().await?;
-    if let Some(collection_id) = &body.collection_id {
-        if store::find_collection(&conn, collection_id)
+    if let Some(collection_id) = &body.collection_id
+        && store::find_collection(&conn, collection_id)
             .await?
             .is_none()
         {
             return Err(AppError::NotFound);
         }
-    }
     let secret = format!("vulse_{}", new_token());
     let prefix = secret.chars().take(16).collect::<String>();
     let id = new_id();
@@ -653,11 +651,9 @@ fn cookie_from_headers(headers: &axum::http::HeaderMap, name: &str) -> Option<St
             .trim()
             .strip_prefix(name)
             .and_then(|v| v.strip_prefix('='))
-        {
-            if !value.is_empty() {
+            && !value.is_empty() {
                 return Some(value.to_string());
             }
-        }
     }
     None
 }

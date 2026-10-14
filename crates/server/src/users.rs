@@ -34,11 +34,10 @@ pub async fn update_user(
         let user = store::find_user(conn, &id)
             .await?
             .ok_or(AppError::NotFound)?;
-        if let Some(role) = body.role {
-            if role != user.role {
+        if let Some(role) = body.role
+            && role != user.role {
                 store::set_user_role(conn, &id, role).await?;
             }
-        }
         if let Some(disabled) = body.disabled {
             if disabled && !user.disabled {
                 store::set_user_disabled(conn, &id, Some(&timeutil::now_rfc3339())).await?;

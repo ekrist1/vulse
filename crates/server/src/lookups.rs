@@ -153,7 +153,7 @@ async fn columns(
 
 /// Whether a field reads other collections, which makes it unusable as a
 /// lookup column itself.
-fn reads_collections(blueprint: &Blueprint, field: &str) -> bool {
+pub(crate) fn reads_collections(blueprint: &Blueprint, field: &str) -> bool {
     let mut pending = vec![field.to_string()];
     let mut visited = std::collections::HashSet::new();
     while let Some(name) = pending.pop() {

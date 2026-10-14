@@ -66,18 +66,15 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
             let completed = completed.clone();
             let id = id.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                match api::import_file(
-                    &id,
-                    &file,
-                    targets.as_deref(),
-                    &selected,
+                let options = api::ImportOptions {
+                    mapping: targets.as_deref(),
+                    sheet: &selected,
                     commit,
-                    &mode,
-                    &match_field,
+                    mode: &mode,
+                    match_field: &match_field,
                     has_headers,
-                )
-                .await
-                {
+                };
+                match api::import_file(&id, &file, options).await {
                     Ok(next) => {
                         mapping.set(next.mapping.clone());
                         sheet_state.set(next.sheet.clone());

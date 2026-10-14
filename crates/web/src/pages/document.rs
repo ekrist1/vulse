@@ -247,13 +247,11 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
                             && f.kind == field.kind
                             && f.items == field.items
                             && f.collection == field.collection
-                    }) {
-                        if draft.inputs.get(old) != draft.baseline.get(old) {
-                            if let Some(value) = draft.inputs.get(old) {
+                    })
+                        && draft.inputs.get(old) != draft.baseline.get(old)
+                            && let Some(value) = draft.inputs.get(old) {
                                 next[index] = value.clone();
                             }
-                        }
-                    }
                 }
                 inputs.set(next);
                 pending.set(None);
@@ -326,20 +324,18 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
                         version.set(Some(document.updated_at.clone()));
                         baseline.set(submitted.clone());
                         current.set(Some(document.clone()));
-                        if *latest.borrow() == submitted {
-                            if let Err(e) = crate::drafts::clear(&key) {
+                        if *latest.borrow() == submitted
+                            && let Err(e) = crate::drafts::clear(&key) {
                                 storage_error.set(e);
                             }
-                        }
                         status.set("Record saved".into());
-                        if doc_id == "new" {
-                            if let Some(navigator) = navigator {
+                        if doc_id == "new"
+                            && let Some(navigator) = navigator {
                                 navigator.push(&Route::Document {
                                     id,
                                     doc_id: document.id,
                                 });
                             }
-                        }
                     }
                     Err(err) => error.set(err),
                 }

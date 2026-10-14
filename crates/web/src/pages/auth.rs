@@ -236,12 +236,11 @@ fn take_fragment_token() -> String {
         .find_map(|part| part.strip_prefix("token="))
         .unwrap_or("")
         .to_string();
-    if !token.is_empty() {
-        if let Ok(history) = window.history() {
+    if !token.is_empty()
+        && let Ok(history) = window.history() {
             let _ =
                 history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/accept"));
         }
-    }
     token
 }
 

@@ -272,6 +272,7 @@ pub async fn import_file(
     commit: bool,
     mode: &str,
     match_field: &str,
+    has_headers: bool,
 ) -> Result<vulse_model::ImportResult, String> {
     let form = FormData::new().map_err(|e| format!("{e:?}"))?;
     form.append_with_blob_and_filename("file", file, &file.name())
@@ -281,6 +282,8 @@ pub async fn import_file(
     form.append_with_str("match_field", match_field)
         .map_err(|e| format!("{e:?}"))?;
     form.append_with_str("sheet", sheet)
+        .map_err(|e| format!("{e:?}"))?;
+    form.append_with_str("has_headers", if has_headers { "true" } else { "false" })
         .map_err(|e| format!("{e:?}"))?;
     form.append_with_str("commit", if commit { "true" } else { "false" })
         .map_err(|e| format!("{e:?}"))?;

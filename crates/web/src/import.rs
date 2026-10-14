@@ -21,6 +21,7 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
     let completed = use_state(|| false);
     let mode = use_state(|| "append".to_string());
     let match_field = use_state(String::new);
+    let has_headers = use_state(|| true);
     let run = {
         let file = file.clone();
         let result = result.clone();
@@ -32,6 +33,7 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
         let success = success.clone();
         let mode = mode.clone();
         let match_field = match_field.clone();
+        let has_headers = has_headers.clone();
         let completed = completed.clone();
         let id = props.collection.id.clone();
         Callback::from(move |commit: bool| {
@@ -60,6 +62,7 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
             let success = success.clone();
             let mode = (*mode).clone();
             let match_field = (*match_field).clone();
+            let has_headers = *has_headers;
             let completed = completed.clone();
             let id = id.clone();
             wasm_bindgen_futures::spawn_local(async move {
@@ -71,6 +74,7 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
                     commit,
                     &mode,
                     &match_field,
+                    has_headers,
                 )
                 .await
                 {
@@ -116,7 +120,8 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
         <section class="card import-panel">
             <div class="section-heading"><div><p class="eyebrow">{"BRING YOUR DATA"}</p><h2>{"From spreadsheet to collection"}</h2><p class="muted">{"Choose a file, map its columns, and review before importing."}</p></div><span class="badge">{"CSV · XLSX"}</span></div>
             <ol class="steps"><li class="active">{"1. Upload"}</li><li class={if result.is_some(){"active"}else{""}}>{"2. Map & validate"}</li><li class={if *validated || *completed{"active"}else{""}}>{"3. Import"}</li></ol>
-            <label class="upload-zone"><strong>{"Choose your spreadsheet"}</strong><span class="muted">{"First row: column headers. Up to 50 MB, 50,000 rows and 200 columns."}</span><input type="file" accept=".csv,.xlsx" disabled={*busy} onchange={on_file}/></label>
+            <label class="upload-zone"><strong>{"Choose your spreadsheet"}</strong><span class="muted">{"Up to 50 MB, 50,000 rows and 200 columns."}</span><input type="file" accept=".csv,.xlsx" disabled={*busy} onchange={on_file}/></label>
+            <label class="check"><input type="checkbox" checked={*has_headers} disabled={*busy||*completed} onchange={Callback::from({let has_headers=has_headers.clone();let result=result.clone();let mapping=mapping.clone();let validated=validated.clone();move |e:Event|{has_headers.set(e.target_unchecked_into::<HtmlInputElement>().checked());result.set(None);mapping.set(vec![]);validated.set(false);}})}/>{"First row contains column headers"}</label>
             <div class="field-metadata"><label>{"Import behavior"}<select aria-label="Import behavior" disabled={*busy||*completed} onchange={Callback::from({let mode=mode.clone();let validated=validated.clone();move |e:Event|{mode.set(e.target_unchecked_into::<HtmlSelectElement>().value());validated.set(false);}})}><option value="append" selected={*mode=="append"}>{"Add new records"}</option><option value="upsert" selected={*mode=="upsert"}>{"Create or update by a unique field"}</option></select></label>
             if *mode=="upsert"{<label>{"Match existing records by"}<select aria-label="Match existing records by" disabled={*busy||*completed} onchange={Callback::from({let match_field=match_field.clone();let validated=validated.clone();move |e:Event|{match_field.set(e.target_unchecked_into::<HtmlSelectElement>().value());validated.set(false);}})}><option value="" selected={match_field.is_empty()}>{"Choose a unique field, such as SKU or email"}</option>{for props.collection.blueprint.fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number)).map(|f|html!{<option value={f.name.clone()} selected={*match_field==f.name}>{f.display_label()}</option>})}</select></label>}
             </div>

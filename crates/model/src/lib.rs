@@ -27,8 +27,9 @@ pub use summary::{
 };
 
 pub use blueprint::{
-    ArrayItems, Blueprint, CheckedDocument, DocumentRef, FieldDef, FieldType, record_title,
-    reference_collections, take_field_renames, validate_blueprint, validate_document,
+    ArrayItems, Blueprint, CheckedDocument, DocumentRef, FieldDef, FieldType, MAX_FIELD_OPTIONS,
+    MAX_OPTION_LENGTH, record_title, reference_collections, take_field_renames,
+    take_option_renames, validate_blueprint, validate_document,
 };
 pub use identity::{
     check_collection_name, check_email, check_handle, check_key_name, check_password, is_date,

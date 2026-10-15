@@ -154,7 +154,16 @@ impl Conn {
         self.execute(if write { "BEGIN IMMEDIATE" } else { "BEGIN" }, &[])
             .await?;
         self.begin_changes();
-        match f(self).await {
+        let result = match f(self).await {
+            // Collections reading the changed ones get current values in the
+            // same transaction.
+            Ok(value) => crate::records::refresh_readers(self, &self.pending_changes())
+                .await
+                .map(|()| value)
+                .map_err(Into::into),
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(value) => match self.execute("COMMIT", &[]).await {
                 Ok(_) => {
                     self.end_changes(true);
@@ -172,6 +181,14 @@ impl Conn {
                 Err(error)
             }
         }
+    }
+    /// Collections changed so far in the open transaction.
+    fn pending_changes(&self) -> std::collections::BTreeSet<String> {
+        self.changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
     }
     pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> anyhow::Result<u64> {
         let result = match &self.inner {

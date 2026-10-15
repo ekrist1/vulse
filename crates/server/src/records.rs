@@ -52,6 +52,51 @@ pub async fn rebuild_all_tables(conn: &Conn) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Rewrites the record tables of collections whose formulas read one of the
+/// `changed` collections, so their filters, sorting and summaries use the
+/// other collections' current data.
+pub(crate) async fn refresh_readers(
+    conn: &Conn,
+    changed: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for id in changed {
+        // A deleted collection has no readers; deleting one that is read is refused.
+        if let Some(collection) = store::find_collection(conn, id).await? {
+            names.insert(collection.name);
+        }
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut readers = std::collections::BTreeSet::new();
+    for name in &names {
+        // Collection names are slugs, so the reference appears verbatim in
+        // the stored blueprint; `lookup_references` confirms each match.
+        for row in conn
+            .query(
+                "SELECT id FROM collections WHERE instr(blueprint, ?1) > 0",
+                &[text(&format!("[{name}."))],
+            )
+            .await?
+        {
+            readers.insert(text_at(&row, 0)?);
+        }
+    }
+    for id in readers {
+        let Some(collection) = store::find_collection(conn, &id).await? else {
+            continue;
+        };
+        let reads_changed = vulse_model::lookup_references(&collection.blueprint)
+            .iter()
+            .any(|(name, _)| names.contains(name));
+        if reads_changed {
+            let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+            crate::rows::refresh(conn, &collection.id, &collection.blueprint, &lookups).await?;
+        }
+    }
+    Ok(())
+}
 pub async fn sync_stored_document(
     conn: &Conn,
     collection: &str,
@@ -435,6 +480,45 @@ pub async fn delete_view(
 }
 
 /// Points saved views' filters, sorting, grouping and columns at renamed fields.
+/// Saved view filters that compare a field with a renamed allowed value
+/// compare with the new value.
+pub async fn rename_view_values(
+    conn: &Conn,
+    collection: &str,
+    renames: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) -> anyhow::Result<()> {
+    for row in conn
+        .query(
+            "SELECT id,config FROM collection_views WHERE collection_id=?1",
+            &[text(collection)],
+        )
+        .await?
+    {
+        let mut config: SavedViewWrite = serde_json::from_str(&text_at(&row, 1)?)?;
+        let mut changed = false;
+        for filter in &mut config.query.filters {
+            let next = renames
+                .get(&filter.field)
+                .zip(filter.value.as_str())
+                .and_then(|(values, value)| values.get(value));
+            if let Some(next) = next {
+                filter.value = serde_json::Value::String(next.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE collection_views SET config=?1 WHERE id=?2",
+                &[
+                    text(&serde_json::to_string(&config)?),
+                    text(&text_at(&row, 0)?),
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
 pub async fn rename_view_fields(
     conn: &Conn,
     collection: &str,

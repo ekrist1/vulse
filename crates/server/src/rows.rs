@@ -245,6 +245,30 @@ pub(crate) async fn rebuild(
     lookups: &Lookups,
 ) -> anyhow::Result<()> {
     create_table(conn, collection_id, blueprint).await?;
+    fill(conn, collection_id, blueprint, lookups, "INSERT").await?;
+    // Building indexes over a full table is faster than updating them per row.
+    create_indexes(conn, collection_id, blueprint).await
+}
+
+/// Rewrites every row from the record bodies, keeping the table and its
+/// indexes, for values calculated from other collections that changed.
+pub(crate) async fn refresh(
+    conn: &Conn,
+    collection_id: &str,
+    blueprint: &Blueprint,
+    lookups: &Lookups,
+) -> anyhow::Result<()> {
+    fill(conn, collection_id, blueprint, lookups, "INSERT OR REPLACE").await
+}
+
+/// Writes a row per record with `insert`, in batches.
+async fn fill(
+    conn: &Conn,
+    collection_id: &str,
+    blueprint: &Blueprint,
+    lookups: &Lookups,
+    insert: &str,
+) -> anyhow::Result<()> {
     let names = columns(blueprint);
     let rows = conn
         .query(
@@ -269,7 +293,7 @@ pub(crate) async fn rebuild(
         }
         conn.execute(
             &format!(
-                "INSERT INTO {} ({}) VALUES {}",
+                "{insert} INTO {} ({}) VALUES {}",
                 table(collection_id),
                 names.join(", "),
                 tuples.join(", ")
@@ -278,6 +302,5 @@ pub(crate) async fn rebuild(
         )
         .await?;
     }
-    // Building indexes over a full table is faster than updating them per row.
-    create_indexes(conn, collection_id, blueprint).await
+    Ok(())
 }

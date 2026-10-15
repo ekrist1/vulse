@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use vulse_model::{
     Blueprint, CollectionView, CreateCollection, DocumentView, DocumentWrite, FieldType, Page,
     UpdateCollection, check_collection_name, page_bounds, reference_collections,
-    take_field_renames, validate_blueprint, validate_document,
+    take_field_renames, take_option_renames, validate_blueprint, validate_document,
 };
 
 use crate::auth::{AuthUser, Editor, Principal, SchemaAdmin, require_collection};
@@ -125,6 +125,9 @@ pub async fn update_collection(
             // Renamed fields keep their values, formulas, title and views.
             let renames =
                 take_field_renames(&mut blueprint, &current.blueprint).map_err(AppError::bad)?;
+            // Renamed allowed values move in the records holding them.
+            let value_renames = take_option_renames(&mut blueprint, &current.blueprint, &renames)
+                .map_err(AppError::bad)?;
             retarget_self(&mut blueprint, &current.name, &name);
             crate::lookups::rename(&mut blueprint, &current.name, &name, &renames);
             prepare_blueprint(&blueprint, &name)?;
@@ -178,6 +181,17 @@ pub async fn update_collection(
                             renamed = true;
                         }
                     }
+                    let mut values_renamed = false;
+                    for (field, values) in &value_renames {
+                        let next = object
+                            .get(field)
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| values.get(value));
+                        if let Some(next) = next {
+                            object.insert(field.clone(), serde_json::Value::String(next.clone()));
+                            values_renamed = true;
+                        }
+                    }
                     let mut changed = false;
                     for field in &removed {
                         if let Some(value) = object.remove(field) {
@@ -217,11 +231,13 @@ pub async fn update_collection(
                     if changed {
                         holders.push(doc.clone());
                     }
-                    if changed || renamed || converted {
+                    if changed || renamed || converted || values_renamed {
                         let action = if converted {
                             "fields converted"
                         } else if renamed {
                             "fields renamed"
+                        } else if values_renamed {
+                            "values renamed"
                         } else {
                             "fields removed"
                         };
@@ -310,6 +326,9 @@ pub async fn update_collection(
             }
             if !renames.is_empty() {
                 crate::records::rename_view_fields(conn, &id, &renames).await?;
+            }
+            if !value_renames.is_empty() {
+                crate::records::rename_view_values(conn, &id, &value_renames).await?;
             }
             // References and formulas elsewhere follow the new names.
             if name != current.name || !renames.is_empty() {

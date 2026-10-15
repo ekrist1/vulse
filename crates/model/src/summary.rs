@@ -314,6 +314,8 @@ fn formula_blueprint(spec: &SummarySpec) -> Blueprint {
                 collection: None,
                 items: None,
                 renamed_from: None,
+                options: None,
+                renamed_options: None,
             })
             .collect(),
     }

@@ -66,6 +66,10 @@ pub fn record_cell(props: &CellProps) -> Html {
                 }
                 FieldType::Boolean => serde_json::json!(draft.eq_ignore_ascii_case("true")),
                 FieldType::Date if draft.is_empty() => serde_json::Value::Null,
+                // No choice clears a value limited to allowed values.
+                FieldType::String if field.options.is_some() && draft.is_empty() => {
+                    serde_json::Value::Null
+                }
                 _ => serde_json::json!((*draft).clone()),
             };
             let body = DocumentPatch {
@@ -106,6 +110,7 @@ pub fn record_cell(props: &CellProps) -> Html {
     html! {<td class={if calculated_error.is_some(){"cell-error"}else if props.field.kind==FieldType::Calculated{"cell-calculated"}else{""}} title={calculated_error.cloned().unwrap_or_else(||value.clone())}>
         if *editing {<div class="inline-cell">
             if props.field.kind==FieldType::Boolean {<select aria-label={format!("Edit {}",props.field.display_label())} disabled={*busy} onchange={Callback::from({let draft=draft.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();draft.set(input.value());}})}><option value="true" selected={draft.eq_ignore_ascii_case("true")}>{"True"}</option><option value="false" selected={!draft.eq_ignore_ascii_case("true")}>{"False"}</option></select>}
+            else if let Some(options)=props.field.options.clone() {<crate::form::OptionSelect label={format!("Edit {}",props.field.display_label())} {options} value={(*draft).clone()} disabled={*busy} on_change={Callback::from({let draft=draft.clone();move |value:String|draft.set(value)})}/>}
             else {<input aria-label={format!("Edit {}",props.field.display_label())} type={match props.field.kind{FieldType::Number=>"number",FieldType::Date=>"date",_=>"text"}} step="any" disabled={*busy} value={(*draft).clone()} oninput={Callback::from({let draft=draft.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();draft.set(input.value());}})} onkeydown={Callback::from({let save=save.clone();let cancel=cancel.clone();move |e:KeyboardEvent|{if e.key()=="Enter"{e.prevent_default();save.emit(());}else if e.key()=="Escape"{e.prevent_default();cancel.emit(());}}})}/>}
             <div class="row"><button type="button" class="secondary" disabled={*busy} aria-label={format!("Save {} cell",props.field.display_label())} onclick={Callback::from(move |_|save.emit(()))}>{"Save"}</button><button type="button" class="text-button" disabled={*busy} onclick={Callback::from(move |_|cancel.emit(()))}>{"Cancel"}</button></div>
             if !error.is_empty(){<p class="error" role="alert">{(*error).clone()}</p>}

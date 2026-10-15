@@ -4357,6 +4357,336 @@ async fn views_hear_about_changes_to_their_collection_and_what_it_shows() {
 }
 
 #[tokio::test]
+async fn allowed_values_are_enforced_and_renames_move_records_and_views() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "options@example.com", "options").await;
+    let field = |options: Value| json!({"name":"status","type":"string","options":options});
+    // Allowed values are checked when fields are saved.
+    for (bad, message) in [
+        (json!([]), "1 to 500"),
+        (json!(["Ja", "ja"]), "more than once"),
+        (json!([" Ja"]), "spaces"),
+    ] {
+        let response = app
+            .call(
+                "POST",
+                "/api/v1/collections",
+                Some(&cookie),
+                None,
+                Some(json!({"name":"bad","visibility":"private","blueprint":{"fields":[field(bad)]}})),
+            )
+            .await;
+        let (status, error) = json_of::<ApiErrorBody>(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains(message), "{}", error.error);
+    }
+    let response = app
+        .call(
+            "POST",
+            "/api/v1/collections",
+            Some(&cookie),
+            None,
+            Some(json!({"name":"bad","visibility":"private","blueprint":{"fields":[{"name":"n","type":"number","options":["1"]}]}})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let municipalities = create_collection(
+        &app,
+        &cookie,
+        "municipalities",
+        "private",
+        json!({"fields":[{"name":"name","type":"string"},field(json!(["Funded","Underfunded"]))]}),
+    )
+    .await;
+    let collection = format!("/api/v1/collections/{}", municipalities.id);
+    let oslo = create_document(
+        &app,
+        &cookie,
+        &municipalities.id,
+        json!({"name":"Oslo","status":"Underfunded"}),
+    )
+    .await;
+    create_document(
+        &app,
+        &cookie,
+        &municipalities.id,
+        json!({"name":"Bergen","status":"Funded"}),
+    )
+    .await;
+    create_document(&app, &cookie, &municipalities.id, json!({"name":"Moss"})).await;
+    // Values must match exactly; leaving an optional value out is fine.
+    for bad in ["underfunded", "Other", ""] {
+        let response = app
+            .call(
+                "POST",
+                &format!("{collection}/documents"),
+                Some(&cookie),
+                None,
+                Some(json!({"body":{"name":"X","status":bad}})),
+            )
+            .await;
+        let (status, error) = json_of::<ApiErrorBody>(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("allowed values"), "{}", error.error);
+    }
+    let (status, _) = json_of::<vulse_model::SavedView>(
+        app.call(
+            "POST",
+            &format!("{collection}/views"),
+            Some(&cookie),
+            None,
+            Some(json!({"name":"Needs funding","query":{"filters":[{"field":"status","op":"eq","value":"Underfunded"}]},"columns":["name","status"]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let patch = |blueprint: Value| {
+        let app = &app;
+        let cookie = cookie.clone();
+        let collection = collection.clone();
+        async move {
+            let response = app
+                .call(
+                    "PATCH",
+                    &collection,
+                    Some(&cookie),
+                    None,
+                    Some(json!({"blueprint":blueprint})),
+                )
+                .await;
+            json_of::<Value>(response).await
+        }
+    };
+    // Removing a value that records hold is refused with those records.
+    let (status, error) =
+        patch(json!({"fields":[{"name":"name","type":"string"},field(json!(["Funded"]))]})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["document_ids"], json!([oslo.id]));
+    // Renames must name saved values and new allowed values.
+    for renamed in [
+        json!({"Missing":"Funded"}),
+        json!({"Underfunded":"Elsewhere"}),
+        json!({"Underfunded":"Funded","Funded":"Fine"}),
+    ] {
+        let mut status_field = field(json!(["Funded", "Fine"]));
+        status_field["renamed_options"] = renamed;
+        let (status, _) =
+            patch(json!({"fields":[{"name":"name","type":"string"},status_field]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // Renaming a value, together with the field, moves records and views.
+    let (status, saved) = patch(json!({"fields":[
+        {"name":"name","type":"string"},
+        {"name":"funding","type":"string","renamed_from":"status",
+         "options":["Funded","Needs funding"],"renamed_options":{"Underfunded":"Needs funding"}}
+    ]}))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert!(
+        saved["blueprint"]["fields"][1]
+            .get("renamed_options")
+            .is_none()
+    );
+    let (_, record) = json_of::<DocumentView>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}", oslo.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        record.body,
+        json!({"name":"Oslo","funding":"Needs funding"})
+    );
+    let (_, views) = json_of::<Vec<vulse_model::SavedView>>(
+        app.call(
+            "GET",
+            &format!("{collection}/views"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(views[0].config.query.filters[0].field, "funding");
+    assert_eq!(
+        views[0].config.query.filters[0].value,
+        json!("Needs funding")
+    );
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &format!("{collection}/query"),
+            Some(&cookie),
+            None,
+            Some(json!(views[0].config.query)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 1);
+    let (_, revisions) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}/revisions", oslo.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(revisions.items[0].action, "fields renamed");
+
+    // A value rename alone; merging two values into one is allowed.
+    let (status, _) = patch(json!({"fields":[
+        {"name":"name","type":"string"},
+        {"name":"funding","type":"string","options":["Status known"],
+         "renamed_options":{"Funded":"Status known","Needs funding":"Status known"}}
+    ]}))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, revisions) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("{collection}/documents/{}/revisions", oslo.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(revisions.items[0].action, "values renamed");
+    assert_eq!(revisions.items[0].body["funding"], json!("Status known"));
+    // Dropping the list keeps the values as free text.
+    let (status, _) = patch(
+        json!({"fields":[{"name":"name","type":"string"},{"name":"funding","type":"string"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn filters_and_sorting_follow_changes_in_collections_formulas_read() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "readers@example.com", "readers").await;
+    let reports = create_collection(
+        &app,
+        &cookie,
+        "reports",
+        "private",
+        json!({"fields":[{"name":"org","type":"string"},{"name":"fte","type":"number"}]}),
+    )
+    .await;
+    let orgs = create_collection(
+        &app,
+        &cookie,
+        "orgs",
+        "private",
+        json!({"fields":[{"name":"org","type":"string"},{"name":"fte","type":"calculated","formula":"=SUMIFS([reports.fte],[reports.org],[org])"}]}),
+    )
+    .await;
+    // Reads its own collection: each record's share of the total.
+    let shares = create_collection(
+        &app,
+        &cookie,
+        "shares",
+        "private",
+        json!({"fields":[{"name":"name","type":"string"},{"name":"amount","type":"number"},{"name":"share","type":"calculated","formula":"=[amount]/SUM([shares.amount])"}]}),
+    )
+    .await;
+    create_document(&app, &cookie, &orgs.id, json!({"org":"a"})).await;
+    create_document(&app, &cookie, &orgs.id, json!({"org":"b"})).await;
+    let query = |collection: String, field: &'static str, filters: Value| {
+        let app = &app;
+        let cookie = cookie.clone();
+        async move {
+            let response = app
+                .call(
+                    "POST",
+                    &format!("/api/v1/collections/{collection}/query"),
+                    Some(&cookie),
+                    None,
+                    Some(json!({"filters":filters,"sort_field":field,"descending":true})),
+                )
+                .await;
+            let (status, page) = json_of::<vulse_model::RecordPage>(response).await;
+            assert_eq!(status, StatusCode::OK);
+            page.items
+                .iter()
+                .map(|d| d.body[if field == "fte" { "org" } else { "name" }].clone())
+                .collect::<Vec<_>>()
+        }
+    };
+    let busy = || json!([{"field":"fte","op":"gte","value":5}]);
+
+    // The orgs were saved before any reports existed.
+    create_document(&app, &cookie, &reports.id, json!({"org":"a","fte":3})).await;
+    let b = create_document(&app, &cookie, &reports.id, json!({"org":"b","fte":6})).await;
+    assert_eq!(query(orgs.id.clone(), "fte", busy()).await, [json!("b")]);
+    assert_eq!(
+        query(orgs.id.clone(), "fte", json!([])).await,
+        [json!("b"), json!("a")]
+    );
+
+    let response = app
+        .call(
+            "PUT",
+            &format!("/api/v1/collections/{}/documents/{}", reports.id, b.id),
+            Some(&cookie),
+            None,
+            Some(json!({"body":{"org":"b","fte":1}})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        query(orgs.id.clone(), "fte", busy()).await,
+        Vec::<Value>::new()
+    );
+    assert_eq!(
+        query(orgs.id.clone(), "fte", json!([])).await,
+        [json!("a"), json!("b")]
+    );
+
+    create_document(&app, &cookie, &reports.id, json!({"org":"b","fte":5})).await;
+    let response = app
+        .call(
+            "DELETE",
+            &format!("/api/v1/collections/{}/documents/{}", reports.id, b.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(query(orgs.id.clone(), "fte", busy()).await, [json!("b")]);
+
+    // A new record changes the share of the records saved before it.
+    create_document(&app, &cookie, &shares.id, json!({"name":"x","amount":1})).await;
+    create_document(&app, &cookie, &shares.id, json!({"name":"y","amount":3})).await;
+    let half = || json!([{"field":"share","op":"gte","value":0.5}]);
+    assert_eq!(
+        query(shares.id.clone(), "share", half()).await,
+        [json!("y")]
+    );
+    create_document(&app, &cookie, &shares.id, json!({"name":"z","amount":4})).await;
+    assert_eq!(
+        query(shares.id.clone(), "share", half()).await,
+        [json!("z")]
+    );
+}
+
+#[tokio::test]
 async fn sql_reads_through_the_record_table_match_full_evaluation() {
     let app = TestApp::new().await;
     let (cookie, _) = register(&app, "narrow@example.com", "narrow").await;

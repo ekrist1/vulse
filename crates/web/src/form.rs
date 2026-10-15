@@ -323,6 +323,10 @@ fn field_control(props: &FieldControlProps) -> Html {
 
 fn control(props: &FieldControlProps) -> Html {
     match (&props.field.kind, &props.input) {
+        (FieldType::String, ValueInput::String(value)) if props.field.options.is_some() => {
+            let on_change = props.on_change.clone();
+            html! { <OptionSelect label={props.field.display_label().to_string()} options={props.field.options.clone().unwrap_or_default()} value={value.clone()} on_change={Callback::from(move |value| on_change.emit(ValueInput::String(value)))} /> }
+        }
         (FieldType::String, ValueInput::String(value)) => {
             let on_change = props.on_change.clone();
             html! { <input placeholder={props.field.example.clone().unwrap_or_default()} aria-label={props.field.display_label().to_string()} value={value.clone()} oninput={Callback::from(move |event: InputEvent| {
@@ -394,6 +398,38 @@ fn control(props: &FieldControlProps) -> Html {
             />
         },
         _ => html! { <p class="error">{"This value does not match the field."}</p> },
+    }
+}
+
+#[derive(Properties, PartialEq)]
+pub struct OptionSelectProps {
+    pub label: String,
+    pub options: Vec<String>,
+    pub value: String,
+    pub on_change: Callback<String>,
+    #[prop_or_default]
+    pub disabled: bool,
+}
+
+/// A dropdown of a field's allowed values. The empty choice means no value.
+/// A stored value that is no longer allowed stays visible until changed.
+#[function_component(OptionSelect)]
+pub fn option_select(props: &OptionSelectProps) -> Html {
+    let on_change = props.on_change.clone();
+    let stale = !props.value.is_empty() && !props.options.contains(&props.value);
+    html! {
+        <select aria-label={props.label.clone()} disabled={props.disabled} onchange={Callback::from(move |event: Event| {
+            let element: web_sys::HtmlSelectElement = event.target_unchecked_into();
+            on_change.emit(element.value());
+        })}>
+            <option value="" selected={props.value.is_empty()}>{"— None —"}</option>
+            if stale {
+                <option value={props.value.clone()} selected={true}>{format!("{} (not allowed)", props.value)}</option>
+            }
+            { for props.options.iter().map(|option| html! {
+                <option value={option.clone()} selected={*option == props.value}>{option.clone()}</option>
+            }) }
+        </select>
     }
 }
 

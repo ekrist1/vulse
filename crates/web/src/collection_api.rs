@@ -66,7 +66,10 @@ fn sample_body(collection: &CollectionView) -> Value {
     for field in &collection.blueprint.fields {
         let value = match field.kind {
             FieldType::Calculated => continue,
-            FieldType::String => json!("Example"),
+            FieldType::String => match field.options.as_ref().and_then(|o| o.first()) {
+                Some(option) => json!(option),
+                None => json!("Example"),
+            },
             FieldType::Number => json!(42),
             FieldType::Boolean => json!(true),
             FieldType::Date => json!("2026-10-11"),
@@ -309,7 +312,7 @@ pub fn collection_api(props: &CollectionApiProps) -> Html {
         if collection.visibility==Visibility::Public {<p>{"This collection is public. Anyone can read its records and asset content without authentication. Public endpoints support cross-origin GET requests."}</p><CodeExample title="Public list request" text={curl("GET",&format!("{public}?limit=50&offset=0"),None,false)}/><p>{"The response has the same paginated shape as the authenticated list."}</p><CodeExample title="Public record and asset URLs" text={format!("GET {public}/DOCUMENT_ID\nGET {public}/assets/ASSET_ID")}/>}
         else {<p>{"This collection is private. Public endpoints return 404. Change visibility in Settings if you want unauthenticated read access."}</p>}
       </section>
-      <section class="card"><h3>{"Validation and errors"}</h3><p>{"Send numbers and booleans as JSON values, dates as \"YYYY-MM-DD\" strings, references and assets as UUID strings, and rich text as Portable Text arrays. The editor uses Tiptap; the stored API format remains Portable Text."}</p><div class="table-scroll"><table><tbody>{for [("400","Invalid JSON, schema, fields, references, or query parameters"),("401","Missing or invalid credentials"),("403","Your role or the API key's role or scope does not permit this action, or a browser sent a cross-site request"),("404","Collection, record, or asset not found or inaccessible"),("409","Stale edit, invalid schema change, blocked deletion or undo conflict"),("413","Request exceeds the upload or JSON size limit")].iter().map(|(code,description)|html!{<tr><th>{*code}</th><td>{*description}</td></tr>})}</tbody></table></div><CodeExample title="Example error response" text={pretty(&json!({"error":"Example validation message"}))}/><p class="muted">{"JSON writes are limited to 1 MB. A schema conflict can also include document_ids to identify incompatible records. Responses above are illustrative, generated from your current schema."}</p></section>
+      <section class="card"><h3>{"Validation and errors"}</h3><p>{"Send numbers and booleans as JSON values, dates as \"YYYY-MM-DD\" strings, references and assets as UUID strings, and rich text as Portable Text arrays. The editor uses Tiptap; the stored API format remains Portable Text."}</p>{for props.collection.blueprint.fields.iter().filter_map(|f|Some((f,f.options.as_ref()?))).map(|(f,options)|html!{<p>{format!("{} accepts only these exact values: {}.",f.name,options.iter().map(|o|format!("\"{o}\"")).collect::<Vec<_>>().join(", "))}</p>})}<div class="table-scroll"><table><tbody>{for [("400","Invalid JSON, schema, fields, references, or query parameters"),("401","Missing or invalid credentials"),("403","Your role or the API key's role or scope does not permit this action, or a browser sent a cross-site request"),("404","Collection, record, or asset not found or inaccessible"),("409","Stale edit, invalid schema change, blocked deletion or undo conflict"),("413","Request exceeds the upload or JSON size limit")].iter().map(|(code,description)|html!{<tr><th>{*code}</th><td>{*description}</td></tr>})}</tbody></table></div><CodeExample title="Example error response" text={pretty(&json!({"error":"Example validation message"}))}/><p class="muted">{"JSON writes are limited to 1 MB. A schema conflict can also include document_ids to identify incompatible records. Responses above are illustrative, generated from your current schema."}</p></section>
     </div>}
 }
 

@@ -478,7 +478,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 if *tab=="data" {<crate::records::RecordsPanel key={item.id.clone()} collection={item.clone()} collections={(*collections).clone()}/>}
                 if *tab=="fields" {<fieldset class="draft-fields" disabled={*busy||pending.is_some()}>
                     <div class="section-heading"><div><h2>{"Shape your collection"}</h2><p class="muted">{"Choose the fields each record contains. Calculated fields update automatically."}</p></div><button disabled={*busy} onclick={on_save.clone()}>{if *busy{"Saving…"}else{"Save fields"}}</button></div>
-                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
+                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} saved_options={item.blueprint.fields.iter().filter_map(|f|Some((f.name.clone(),f.options.clone()?))).collect::<std::collections::BTreeMap<_,_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
                 </fieldset>}
                 if *tab=="import" {<ImportPanel key={props.id.clone()} collection={item.clone()} on_import={Callback::from({let refresh=refresh.clone();move |_|refresh.set(*refresh+1)})}/>}
                 if *tab=="api" {<CollectionApi collection={item.clone()}/>}
@@ -499,6 +499,8 @@ struct BlueprintEditorProps {
     current: String,
     /// Field names in the saved collection.
     saved_fields: Vec<String>,
+    /// Allowed values of saved fields, by saved field name.
+    saved_options: std::collections::BTreeMap<String, Vec<String>>,
     /// A saved field was removed after confirmation.
     on_removed: Callback<String>,
     /// A field name was committed: (previous name, new name).
@@ -528,6 +530,8 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                 items: None,
                 formula: None,
                 renamed_from: None,
+                options: None,
+                renamed_options: None,
             });
             on_change.emit(next);
         })
@@ -539,6 +543,17 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                 <p class="muted">{"Add your first field to start shaping your records."}</p>
             }
             { for props.fields.iter().enumerate().map(|(index, field)| {
+                let origin = field.renamed_from.clone().or_else(|| {
+                    // A saved name claimed by a renamed row belongs to that row.
+                    (props.saved_fields.contains(&field.name)
+                        && !props.fields.iter().any(|f| f.renamed_from.as_deref() == Some(field.name.as_str())))
+                    .then(|| field.name.clone())
+                });
+                let saved_options = origin
+                    .as_ref()
+                    .and_then(|name| props.saved_options.get(name))
+                    .cloned()
+                    .unwrap_or_default();
                 html! {
                     <FieldRow
                         key={index}
@@ -549,12 +564,8 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                         collections={props.collections.clone()}
                         current={props.current.clone()}
                         fields={props.fields.clone()}
-                        origin={field.renamed_from.clone().or_else(|| {
-                            // A saved name claimed by a renamed row belongs to that row.
-                            (props.saved_fields.contains(&field.name)
-                                && !props.fields.iter().any(|f| f.renamed_from.as_deref() == Some(field.name.as_str())))
-                            .then(|| field.name.clone())
-                        })}
+                        {origin}
+                        {saved_options}
                         on_removed={props.on_removed.clone()}
                         on_renamed={props.on_renamed.clone()}
                         on_change={props.on_change.clone()}
@@ -577,6 +588,8 @@ struct FieldRowProps {
     fields: Vec<FieldDef>,
     /// The saved field this row edits, under its saved name, if any.
     origin: Option<String>,
+    /// The saved field's allowed values.
+    saved_options: Vec<String>,
     on_removed: Callback<String>,
     on_renamed: Callback<(String, String)>,
     on_change: Callback<Vec<FieldDef>>,
@@ -745,6 +758,10 @@ fn field_row(props: &FieldRowProps) -> Html {
                             None
                         };
                         next.formula = if next.kind == FieldType::Calculated {Some(String::new())} else {None};
+                        if next.kind != FieldType::String {
+                            next.options = None;
+                            next.renamed_options = None;
+                        }
                         if next.kind == FieldType::Calculated {next.required=false;}
                         patch.emit(next);
                     }
@@ -815,6 +832,9 @@ fn field_row(props: &FieldRowProps) -> Html {
                     </select>
                 </label>
             }
+            if field.kind == FieldType::String {
+                <OptionsEditor field={field.clone()} saved={props.saved_options.clone()} records={props.records.clone()} origin={props.origin.clone()} on_change={patch.clone()}/>
+            }
             if field.kind == FieldType::Calculated {
                 <FormulaEditor records={props.records.clone()} field={field.clone()} fields={props.fields.clone()} collections={props.collections.clone()} current={props.current.clone()} on_change={patch.clone()}/>
             }
@@ -829,6 +849,168 @@ fn field_row(props: &FieldRowProps) -> Html {
                 })}>{"Down"}</button>
                 <button type="button" class="danger" onclick={remove}>{"Remove"}</button>
             </div>
+        </div>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct OptionsEditorProps {
+    field: FieldDef,
+    /// The saved field's allowed values.
+    saved: Vec<String>,
+    records: Vec<DocumentView>,
+    origin: Option<String>,
+    on_change: Callback<FieldDef>,
+}
+
+/// Allowed values of a text field. Editing a saved value renames it: records
+/// holding it get the new value when the fields are saved.
+#[function_component(OptionsEditor)]
+fn options_editor(props: &OptionsEditorProps) -> Html {
+    let field = &props.field;
+    let options = field.options.clone().unwrap_or_default();
+    let renames = field.renamed_options.clone().unwrap_or_default();
+    // The saved value an option row started from, if any.
+    let origin_of = {
+        let renames = renames.clone();
+        let saved = props.saved.clone();
+        move |value: &str| -> Option<String> {
+            renames
+                .iter()
+                .find(|(_, to)| *to == value)
+                .map(|(from, _)| from.clone())
+                .or_else(|| {
+                    (saved.iter().any(|s| s == value) && !renames.contains_key(value))
+                        .then(|| value.to_string())
+                })
+        }
+    };
+    let emit = {
+        let field = field.clone();
+        let on_change = props.on_change.clone();
+        move |options: Option<Vec<String>>, renames: std::collections::BTreeMap<String, String>| {
+            let mut next = field.clone();
+            next.options = options;
+            next.renamed_options = (!renames.is_empty()).then_some(renames);
+            on_change.emit(next);
+        }
+    };
+    let toggle = {
+        let emit = emit.clone();
+        let records = props.records.clone();
+        let origin = props.origin.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if !input.checked() {
+                emit(None, Default::default());
+                return;
+            }
+            // Start from the values loaded records already hold.
+            let mut values: Vec<String> = Vec::new();
+            for record in &records {
+                if let Some(value) = origin
+                    .as_ref()
+                    .and_then(|name| record.body.get(name))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    && !values.iter().any(|v| v.eq_ignore_ascii_case(value))
+                    && values.len() < vulse_model::MAX_FIELD_OPTIONS
+                {
+                    values.push(value.to_string());
+                }
+            }
+            if values.is_empty() {
+                values.push(String::new());
+            }
+            emit(Some(values), Default::default());
+        })
+    };
+    let removed: Vec<String> = props
+        .saved
+        .iter()
+        .filter(|value| !options.contains(value) && !renames.contains_key(*value))
+        .cloned()
+        .collect();
+    html! {
+        <div class="field-options">
+            <label class="check">
+                <input type="checkbox" checked={field.options.is_some()} onchange={toggle} />
+                {"Limit to allowed values (shown as a dropdown)"}
+            </label>
+            if field.options.is_some() {
+                <ol class="option-list">
+                    { for options.iter().enumerate().map(|(index, value)| {
+                        let origin = origin_of(value);
+                        let edit = {
+                            let (options, renames, emit, origin) = (options.clone(), renames.clone(), emit.clone(), origin.clone());
+                            Callback::from(move |event: InputEvent| {
+                                let input: HtmlInputElement = event.target_unchecked_into();
+                                let text = input.value();
+                                let mut options = options.clone();
+                                let mut renames = renames.clone();
+                                if let Some(from) = &origin {
+                                    renames.remove(from);
+                                    if *from != text {
+                                        renames.insert(from.clone(), text.clone());
+                                    }
+                                }
+                                options[index] = text;
+                                emit(Some(options), renames);
+                            })
+                        };
+                        let shift = |delta: isize| {
+                            let (options, renames, emit) = (options.clone(), renames.clone(), emit.clone());
+                            Callback::from(move |_| {
+                                let target = index as isize + delta;
+                                if target >= 0 && (target as usize) < options.len() {
+                                    let mut options = options.clone();
+                                    options.swap(index, target as usize);
+                                    emit(Some(options), renames.clone());
+                                }
+                            })
+                        };
+                        let remove = {
+                            let (options, renames, emit, origin) = (options.clone(), renames.clone(), emit.clone(), origin.clone());
+                            Callback::from(move |_| {
+                                let mut options = options.clone();
+                                let mut renames = renames.clone();
+                                options.remove(index);
+                                if let Some(from) = &origin {
+                                    renames.remove(from);
+                                }
+                                emit(Some(options), renames);
+                            })
+                        };
+                        let renamed_from = origin.filter(|from| from != value);
+                        html! {
+                            <li key={index}>
+                                <div class="row">
+                                    <input aria-label={format!("Allowed value {}", index + 1)} maxlength={vulse_model::MAX_OPTION_LENGTH.to_string()} value={value.clone()} oninput={edit} />
+                                    <button type="button" class="secondary" aria-label={format!("Move allowed value {} up", index + 1)} disabled={index == 0} onclick={shift(-1)}>{"↑"}</button>
+                                    <button type="button" class="secondary" aria-label={format!("Move allowed value {} down", index + 1)} disabled={index + 1 == options.len()} onclick={shift(1)}>{"↓"}</button>
+                                    <button type="button" class="text-button" aria-label={format!("Remove allowed value {}", index + 1)} onclick={remove}>{"Remove"}</button>
+                                </div>
+                                if let Some(from) = renamed_from {
+                                    <span class="field-help">{format!("Renamed from “{from}”. Records with “{from}” get the new value when you save.")}</span>
+                                }
+                            </li>
+                        }
+                    }) }
+                </ol>
+                <button type="button" class="secondary" disabled={options.len() >= vulse_model::MAX_FIELD_OPTIONS} onclick={Callback::from({
+                    let (options, renames, emit) = (options.clone(), renames.clone(), emit.clone());
+                    move |_| {
+                        let mut options = options.clone();
+                        options.push(String::new());
+                        emit(Some(options), renames.clone());
+                    }
+                })}>{"Add value"}</button>
+                if !removed.is_empty() {
+                    <p class="field-help">{format!("Removed: {}. Saving is refused while records still use a removed value; change those records first, or rename the value instead.", removed.iter().map(|v| format!("“{v}”")).collect::<Vec<_>>().join(", "))}</p>
+                }
+                <p class="muted">{"Values must match exactly. Editing a saved value renames it in every record and saved view filter when you save. Earlier history versions keep the old value."}</p>
+            }
         </div>
     }
 }

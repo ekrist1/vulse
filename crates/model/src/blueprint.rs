@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +34,14 @@ pub struct FieldDef {
     pub collection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<ArrayItems>,
+    /// The allowed values of a text field, in the order a dropdown lists
+    /// them. A stored value must equal one of them exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    /// Only in schema updates: allowed values renamed, as saved value → new
+    /// value. Records holding a saved value get the new one. Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_options: Option<BTreeMap<String, String>>,
     /// Only in schema updates: the saved field this one renames. Its values,
     /// formula references, title setting and saved views move to `name`.
     /// Never stored.
@@ -56,6 +64,11 @@ pub enum FieldType {
     Reference,
     Array,
 }
+
+/// Allowed values one text field may list.
+pub const MAX_FIELD_OPTIONS: usize = 500;
+/// Characters in one allowed value.
+pub const MAX_OPTION_LENGTH: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +131,15 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
                 field.name
             ));
         }
+        if field.renamed_options.is_some() {
+            return Err(format!(
+                "{}: renamed_options is only accepted when changing a saved collection's fields",
+                field.name
+            ));
+        }
+        if let Some(options) = &field.options {
+            validate_options(field, options)?;
+        }
         match field.kind {
             FieldType::Reference => {
                 require_collection(field)?;
@@ -162,6 +184,108 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
             );
         }
     crate::validate_formulas(blueprint)
+}
+
+fn validate_options(field: &FieldDef, options: &[String]) -> Result<(), String> {
+    if field.kind != FieldType::String {
+        return Err(format!(
+            "{}: only text fields can have allowed values",
+            field.name
+        ));
+    }
+    if options.is_empty() || options.len() > MAX_FIELD_OPTIONS {
+        return Err(format!(
+            "{}: list 1 to {MAX_FIELD_OPTIONS} allowed values",
+            field.name
+        ));
+    }
+    let mut seen = HashSet::new();
+    for option in options {
+        if option.is_empty() || option.trim() != option {
+            return Err(format!(
+                "{}: allowed values must be nonempty, without spaces at the start or end",
+                field.name
+            ));
+        }
+        if option.chars().count() > MAX_OPTION_LENGTH {
+            return Err(format!(
+                "{}: allowed values can have at most {MAX_OPTION_LENGTH} characters",
+                field.name
+            ));
+        }
+        // Filters compare text case-insensitively, so "Ja" and "ja" would mix.
+        if !seen.insert(option.to_lowercase()) {
+            return Err(format!(
+                "{}: “{option}” is listed more than once (ignoring case)",
+                field.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Takes the `renamed_options` markers out of an updated blueprint and
+/// returns them by field name (after `field_renames`), as saved value → new
+/// value. Each saved value must be one the saved field allows, and each new
+/// value one the updated field allows; a renamed value cannot stay allowed.
+/// Two saved values may be renamed to the same value, merging them.
+pub fn take_option_renames(
+    blueprint: &mut Blueprint,
+    saved: &Blueprint,
+    field_renames: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
+    let mut found = BTreeMap::new();
+    for field in &mut blueprint.fields {
+        let Some(renames) = field.renamed_options.take() else {
+            continue;
+        };
+        let renames: BTreeMap<String, String> = renames
+            .into_iter()
+            .filter(|(old, new)| old != new)
+            .collect();
+        if renames.is_empty() {
+            continue;
+        }
+        let origin = field_renames
+            .iter()
+            .find(|(_, to)| **to == field.name)
+            .map(|(from, _)| from.as_str())
+            .unwrap_or(field.name.as_str());
+        let saved_options = saved
+            .fields
+            .iter()
+            .find(|f| f.name == origin)
+            .and_then(|f| f.options.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "{}: renamed_options needs a saved field with allowed values",
+                    field.name
+                )
+            })?;
+        let options = field.options.as_deref().unwrap_or_default();
+        for (old, new) in &renames {
+            if !saved_options.contains(old) {
+                return Err(format!(
+                    "{}: “{old}” is renamed, but it is not a saved allowed value",
+                    field.name
+                ));
+            }
+            if !options.contains(new) {
+                return Err(format!(
+                    "{}: “{old}” is renamed to “{new}”, which is not an allowed value",
+                    field.name
+                ));
+            }
+            if options.contains(old) {
+                return Err(format!(
+                    "{}: “{old}” cannot be renamed while it stays an allowed value",
+                    field.name
+                ));
+            }
+        }
+        found.insert(field.name.clone(), renames);
+    }
+    Ok(found)
 }
 
 /// Takes the `renamed_from` markers out of an updated blueprint and returns
@@ -306,7 +430,19 @@ fn validate_field(
 ) -> Result<(), String> {
     match field.kind {
         FieldType::Calculated => Ok(()),
-        FieldType::String => expect_string(field, value).map(|_| ()),
+        FieldType::String => {
+            let text = expect_string(field, value)?;
+            match &field.options {
+                Some(options) if !options.iter().any(|option| option == text) => {
+                    let shown: String = text.chars().take(60).collect();
+                    Err(format!(
+                        "{} must be one of its allowed values, not “{shown}”",
+                        field.name
+                    ))
+                }
+                _ => Ok(()),
+            }
+        }
         FieldType::Number => {
             if value.is_number() {
                 Ok(())
@@ -521,6 +657,8 @@ mod tests {
             collection: None,
             items: None,
             renamed_from: None,
+            options: None,
+            renamed_options: None,
         }
     }
 
@@ -571,6 +709,8 @@ mod tests {
                     collection: None,
                     items: None,
                     renamed_from: None,
+                    options: None,
+                    renamed_options: None,
                 },
                 FieldDef {
                     label: None,
@@ -583,6 +723,8 @@ mod tests {
                     collection: Some("authors".into()),
                     items: None,
                     renamed_from: None,
+                    options: None,
+                    renamed_options: None,
                 },
             ],
         };

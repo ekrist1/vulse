@@ -24,6 +24,12 @@ const { signInFreshAdmin } = require("./sign-in.cjs");
     await double.getByLabel("Calculation", { exact: true }).waitFor();
     assert.equal(await double.getByLabel("Calculation", { exact: true }).inputValue(), "multiply");
     assert.equal(await double.getByLabel("Multiply by 2 fixed value").inputValue(), "2");
+    assert.equal(await total.getByLabel("Calculation", { exact: true }).first().inputValue(), "ROUND");
+    const product = total.getByRole("group", { name: "Value to round 1 nested calculation", exact: true });
+    assert.equal(await product.getByLabel("Calculation", { exact: true }).inputValue(), "multiply");
+    await total.getByLabel("Preview values").selectOption(record.id);
+    assert.equal(await total.getByLabel("Calculation preview result").innerText(), "73.5");
+    await total.getByRole("button", { name: "Edit formula", exact: true }).click();
     assert.equal(await total.getByLabel("Formula", { exact: true }).inputValue(), "=ROUND([price]*[quantity],2)");
     assert.equal(await double.locator("..").getByText("Required", { exact: true }).count(), 0);
     assert.equal(await double.getByLabel("Calculation preview result").innerText(), "20");
@@ -109,8 +115,10 @@ const { signInFreshAdmin } = require("./sign-in.cjs");
     await page.getByText("Changes saved", { exact: true }).waitFor();
     await page.reload();
     await page.getByRole("button", { name: "Fields", exact: true }).click();
+    await double.getByRole("button", { name: "Edit formula", exact: true }).click();
     await double.getByLabel("Formula", { exact: true }).waitFor();
     assert.equal(await double.getByLabel("Formula", { exact: true }).inputValue(), "=ROUND(ABS([price]) * [quantity], 2) + 5");
+    await total.getByRole("button", { name: "Edit formula", exact: true }).click();
     assert.equal(await total.getByLabel("Formula", { exact: true }).inputValue(), "=ROUND([price]*[quantity],2)");
     const saved = await (await page.request.get(base + `/api/v1/collections/${id}/documents/${record.id}`)).json();
     assert.equal(saved.body.double, 78.5);
@@ -132,8 +140,141 @@ const { signInFreshAdmin } = require("./sign-in.cjs");
     await page.getByText("Changes saved", { exact: true }).waitFor();
     const final = await (await page.request.get(base + `/api/v1/collections/${id}/documents/${record.id}`)).json();
     assert.equal(final.body.new_result, 49);
+    // Collection summary formulas use the same recursive guided builder.
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole("button", { name: "Records", exact: true }).click();
+    await page.getByRole("button", { name: "Summary", exact: true }).click();
+    await page.getByRole("button", { name: "+ Add formula", exact: true }).click();
+    const summary = page.getByRole("region", { name: "value_2 calculation", exact: true });
+    await summary.getByRole("button", { name: "Start a new guided calculation", exact: true }).click();
+    await summary.getByLabel("Calculation", { exact: true }).selectOption("ROUND");
+    await summary.getByLabel("Value to round 1 source").selectOption("calculation");
+    const nested = summary.getByRole("group", { name: "Value to round 1 nested calculation", exact: true });
+    await nested.getByLabel("Calculation", { exact: true }).selectOption("divide");
+    const sources = await nested.getByLabel("Value to divide 1 source").locator("option").allTextContents();
+    assert(sources.some(s => s.includes("total_price")));
+    assert(!sources.some(s => /\[price\]|\[value_2\]/.test(s)));
+    await nested.getByLabel("Value to divide 1 source").selectOption("field:total_price");
+    await nested.getByLabel("Divide by 2 source").selectOption("number");
+    await nested.getByLabel("Divide by 2 fixed value").fill("3");
+    await summary.getByLabel("Decimal places 2 fixed value").fill("2");
+    await page.locator(".summary-results tbody").getByRole("cell", { name: "8.17", exact: true }).waitFor();
+    await summary.getByRole("button", { name: "Edit formula", exact: true }).click();
+    assert.equal(await summary.getByLabel("Value 2 formula", { exact: true }).inputValue(), "=ROUND(([total_price] / 3), 2)");
+    await summary.getByRole("button", { name: "Use guided builder", exact: true }).click();
+    assert.equal(await nested.getByLabel("Divide by 2 fixed value").inputValue(), "3");
+    await page.getByRole("button", { name: "Save view…", exact: true }).click();
+    await page.getByLabel("View name", { exact: true }).fill("Guided summary");
+    await page.getByRole("button", { name: "Save view", exact: true }).click();
+    await page.getByRole("button", { name: "Edit view…", exact: true }).waitFor();
+    await page.reload();
+    await page.getByLabel("Collection view", { exact: true }).selectOption({ label: "Guided summary" });
+    await summary.getByLabel("Value 2 formula", { exact: true }).waitFor();
+    assert.equal(await summary.getByLabel("Value 2 formula", { exact: true }).inputValue(), "=ROUND(([total_price] / 3), 2)");
+    await summary.getByRole("button", { name: "Use guided builder", exact: true }).click();
+    assert.equal(await nested.getByLabel("Divide by 2 fixed value").inputValue(), "3");
+    await page.locator(".summary-results tbody").getByRole("cell", { name: "8.17", exact: true }).waitFor();
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await summary.screenshot({ path: "/tmp/vulse-summary-guided-mobile.png" });
+    // Cross-collection calculations: preserve the user's guarded SUMIFS formula,
+    // then add math without turning missing matches into numeric results.
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    const reportName = "aarsmelding-" + run;
+    const sourceResponse = await page.request.post(base + "/api/v1/collections", { data: {
+      name: reportName, visibility: "private", blueprint: { fields: [
+        { name: "org_nummer", type: "string" }, { name: "aar", type: "number" },
+        { name: "aarsverk_ex_spesped", type: "number" }
+      ] }
+    } });
+    assert.equal(sourceResponse.status(), 201);
+    const reports = await sourceResponse.json();
+    for (const [org_nummer, aar, aarsverk_ex_spesped] of [["positive", 2025, 4.2], ["positive", 2025, 8.3], ["zero", 2025, 0], ["other-year", 2024, 7]]) {
+      const response = await page.request.post(base + `/api/v1/collections/${reports.id}/documents`, { data: { body: { org_nummer, aar, aarsverk_ex_spesped } } });
+      assert.equal(response.status(), 201);
+    }
+    const guardedSum = `=IF(COUNTIFS([${reportName}.org_nummer]; [orgnummer]; [${reportName}.aar]; [aar]) = 0; ""; SUMIFS([${reportName}.aarsverk_ex_spesped]; [${reportName}.org_nummer]; [orgnummer]; [${reportName}.aar]; [aar]))`;
+    const firstMatch = `=XLOOKUP([orgnummer], [${reportName}.org_nummer], [${reportName}.aarsverk_ex_spesped])`;
+    const lookupResponse = await page.request.post(base + "/api/v1/collections", { data: {
+      name: "lookup-calculations-" + run, visibility: "private", blueprint: { fields: [
+        { name: "orgnummer", type: "string" }, { name: "aar", type: "number" }, { name: "factor", type: "number" },
+        { name: "guarded_sum", type: "calculated", formula: guardedSum },
+        { name: "first_match", type: "calculated", formula: firstMatch }
+      ] }
+    } });
+    assert.equal(lookupResponse.status(), 201);
+    const lookupCollection = await lookupResponse.json();
+    const lookupRecords = {};
+    for (const orgnummer of ["positive", "zero", "missing", "other-year"]) {
+      const response = await page.request.post(base + `/api/v1/collections/${lookupCollection.id}/documents`, { data: { body: { orgnummer, aar: 2025, factor: 2 } } });
+      assert.equal(response.status(), 201);
+      lookupRecords[orgnummer] = await response.json();
+    }
+    assert.equal(lookupRecords.positive.body.guarded_sum, 12.5);
+    assert.equal(lookupRecords.zero.body.guarded_sum, 0);
+    assert.equal(lookupRecords.missing.body.guarded_sum, "");
+    assert.equal(lookupRecords["other-year"].body.guarded_sum, "");
+    await page.goto(base + `/collections/${lookupCollection.id}`);
+    await page.getByRole("button", { name: "Fields", exact: true }).click();
+    const sumLookup = page.getByRole("region", { name: "guarded_sum calculation", exact: true });
+    const firstLookup = page.getByRole("region", { name: "first_match calculation", exact: true });
+    assert.equal(await sumLookup.getByLabel("Calculation", { exact: true }).inputValue(), "lookup");
+    assert.equal(await sumLookup.getByLabel("Lookup calculation", { exact: true }).inputValue(), "SUMIFS");
+    assert.equal(await sumLookup.getByLabel("Condition 2 value source", { exact: true }).inputValue(), "field:aar");
+    assert(await sumLookup.getByLabel("Return empty text when no records match", { exact: true }).isChecked());
+    await sumLookup.getByRole("button", { name: "Edit formula", exact: true }).click();
+    assert.equal(await sumLookup.getByLabel("Formula", { exact: true }).inputValue(), guardedSum);
+    await sumLookup.getByRole("button", { name: "Use guided builder", exact: true }).click();
+    await sumLookup.getByLabel("Return empty text when no records match", { exact: true }).uncheck();
+    assert((await sumLookup.locator(".calculation-formula code").innerText()).startsWith("=SUMIFS("));
+    await sumLookup.getByLabel("Return empty text when no records match", { exact: true }).check();
+    await sumLookup.getByRole("button", { name: "+ Add math step", exact: true }).click();
+    await sumLookup.getByLabel("Math step 1 source", { exact: true }).selectOption("field:factor");
+    const mathSources = await sumLookup.getByLabel("Math step 1 source", { exact: true }).locator("option").allTextContents();
+    assert(!mathSources.some(s => /\[orgnummer\]|\[guarded_sum\]/.test(s)));
+    await sumLookup.getByRole("button", { name: "+ Add math step", exact: true }).click();
+    await sumLookup.getByLabel("Math step 2 operation", { exact: true }).selectOption("+");
+    await sumLookup.getByLabel("Math step 2 number", { exact: true }).fill("1");
+    await sumLookup.getByRole("button", { name: "+ Add math step", exact: true }).click();
+    await sumLookup.getByLabel("Math step 3 operation", { exact: true }).selectOption("/");
+    await sumLookup.getByLabel("Math step 3 number", { exact: true }).fill("3");
+    await sumLookup.getByRole("button", { name: "+ Add math step", exact: true }).click();
+    await sumLookup.getByLabel("Math step 4 operation", { exact: true }).selectOption("ROUND");
+    await sumLookup.getByLabel("Math step 4 number", { exact: true }).fill("");
+    await sumLookup.getByText("Math step 4: choose a numeric field or enter a number.", { exact: true }).waitFor();
+    await sumLookup.getByLabel("Math step 4 number", { exact: true }).fill("2");
+    await firstLookup.getByLabel("Return empty text when no records match", { exact: true }).check();
+    await firstLookup.getByRole("button", { name: "+ Add math step", exact: true }).click();
+    await page.getByRole("button", { name: "Save fields", exact: true }).click();
+    await page.getByText("Changes saved", { exact: true }).waitFor();
+    for (const [org, expected] of [["positive", 8.67], ["zero", 0.33], ["missing", ""], ["other-year", ""]]) {
+      const response = await page.request.get(base + `/api/v1/collections/${lookupCollection.id}/documents/${lookupRecords[org].id}`);
+      const saved = await response.json();
+      assert.equal(saved.body.guarded_sum, expected, org);
+      assert.equal(saved.body.first_match, org === "missing" ? "" : lookupRecords[org].body.first_match * 2, org);
+    }
+    await page.reload();
+    await page.getByRole("button", { name: "Fields", exact: true }).click();
+    assert.equal(await sumLookup.getByLabel("Calculation", { exact: true }).inputValue(), "lookup");
+    assert(await sumLookup.getByLabel("Return empty text when no records match", { exact: true }).isChecked());
+    assert.equal(await sumLookup.getByLabel("Math step 1 source", { exact: true }).inputValue(), "field:factor");
+    assert.equal(await sumLookup.getByLabel("Math step 4 operation", { exact: true }).inputValue(), "ROUND");
+    assert.equal(await firstLookup.getByLabel("Math step 1 number", { exact: true }).inputValue(), "2");
+    await sumLookup.screenshot({ path: "/tmp/vulse-lookup-math-desktop.png" });
+    await sumLookup.getByRole("button", { name: "Remove math step 2", exact: true }).click();
+    assert.equal(await sumLookup.getByLabel("Math step 2 operation", { exact: true }).inputValue(), "/");
+    assert.equal(await sumLookup.getByLabel("Math step 3 operation", { exact: true }).inputValue(), "ROUND");
+    await page.getByRole("button", { name: "Save fields", exact: true }).click();
+    await page.getByText("Changes saved", { exact: true }).waitFor();
+    for (const [org, expected] of [["positive", 8.33], ["zero", 0], ["missing", ""]]) {
+      const response = await page.request.get(base + `/api/v1/collections/${lookupCollection.id}/documents/${lookupRecords[org].id}`);
+      assert.equal((await response.json()).body.guarded_sum, expected, org);
+    }
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await sumLookup.screenshot({ path: "/tmp/vulse-lookup-math-mobile.png" });
     assert.deepEqual(errors, []);
-    console.log("PASS: existing formula recognition/preservation, typed guided inputs, sample and record previews without writes, percentages/runtime errors, text joining, conditions, function search/help, field autocomplete, cursor insertion, save/reload/server results, mobile layout; no runtime errors");
+    console.log("PASS: existing formula recognition/preservation, typed guided inputs, sample and record previews without writes, percentages/runtime errors, text joining, conditions, function search/help, field autocomplete, cursor insertion, save/reload/server results, nested calculations, collection summary wizard and saved view persistence, lookup math steps, empty versus zero matching results, mobile layout; no runtime errors");
   } catch (error) {
     await page.screenshot({ path: "/tmp/vulse-calculation-failure.png", fullPage: true });
     console.error("Browser errors:", errors);

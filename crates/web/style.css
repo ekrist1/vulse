@@ -201,3 +201,13 @@ button.toolbar-toggle.active{background:#e7f4f1;border-color:#9ccfc4;color:var(-
 .sql-actions{margin:.9rem 0 0}.sql-actions span{font-size:12px}.sql-result h2{margin:0}.sql-table td{max-width:320px}.sql-before{color:var(--muted);text-decoration:line-through}.sql-preview .error ul{margin:.4rem 0 0;padding-left:1.2rem}.sql-done{margin-bottom:1.5rem}
 @media(max-width:900px){.sql-layout{grid-template-columns:minmax(0,1fr)}}
 .field-options{grid-column:1/-1;padding:1rem 1.2rem;background:#f7fafb;border:1px solid var(--line);border-radius:10px}.field-options label.check{margin:0}.option-list{list-style:none;padding:0;margin:.8rem 0 0;display:grid;gap:.5rem}.option-list .row{margin:0;flex-wrap:nowrap}.option-list input{flex:1;min-width:0}.option-list button{min-height:34px;padding:.3rem .6rem}.field-options>p{font-size:12px;margin:.6rem 0 0}
+
+/* Recursive formula inputs keep each calculation readable on narrow screens. */
+.nested-calculation{margin-top:12px;border-left:3px solid #bce0cc;padding-left:12px;min-width:0}
+.nested-calculation .calculation-inputs{grid-template-columns:minmax(0,1fr)}
+.guided-calculation>.secondary{margin-top:12px}
+.summary-row>.formula-editor{flex:1 1 100%;order:1;border-radius:9px}
+
+.lookup-empty{display:flex;align-items:center;gap:8px;font-size:13px}.lookup-empty input{width:auto;margin:0}
+.lookup-result-steps{display:grid;gap:10px;margin-bottom:12px}.lookup-result-step{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,.8fr) auto;gap:10px;align-items:end;border:1px solid #dce9e5;border-radius:9px;background:#fff;padding:12px 15px}.lookup-result-step label{margin:0;font-size:13px}.lookup-result-step .text-button{font-size:12px;min-height:34px}
+@media(max-width:800px){.lookup-result-step{grid-template-columns:minmax(0,1fr)}}

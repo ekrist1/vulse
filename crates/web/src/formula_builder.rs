@@ -1,7 +1,7 @@
-use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
 use crate::formula_input::{FormulaInput, Suggestion};
 use crate::lookup_builder::{LookupBuilder, LookupDraft};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use vulse_model::{
     ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType,
     FormulaExpression as Expr,
@@ -519,6 +519,7 @@ struct Binding {
     value: String,
     comparison: String,
     compare_value: String,
+    calculation: Option<Box<Draft>>,
 }
 impl Binding {
     fn empty() -> Self {
@@ -527,6 +528,7 @@ impl Binding {
             value: String::new(),
             comparison: ">".into(),
             compare_value: "0".into(),
+            calculation: None,
         }
     }
     fn fixed(kind: Kind, value: &str) -> Self {
@@ -579,11 +581,8 @@ impl Binding {
             Expr::Binary(op, left, right)
                 if ["=", "<>", "!=", ">", "<", ">=", "<="].contains(&op.as_str()) =>
             {
-                let Expr::Field(name) = left.as_ref() else {
-                    return None;
-                };
-                let Expr::Literal(v) = right.as_ref() else {
-                    return None;
+                let (Expr::Field(name), Expr::Literal(v)) = (left.as_ref(), right.as_ref()) else {
+                    return Some(Self::nested(Draft::from_expr(e)?));
                 };
                 Self {
                     source: format!("field:{name}"),
@@ -592,10 +591,38 @@ impl Binding {
                     ..Self::empty()
                 }
             }
-            _ => return None,
+            _ => Self::nested(Draft::from_expr(e)?),
         })
     }
+    fn nested(draft: Draft) -> Self {
+        Self {
+            source: "calculation".into(),
+            calculation: Some(Box::new(draft)),
+            ..Self::empty()
+        }
+    }
     fn expression(&self, argument: &Argument, fields: &[FieldDef]) -> Result<String, String> {
+        if self.source == "calculation" {
+            let draft = self
+                .calculation
+                .as_ref()
+                .ok_or("Choose a nested calculation.")?;
+            return draft
+                .formula(fields)
+                .map(|formula| format!("({})", formula.trim_start_matches('=')))
+                .map_err(|error| format!("{} → {error}", argument.label));
+        }
+        if self.source == "expression" {
+            let expression = self.value.trim().trim_start_matches('=');
+            vulse_model::inspect_formula(expression)
+                .map_err(|error| format!("{}: {error}", argument.label))?;
+            for name in vulse_model::formula_dependencies(expression).unwrap_or_default() {
+                if !fields.iter().any(|field| field.name == name) {
+                    return Err(format!("{}: unknown input [{name}].", argument.label));
+                }
+            }
+            return Ok(format!("({expression})"));
+        }
         if let Some(name) = self.source.strip_prefix("field:") {
             let field = fields
                 .iter()
@@ -734,8 +761,12 @@ pub(crate) fn argument_hint(name: &str, index: usize) -> Option<String> {
     };
     let argument = h.args.get(position)?;
     let label = match (name, position, index) {
-        ("SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS", 1, _) | ("COUNTIFS", 0, _) => "List to check",
-        ("SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS", 2, _) | ("COUNTIFS", 1, _) => "Condition for that list",
+        ("SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS", 1, _) | ("COUNTIFS", 0, _) => {
+            "List to check"
+        }
+        ("SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS", 2, _) | ("COUNTIFS", 1, _) => {
+            "Condition for that list"
+        }
         _ => argument.label,
     };
     Some(format!(
@@ -786,33 +817,80 @@ struct Draft {
     task: String,
     inputs: Vec<Binding>,
 }
+// Operators are first-class calculations, so they can be nested like functions.
+const OPERATORS: &[(&str, &str, &str)] = &[
+    ("multiply", "*", "Multiply values"),
+    ("add", "+", "Add two values"),
+    ("subtract", "-", "Subtract values"),
+    ("divide", "/", "Divide values"),
+    ("power", "^", "Raise to a power"),
+    ("join", "&", "Join two values as text"),
+    ("equal", "=", "Equals"),
+    ("not_equal", "<>", "Does not equal"),
+    ("greater", ">", "Greater than"),
+    ("less", "<", "Less than"),
+    ("at_least", ">=", "At least"),
+    ("at_most", "<=", "At most"),
+];
+fn operator(task: &str) -> Option<&'static str> {
+    OPERATORS
+        .iter()
+        .find(|(name, _, _)| *name == task)
+        .map(|(_, op, _)| *op)
+}
 impl Draft {
-    fn arguments(&self) -> Vec<Argument> {
-        if self.task == "multiply" {
-            return vec![
-                arg("Value to multiply", Kind::Number),
-                arg("Multiply by", Kind::Number),
-            ];
+    fn criteria_start(&self) -> Option<usize> {
+        match self.task.as_str() {
+            "COUNTIFS" => Some(0),
+            "SUMIFS" | "AVERAGEIFS" | "MINIFS" | "MAXIFS" => Some(1),
+            _ => None,
+        }
+    }
+    fn argument(&self, index: usize) -> Argument {
+        if let Some(op) = operator(&self.task) {
+            let (left, right, kind) = match op {
+                "*" => ("Value to multiply", "Multiply by", Kind::Number),
+                "/" => ("Value to divide", "Divide by", Kind::Number),
+                "-" => ("Starting value", "Subtract", Kind::Number),
+                "+" => ("Starting value", "Add", Kind::Number),
+                "^" => ("Number", "Power", Kind::Number),
+                "&" => ("First value", "Second value", Kind::Any),
+                _ => ("Left value", "Right value", Kind::Any),
+            };
+            return arg(if index == 0 { left } else { right }, kind);
         }
         if self.task == "percentage" {
-            return vec![arg("Part", Kind::Number), arg("Total", Kind::Number)];
+            return arg(if index == 0 { "Part" } else { "Total" }, Kind::Number);
         }
         let h = help(&self.task);
+        if let Some(start) = self.criteria_start() {
+            if index >= start {
+                return if (index - start) % 2 == 0 {
+                    arg("List to check", Kind::Array)
+                } else {
+                    fixed("Condition for that list", Kind::Any, ">0")
+                };
+            }
+        }
+        h.args.get(index).unwrap_or(h.args.last().unwrap()).clone()
+    }
+    fn arguments(&self) -> Vec<Argument> {
         (0..self.inputs.len())
-            .map(|i| h.args.get(i).unwrap_or(h.args.last().unwrap()).clone())
+            .map(|index| self.argument(index))
             .collect()
     }
     fn new(task: &str) -> Self {
-        if task == "multiply" {
+        if operator(task).is_some() || task == "percentage" {
             return Self {
                 task: task.into(),
-                inputs: vec![Binding::empty(), Binding::fixed(Kind::Number, "2")],
-            };
-        }
-        if task == "percentage" {
-            return Self {
-                task: task.into(),
-                inputs: vec![Binding::empty(), Binding::empty()],
+                inputs: vec![
+                    Binding::empty(),
+                    if task == "multiply" {
+                        Binding::fixed(Kind::Number, "2")
+                    } else {
+                        Binding::empty()
+                    },
+                ],
             };
         }
         let h = help(task);
@@ -820,19 +898,59 @@ impl Draft {
         if h.variadic {
             args.push(h.args.last().unwrap().clone());
         }
-        let inputs = args
-            .iter()
-            .filter(|a| !a.optional)
-            .map(|a| {
-                a.default
-                    .map(|v| Binding::fixed(a.kind, v))
-                    .unwrap_or_else(Binding::empty)
-            })
-            .collect();
         Self {
             task: task.into(),
-            inputs,
+            inputs: args
+                .iter()
+                .filter(|a| !a.optional)
+                .map(|a| {
+                    a.default
+                        .map(|v| Binding::fixed(a.kind, v))
+                        .unwrap_or_else(Binding::empty)
+                })
+                .collect(),
         }
+    }
+    fn can_add(&self) -> bool {
+        operator(&self.task).is_none()
+            && self.task != "percentage"
+            && (self.criteria_start().is_some()
+                || help(&self.task).variadic
+                || self.inputs.len() < help(&self.task).args.len())
+    }
+    fn add_input(&mut self) {
+        let count = if self.criteria_start().is_some() {
+            2
+        } else {
+            1
+        };
+        for _ in 0..count {
+            let arg = self.argument(self.inputs.len());
+            self.inputs.push(
+                arg.default
+                    .map(|v| Binding::fixed(arg.kind, v))
+                    .unwrap_or_else(Binding::empty),
+            );
+        }
+    }
+    fn can_remove(&self, index: usize) -> bool {
+        if operator(&self.task).is_some() || self.task == "percentage" {
+            return false;
+        }
+        if let Some(start) = self.criteria_start() {
+            return index >= start + 2 && (index - start) % 2 == 0;
+        }
+        let h = help(&self.task);
+        (h.variadic && index >= h.args.len())
+            || (self.argument(index).optional && index + 1 == self.inputs.len())
+    }
+    fn remove_input(&mut self, index: usize) {
+        let count = if self.criteria_start().is_some() {
+            2
+        } else {
+            1
+        };
+        self.inputs.drain(index..index + count);
     }
     fn formula(&self, fields: &[FieldDef]) -> Result<String, String> {
         let values = self
@@ -841,8 +959,8 @@ impl Draft {
             .zip(self.arguments())
             .map(|(b, a)| b.expression(&a, fields))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(if self.task == "multiply" {
-            format!("={} * {}", values[0], values[1])
+        Ok(if let Some(op) = operator(&self.task) {
+            format!("={} {op} {}", values[0], values[1])
         } else if self.task == "percentage" {
             format!("=({} / {}) * 100", values[0], values[1])
         } else {
@@ -850,43 +968,32 @@ impl Draft {
         })
     }
     fn from_formula(formula: &str) -> Option<Self> {
-        let e = vulse_model::inspect_formula(formula).ok()?;
-        let simple = |value: &Expr| {
-            if matches!(value, Expr::Binary(..)) {
-                None
-            } else {
-                Binding::from_expr(value)
-            }
-        };
-        match &e {
-            Expr::Binary(op, a, b) if op == "*" => {
-                if matches!(b.as_ref(),Expr::Literal(v) if v.as_f64()==Some(100.0))
-                    && let Expr::Binary(op, part, total) = a.as_ref()
-                        && op == "/" {
-                            return Some(Self {
-                                task: "percentage".into(),
-                                inputs: vec![simple(part)?, simple(total)?],
-                            });
-                        }
+        Self::from_expr(&vulse_model::inspect_formula(formula).ok()?)
+    }
+    fn from_expr(e: &Expr) -> Option<Self> {
+        match e {
+            Expr::Binary(op, a, b) => {
+                if op == "*"
+                    && matches!(b.as_ref(),Expr::Literal(v) if v.as_f64()==Some(100.0))
+                    && let Expr::Binary(divide, part, total) = a.as_ref()
+                    && divide == "/"
+                {
+                    return Some(Self {
+                        task: "percentage".into(),
+                        inputs: vec![Binding::from_expr(part)?, Binding::from_expr(total)?],
+                    });
+                }
+                let (task, _, _) = OPERATORS.iter().find(|(_, symbol, _)| *symbol == op)?;
                 Some(Self {
-                    task: "multiply".into(),
-                    inputs: vec![simple(a)?, simple(b)?],
+                    task: (*task).into(),
+                    inputs: vec![Binding::from_expr(a)?, Binding::from_expr(b)?],
                 })
             }
             Expr::Call(name, args) => Some(Self {
                 task: name.clone(),
                 inputs: args
                     .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let h = help(name);
-                        let kind = h.args.get(index).unwrap_or(h.args.last().unwrap()).kind;
-                        if kind == Kind::Condition {
-                            Binding::from_expr(value)
-                        } else {
-                            simple(value)
-                        }
-                    })
+                    .map(Binding::from_expr)
                     .collect::<Option<Vec<_>>>()?,
             }),
             _ => None,
@@ -894,8 +1001,10 @@ impl Draft {
     }
 }
 fn task_title(task: &str) -> String {
+    if let Some((_, _, title)) = OPERATORS.iter().find(|(name, _, _)| *name == task) {
+        return (*title).into();
+    }
     match task {
-        "multiply" => "Multiply values".into(),
         "percentage" => "Calculate a percentage".into(),
         "SUM" => "Add values".into(),
         "TEXTJOIN" => "Combine text".into(),
@@ -903,6 +1012,35 @@ fn task_title(task: &str) -> String {
         "ROUND" => "Round a number".into(),
         _ => format!("{task} calculation"),
     }
+}
+
+/// The same recursive input controls serve fields and collection summaries.
+#[derive(Properties, PartialEq)]
+struct GuidedProps {
+    draft: Draft,
+    fields: Vec<FieldDef>,
+    on_change: Callback<Draft>,
+    #[prop_or(false)]
+    select_task: bool,
+}
+#[function_component(GuidedCalculation)]
+fn guided_calculation(props: &GuidedProps) -> Html {
+    let draft = &props.draft;
+    html! {<div class="guided-calculation">
+        if props.select_task {
+            <label>{"Calculation"}<select aria-label="Calculation" value={draft.task.clone()} onchange={Callback::from({let change=props.on_change.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();change.emit(Draft::new(&select.value()));}})}>
+                <optgroup label="Arithmetic and comparisons">{for OPERATORS.iter().map(|(task,_,title)|html!{<option value={*task} selected={draft.task==*task}>{*title}</option>})}<option value="percentage" selected={draft.task=="percentage"}>{"Calculate a percentage"}</option></optgroup>
+                {for ["Numbers", "Logic", "Text", "Dates", "Lists"].iter().map(|category|html!{<optgroup label={*category}>{for vulse_model::FUNCTIONS.iter().filter(|(name,_)|help(name).category==*category).map(|(name,_)|html!{<option value={*name} selected={draft.task==*name}>{format!("{} · {}",name,help(name).description)}</option>})}</optgroup>})}
+            </select></label>
+        }
+        <div class="calculation-inputs">{for draft.inputs.iter().zip(draft.arguments()).enumerate().map(|(index,(binding,argument))| {
+            let change = {let draft=draft.clone();let change=props.on_change.clone();Callback::from(move |binding:Binding|{let mut next=draft.clone();next.inputs[index]=binding;change.emit(next);})};
+            html!{<div class="calculation-input-wrap"><CalculationInput key={index} index={index} argument={ArgumentView{label:argument.label.into(),kind:argument.kind}} binding={binding.clone()} fields={props.fields.clone()} on_change={change}/>
+                if draft.can_remove(index) {<button class="text-button" type="button" aria-label={format!("Remove input {}",index+1)} onclick={Callback::from({let draft=draft.clone();let change=props.on_change.clone();move |_|{let mut next=draft.clone();next.remove_input(index);change.emit(next);}})}>{if draft.criteria_start().is_some(){"Remove condition"}else{"Remove input"}}</button>}
+            </div>}
+        })}</div>
+        if draft.can_add() {<button type="button" class="secondary" onclick={Callback::from({let draft=draft.clone();let change=props.on_change.clone();move |_|{let mut next=draft.clone();next.add_input();change.emit(next);}})}>{if draft.criteria_start().is_some(){"+ Add another condition"}else if help(&draft.task).variadic{"+ Add another value"}else{"+ Add optional argument"}}</button>}
+    </div>}
 }
 
 #[derive(Properties, PartialEq)]
@@ -948,10 +1086,13 @@ fn calculation_input(props: &InputProps) -> Html {
             ("boolean", "True / false"),
         ],
     };
-    html! {<div class="calculation-input"><label>{props.argument.label.clone()}<select aria-label={format!("{label} source")} value={binding.source.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();let fields=props.fields.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.source=select.value();if next.source=="boolean"{next.value="true".into();}
+    html! {<div class="calculation-input"><label>{props.argument.label.clone()}<select aria-label={format!("{label} source")} value={binding.source.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();let fields=props.fields.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.source=select.value();if next.source=="boolean"{next.value="true".into();}if next.source=="calculation" && next.calculation.is_none(){next.calculation=Some(Box::new(Draft::new(if kind==Kind::Condition{"AND"}else{"multiply"})));}if next.source=="expression"{next.value=binding.expression(&arg("Input",kind),&fields).unwrap_or_default();}
                 if let Some(f)=next.source.strip_prefix("field:").and_then(|n|fields.iter().find(|f|f.name==n)){next.comparison=if f.kind==FieldType::String{"="}else if f.kind==FieldType::Boolean{"truthy"}else{">"}.into();next.compare_value=if f.kind==FieldType::String{json!("Example").to_string()}else{"0".into()};}change.emit(next);}})}>
-        <option value="" selected={binding.source.is_empty()}>{"Choose a field or fixed value…"}</option><optgroup label="Collection fields">{for props.fields.iter().filter(|f|compatible(kind,f)).map(|f|html!{<option value={format!("field:{}",f.name)} selected={binding.source==format!("field:{}",f.name)}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</optgroup><optgroup label="Fixed values">{for fixed_sources.into_iter().map(|(value,text)|html!{<option {value} selected={binding.source==value}>{text}</option>})}</optgroup></select></label>
-        if !binding.source.is_empty() && !binding.source.starts_with("field:") {
+        <option value="" selected={binding.source.is_empty()}>{"Choose a field or fixed value…"}</option><optgroup label="Collection fields">{for props.fields.iter().filter(|f|compatible(kind,f)).map(|f|html!{<option value={format!("field:{}",f.name)} selected={binding.source==format!("field:{}",f.name)}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</optgroup><optgroup label="Fixed values">{for fixed_sources.into_iter().map(|(value,text)|html!{<option {value} selected={binding.source==value}>{text}</option>})}</optgroup><optgroup label="Build an expression"><option value="calculation" selected={binding.source=="calculation"}>{"Nested calculation…"}</option><option value="expression" selected={binding.source=="expression"}>{"Custom formula…"}</option></optgroup></select></label>
+        if binding.source=="calculation" {
+            if let Some(draft)=&binding.calculation {<div class="nested-calculation" role="group" aria-label={format!("{label} nested calculation")}><GuidedCalculation draft={(**draft).clone()} fields={props.fields.clone()} select_task={true} on_change={Callback::from({let binding=binding.clone();let change=props.on_change.clone();move |draft:Draft|{let mut next=binding.clone();next.calculation=Some(Box::new(draft));change.emit(next);}})}/></div>}
+        } else if binding.source=="expression" {<FormulaInput label={format!("{label} formula")} value={binding.value.clone()} suggestions={formula_suggestions(&props.fields,&[],"")} library={true} on_change={Callback::from({let binding=binding.clone();let change=props.on_change.clone();move |value:String|{let mut next=binding.clone();next.value=value;change.emit(next);}})}/>
+        } else if !binding.source.is_empty() && !binding.source.starts_with("field:") {
             if binding.source=="boolean" {<label class="calculation-fixed"><span class="muted">{"Fixed value"}</span><select aria-label={format!("{label} fixed value")} value={binding.value.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.value=select.value();change.emit(next);}})}><option value="true" selected={binding.value=="true"}>{"True"}</option><option value="false" selected={binding.value=="false"}>{"False"}</option></select></label>}
             else {<label class="calculation-fixed"><span class="muted">{"Fixed value"}</span><input aria-label={format!("{label} fixed value")} type={if binding.source=="number"{"number"}else{"text"}} step="any" placeholder={if binding.source=="json"{"[1, 2, 3]"}else if kind==Kind::Date{"YYYY-MM-DD"}else{"Enter a value"}} value={binding.value.clone()} oninput={Callback::from({let change=props.on_change.clone();let binding=binding.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=binding.clone();next.value=input.value();change.emit(next);}})}/></label>}
         }
@@ -963,7 +1104,12 @@ fn calculation_input(props: &InputProps) -> Html {
 pub struct FormulaEditorProps {
     pub field: FieldDef,
     pub fields: Vec<FieldDef>,
+    #[prop_or_default]
     pub records: Vec<DocumentView>,
+    #[prop_or(false)]
+    pub summary: bool,
+    #[prop_or_else(|| "Formula".into())]
+    pub formula_label: String,
     pub on_change: Callback<FieldDef>,
     /// Other collections whose fields formulas can read.
     #[prop_or_default]
@@ -979,12 +1125,12 @@ enum Mode {
     Advanced,
 }
 /// The editing mode that shows `formula` best.
-fn mode_for(formula: &str, inputs: &[FieldDef]) -> Mode {
+fn mode_for(formula: &str, inputs: &[FieldDef], summary: bool) -> Mode {
     if formula.is_empty() {
         Mode::Guided(Draft::new("multiply"))
     } else if let Some(draft) = guided_draft(formula, inputs) {
         Mode::Guided(draft)
-    } else if let Some(draft) = LookupDraft::from_formula(formula) {
+    } else if !summary && let Some(draft) = LookupDraft::from_formula(formula) {
         Mode::Lookup(draft)
     } else {
         Mode::Advanced
@@ -1005,7 +1151,13 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         .filter(|c| c.name != props.current)
         .cloned()
         .collect();
-    let mode = use_state(|| mode_for(&formula, &inputs));
+    let mode = use_state(|| {
+        if props.summary {
+            Mode::Advanced
+        } else {
+            mode_for(&formula, &inputs, props.summary)
+        }
+    });
     let library = use_state(|| false);
     let textarea = use_node_ref();
     let selection = use_state(|| {
@@ -1018,11 +1170,12 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
     // Reconcile external edits/reordering, while retaining incomplete named-input drafts.
     {
         let mode = mode.clone();
+        let summary = props.summary;
         let inputs = inputs.clone();
         let last_emitted = last_emitted.clone();
         use_effect_with(formula.clone(), move |formula| {
             if *last_emitted.borrow() != *formula {
-                mode.set(mode_for(formula, &inputs));
+                mode.set(mode_for(formula, &inputs, summary));
                 *last_emitted.borrow_mut() = formula.clone();
             }
         });
@@ -1042,7 +1195,7 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
     let set_draft = {
         let mode = mode.clone();
         let emit = emit.clone();
-        let fields = props.fields.clone();
+        let fields = inputs.clone();
         Callback::from(move |draft: Draft| {
             emit.emit(draft.formula(&fields).unwrap_or_default());
             mode.set(Mode::Guided(draft));
@@ -1062,16 +1215,16 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         Mode::Lookup(draft) => draft.formula().err(),
         Mode::Advanced => None,
     };
-    let guided_available = !matches!(mode_for(&formula, &inputs), Mode::Advanced);
+    let guided_available = !matches!(mode_for(&formula, &inputs, props.summary), Mode::Advanced);
     let task = match &*mode {
         Mode::Guided(draft) => draft.task.clone(),
         Mode::Lookup(_) => "lookup".to_string(),
         Mode::Advanced => String::new(),
     };
-    let task_select = html! {<div class="calculation-task"><label>{"Calculation"}<select aria-label="Calculation" value={task.clone()} onchange={Callback::from({let set_draft=set_draft.clone();let set_lookup=set_lookup.clone();let others=others.clone();let library=library.clone();let task=task.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let value=select.value();if value=="more"{library.set(true);select.set_value(&task);}else if value=="lookup"{if let Some(first)=others.first(){set_lookup.emit(LookupDraft::new(first));}library.set(false);}else{set_draft.emit(Draft::new(&value));library.set(false);}}})}>{for [("multiply","Multiply values"),("SUM","Add values"),("percentage","Calculate a percentage"),("TEXTJOIN","Combine text"),("IF","If / otherwise"),("ROUND","Round a number")].into_iter().map(|(value,label)|html!{<option {value} selected={task==value}>{label}</option>})}if !others.is_empty(){<option value="lookup" selected={task=="lookup"}>{"From another collection"}</option>}if !["multiply","SUM","percentage","TEXTJOIN","IF","ROUND","lookup"].contains(&task.as_str()){<option value={task.clone()} selected={true}>{task_title(&task)}</option>}<option value="more">{"More calculations…"}</option></select></label>
-        <p class="muted">{match task.as_str(){"multiply"=>"Multiply a field by another field or a fixed number.","percentage"=>"Divide the part by the total, then multiply by 100. A result of 25 means 25%.","lookup"=>"Sum, count or look up values in another collection, using the records that match this record.","" => "",name=>help(name).description}}</p></div>};
+    let task_select = html! {<div class="calculation-task"><label>{"Calculation"}<select aria-label="Calculation" value={task.clone()} onchange={Callback::from({let set_draft=set_draft.clone();let set_lookup=set_lookup.clone();let others=others.clone();let library=library.clone();let task=task.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let value=select.value();if value=="more"{library.set(true);select.set_value(&task);}else if value=="lookup"{if let Some(first)=others.first(){set_lookup.emit(LookupDraft::new(first));}library.set(false);}else{set_draft.emit(Draft::new(&value));library.set(false);}}})}>{for [("multiply","Multiply values"),("subtract","Subtract values"),("divide","Divide values"),("SUM","Add values"),("percentage","Calculate a percentage"),("TEXTJOIN","Combine text"),("IF","If / otherwise"),("ROUND","Round a number")].into_iter().map(|(value,label)|html!{<option {value} selected={task==value}>{label}</option>})}<optgroup label="More arithmetic and comparisons">{for OPERATORS.iter().filter(|(name,_,_)|!["multiply","subtract","divide"].contains(name)).map(|(name,_,title)|html!{<option value={*name} selected={task==*name}>{*title}</option>})}</optgroup>if !others.is_empty(){<option value="lookup" selected={task=="lookup"}>{"From another collection"}</option>}if operator(&task).is_none() && !["SUM","percentage","TEXTJOIN","IF","ROUND","lookup"].contains(&task.as_str()){<option value={task.clone()} selected={true}>{task_title(&task)}</option>}<option value="more">{"More calculations…"}</option></select></label>
+    <p class="muted">{match task.as_str(){"multiply"=>"Multiply a field by another field, a fixed number, or a nested calculation.","subtract"=>"Subtract one value or calculation from another.","divide"=>"Divide one value or calculation by another.","percentage"=>"Divide the part by the total, then multiply by 100. A result of 25 means 25%.","lookup"=>"Sum, count or look up values in another collection, using the records that match this record.","" => "",name if operator(name).is_some()=>"Combine values or nested calculations.",name=>help(name).description}}</p></div>};
     html! {<section class="formula-editor" aria-label={format!("{} calculation",props.field.name)}>
-        <div class="calculation-heading"><div><h3>{"How should this field be calculated?"}</h3><p class="muted">{"Read-only · Updates automatically when its input fields change."}</p></div><button type="button" class="secondary" onclick={Callback::from({let mode=mode.clone();let formula=formula.clone();let set_draft=set_draft.clone();let inputs=inputs.clone();move |_|{match &*mode{Mode::Guided(_)|Mode::Lookup(_)=>mode.set(Mode::Advanced),Mode::Advanced=>match mode_for(&formula,&inputs){Mode::Advanced=>set_draft.emit(Draft::new("multiply")),next=>mode.set(next)}}}})}>{if !matches!(&*mode,Mode::Advanced){"Edit formula"}else if guided_available{"Use guided builder"}else{"Start a new guided calculation"}}</button></div>
+        <div class="calculation-heading"><div><h3>{if props.summary {"How should this summary value be calculated?"}else{"How should this field be calculated?"}}</h3><p class="muted">{if props.summary {"Use other summary values by name. Results update automatically for each group."}else{"Read-only · Updates automatically when its input fields change."}}</p></div><button type="button" class="secondary" onclick={Callback::from({let mode=mode.clone();let formula=formula.clone();let set_draft=set_draft.clone();let inputs=inputs.clone();let summary=props.summary;move |_|{match &*mode{Mode::Guided(_)|Mode::Lookup(_)=>mode.set(Mode::Advanced),Mode::Advanced=>match mode_for(&formula,&inputs,summary){Mode::Advanced=>set_draft.emit(Draft::new("multiply")),next=>mode.set(next)}}}})}>{if !matches!(&*mode,Mode::Advanced){"Edit formula"}else if guided_available{"Use guided builder"}else{"Start a new guided calculation"}}</button></div>
         if let Mode::Lookup(draft)=&*mode {
             {task_select.clone()}
             <LookupBuilder draft={draft.clone()} collections={others.clone()} inputs={inputs.clone()} on_change={set_lookup.clone()}/>
@@ -1079,15 +1232,14 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         }
         if let Mode::Guided(draft)=&*mode {
             {task_select}
-            <div class="calculation-inputs">{for draft.inputs.iter().zip(draft.arguments()).enumerate().map(|(index,(binding,argument))|{let change={let draft=draft.clone();let set_draft=set_draft.clone();Callback::from(move |binding:Binding|{let mut draft=draft.clone();draft.inputs[index]=binding;set_draft.emit(draft);})};html!{<div class="calculation-input-wrap"><CalculationInput key={index} index={index} argument={ArgumentView{label:argument.label.into(),kind:argument.kind}} binding={binding.clone()} fields={inputs.clone()} on_change={change}/>
-            if draft.inputs.len()>1 && !["multiply","percentage"].contains(&draft.task.as_str()) && ((help(&draft.task).variadic && index>=help(&draft.task).args.len()) || argument.optional) {<button class="text-button" type="button" aria-label={format!("Remove input {}",index+1)} onclick={Callback::from({let draft=draft.clone();let set_draft=set_draft.clone();move |_|{let mut draft=draft.clone();draft.inputs.remove(index);set_draft.emit(draft);}})}>{"Remove input"}</button>}
-            </div>}})}</div>
-            if !["multiply","percentage"].contains(&draft.task.as_str()) && (help(&draft.task).variadic || draft.inputs.len()<help(&draft.task).args.len()) {<button type="button" class="secondary" onclick={Callback::from({let draft=draft.clone();let set_draft=set_draft.clone();move |_|{let mut draft=draft.clone();let h=help(&draft.task);let arg=h.args.get(draft.inputs.len()).unwrap_or(h.args.last().unwrap());draft.inputs.push(arg.default.map(|v|Binding::fixed(arg.kind,v)).unwrap_or_else(Binding::empty));set_draft.emit(draft);}})}>{if help(&draft.task).variadic{"+ Add another value"}else{"+ Add optional argument"}}</button>}
+            <GuidedCalculation draft={draft.clone()} fields={inputs.clone()} on_change={set_draft.clone()}/>
             <div class="calculation-formula"><span class="muted">{"Formula"}</span><code>{if formula.is_empty(){"Choose your inputs to build the formula"}else{&formula}}</code></div>
         }
-        if matches!(&*mode,Mode::Advanced) {<AdvancedFormula suggestions={formula_suggestions(&inputs,&props.collections,&props.current)} textarea={textarea.clone()} on_selection={Callback::from({let selection=selection.clone();move |next|selection.set(next)})} value={formula.clone()} fields={inputs.clone()} on_change={emit.clone()} on_library={Callback::from({let library=library.clone();move |_|library.set(!*library)})}/>}
+        if matches!(&*mode,Mode::Advanced) {<AdvancedFormula summary={props.summary} label={props.formula_label.clone()} suggestions={formula_suggestions(&inputs,&props.collections,&props.current)} textarea={textarea.clone()} on_selection={Callback::from({let selection=selection.clone();move |next|selection.set(next)})} value={formula.clone()} fields={inputs.clone()} on_change={emit.clone()} on_library={Callback::from({let library=library.clone();move |_|library.set(!*library)})}/>}
         if *library {<FunctionLibrary advanced={matches!(&*mode,Mode::Advanced)} on_use={Callback::from({let set_draft=set_draft.clone();let library=library.clone();move |name:String|{set_draft.emit(Draft::new(&name));library.set(false);}})} on_insert={Callback::from({let emit=emit.clone();let formula=formula.clone();let selection=selection.clone();let textarea=textarea.clone();move |name:String|{let (next,caret)=insert_function(&formula,*selection,&name);if let Some(area)=textarea.cast::<HtmlTextAreaElement>(){area.set_value(&next);area.focus().ok();area.set_selection_range(caret as u32,caret as u32).ok();}selection.set((caret,caret));emit.emit(next);}})}/>}
-        <CalculationPreview field={props.field.clone()} fields={props.fields.clone()} records={props.records.clone()} draft_error={draft_error}/>
+        if props.summary {
+            if let Some(error)=draft_error {<p class="calculation-feedback" role="status">{error}</p>}
+        } else {<CalculationPreview field={props.field.clone()} fields={props.fields.clone()} records={props.records.clone()} draft_error={draft_error}/>}
     </section>}
 }
 
@@ -1188,6 +1340,8 @@ pub(crate) fn insert_function(
 }
 #[derive(Properties, PartialEq)]
 struct AdvancedProps {
+    summary: bool,
+    label: String,
     value: String,
     fields: Vec<FieldDef>,
     suggestions: Vec<Suggestion>,
@@ -1198,8 +1352,8 @@ struct AdvancedProps {
 }
 #[function_component(AdvancedFormula)]
 fn advanced_formula(props: &AdvancedProps) -> Html {
-    html! {<div class="advanced-formula"><FormulaInput lookups={true} textarea={props.textarea.clone()} value={props.value.clone()} suggestions={props.suggestions.clone()} on_change={props.on_change.clone()} on_selection={props.on_selection.clone()} placeholder="=ROUND([price] * [quantity], 2)"/>
-        <p class="muted">{"Use [field_name] for a field, [collection.field] for a field of another collection, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions, then press Enter to insert. Select text to wrap it in a function."}</p><div class="row"><button type="button" class="secondary" onclick={Callback::from({let change=props.on_library.clone();move |_|change.emit(())})}>{"Browse functions"}</button><label class="advanced-insert-field">{"Insert field"}<select aria-label="Insert input field" value="" onchange={Callback::from({let change=props.on_change.clone();let value=props.value.clone();let node=props.textarea.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();if select.value().is_empty(){return;}let name=select.value();let (start,end)=node.cast::<HtmlTextAreaElement>().map(|a|(a.selection_start().ok().flatten().unwrap_or(0) as usize,a.selection_end().ok().flatten().unwrap_or(0) as usize)).unwrap_or((value.encode_utf16().count(),value.encode_utf16().count()));let at=vulse_model::utf16_to_char_index(&value,start);let end=vulse_model::utf16_to_char_index(&value,end);let prefix=if value.is_empty(){"="}else{""};change.emit(replace_chars(&value,at,end,&format!("{prefix}[{name}]")));select.set_value("");}})}><option value="" selected={true}>{"Choose a field…"}</option>{for props.fields.iter().map(|f|html!{<option value={f.name.clone()}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</select></label></div>
+    html! {<div class="advanced-formula"><FormulaInput label={props.label.clone()} lookups={!props.summary} textarea={props.textarea.clone()} value={props.value.clone()} suggestions={props.suggestions.clone()} on_change={props.on_change.clone()} on_selection={props.on_selection.clone()} placeholder="=ROUND([price] * [quantity], 2)"/>
+        <p class="muted">{if props.summary {"Use [value_name] for another summary value, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions."}else{"Use [field_name] for a field, [collection.field] for a field of another collection, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions, then press Enter to insert. Select text to wrap it in a function."}}</p><div class="row"><button type="button" class="secondary" onclick={Callback::from({let change=props.on_library.clone();move |_|change.emit(())})}>{"Browse functions"}</button><label class="advanced-insert-field">{"Insert field"}<select aria-label="Insert input field" value="" onchange={Callback::from({let change=props.on_change.clone();let value=props.value.clone();let node=props.textarea.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();if select.value().is_empty(){return;}let name=select.value();let (start,end)=node.cast::<HtmlTextAreaElement>().map(|a|(a.selection_start().ok().flatten().unwrap_or(0) as usize,a.selection_end().ok().flatten().unwrap_or(0) as usize)).unwrap_or((value.encode_utf16().count(),value.encode_utf16().count()));let at=vulse_model::utf16_to_char_index(&value,start);let end=vulse_model::utf16_to_char_index(&value,end);let prefix=if value.is_empty(){"="}else{""};change.emit(replace_chars(&value,at,end,&format!("{prefix}[{name}]")));select.set_value("");}})}><option value="" selected={true}>{"Choose a field…"}</option>{for props.fields.iter().map(|f|html!{<option value={f.name.clone()}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</select></label></div>
     </div>}
 }
 
@@ -1247,9 +1401,10 @@ fn preview_schema(field: &FieldDef, fields: &[FieldDef]) -> (Blueprint, Vec<Fiel
         }
         if let Some(f) = fields.iter().find(|f| f.name == name)
             && let Some(formula) = &f.formula
-                && let Ok(deps) = vulse_model::formula_dependencies(formula) {
-                    pending.extend(deps);
-                }
+            && let Ok(deps) = vulse_model::formula_dependencies(formula)
+        {
+            pending.extend(deps);
+        }
     }
     let schema = Blueprint {
         title_field: None,
@@ -1450,12 +1605,117 @@ mod tests {
                 .unwrap(),
             "=[price] * 2"
         );
-        assert!(Draft::from_formula("=ROUND([price] * [quantity], 2)").is_none());
+        assert!(Draft::from_formula("=ROUND([price] * [quantity], 2)").is_some());
         assert_eq!(
             Draft::from_formula("=([part]/[total])*100").unwrap().task,
             "percentage"
         );
     }
+    #[test]
+    fn nested_formulas_preserve_precedence_conditions_and_results() {
+        let fields = vec![
+            field("price", FieldType::Number, None),
+            field("quantity", FieldType::Number, None),
+        ];
+        for (formula, expected) in [
+            ("=ROUND([price] * [quantity], 2)", json!(73.5)),
+            ("=([price] + 5) / ([quantity] - 1)", json!(14.75)),
+            (
+                "=IF(AND([price] > 20, [quantity] > 2), ROUND([price] * [quantity], 2), 0)",
+                json!(73.5),
+            ),
+            (
+                "=IF([price] > [quantity], [price] - [quantity], 0)",
+                json!(21.5),
+            ),
+            (
+                "=IFERROR(ROUND([price] / ([quantity] - 3), 2), 0)",
+                json!(0.0),
+            ),
+        ] {
+            let draft = guided_draft(formula, &fields).unwrap_or_else(|| panic!("{formula}"));
+            let generated = draft.formula(&fields).unwrap();
+            assert_eq!(
+                vulse_model::inspect_formula(&generated),
+                vulse_model::inspect_formula(formula)
+            );
+            let mut schema = Blueprint {
+                title_field: None,
+                fields: fields.clone(),
+            };
+            schema
+                .fields
+                .push(field("result", FieldType::Calculated, Some(&generated)));
+            let (body, errors) =
+                vulse_model::calculate_document(&schema, &json!({"price":24.5,"quantity":3}));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(body["result"], expected);
+        }
+        // Unary expressions that cannot be represented remain in the text editor.
+        assert!(guided_draft("=-([price] + 1)", &fields).is_none());
+    }
+
+    #[test]
+    fn criteria_pairs_repeat_and_optional_arguments_remove_from_the_end() {
+        let fields = vec![field("values", FieldType::Json, None)];
+        for task in ["SUMIFS", "COUNTIFS", "AVERAGEIFS", "MINIFS", "MAXIFS"] {
+            let mut draft = Draft::new(task);
+            draft.add_input();
+            draft.add_input();
+            for (index, argument) in draft.arguments().iter().enumerate() {
+                draft.inputs[index] = if argument.kind == Kind::Array {
+                    Binding {
+                        source: "field:values".into(),
+                        ..Binding::empty()
+                    }
+                } else {
+                    Binding::fixed(Kind::Any, ">0")
+                };
+            }
+            let formula = draft.formula(&fields).unwrap();
+            assert!(vulse_model::inspect_formula(&formula).is_ok(), "{formula}");
+            assert!(guided_draft(&formula, &fields).is_some(), "{formula}");
+            let start = draft.criteria_start().unwrap();
+            assert!(!draft.can_remove(start));
+            assert!(draft.can_remove(start + 2));
+            assert!(!draft.can_remove(start + 3));
+            draft.remove_input(start + 2);
+            assert!(vulse_model::inspect_formula(&draft.formula(&fields).unwrap()).is_ok());
+        }
+        let mut draft = Draft::new("MATCH");
+        draft.add_input();
+        assert!(draft.can_remove(draft.inputs.len() - 1));
+        assert!(!draft.can_remove(0));
+    }
+
+    #[test]
+    fn custom_inputs_are_parenthesized_and_validate_available_values() {
+        let fields = vec![
+            field("total", FieldType::Number, None),
+            field("records", FieldType::Number, None),
+        ];
+        let binding = Binding {
+            source: "expression".into(),
+            value: "=[total] / [records] + 1".into(),
+            ..Binding::empty()
+        };
+        let mut draft = Draft::new("multiply");
+        draft.inputs[0] = binding;
+        assert_eq!(
+            draft.formula(&fields).unwrap(),
+            "=([total] / [records] + 1) * 2"
+        );
+        draft.inputs[0].value = "[unknown]".into();
+        assert!(
+            draft
+                .formula(&fields)
+                .unwrap_err()
+                .contains("unknown input [unknown]")
+        );
+        draft.inputs[0].value = "ROUND(".into();
+        assert!(draft.formula(&fields).is_err());
+    }
+
     #[test]
     fn quoted_text_and_conditions_round_trip_through_the_shared_parser() {
         let values = [

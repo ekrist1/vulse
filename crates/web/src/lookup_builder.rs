@@ -1,6 +1,7 @@
 //! Guided calculations that read another collection: a sum, average,
 //! minimum, maximum or count of matching records, or a value from the first
-//! matching record. Builds `SUMIFS`-style formulas and reads them back.
+//! matching record. Supports math on the result and an empty result when
+//! nothing matches. Builds these formulas and reads them back losslessly.
 
 use serde_json::Value;
 use vulse_model::{CollectionView, FieldDef, FieldType, FormulaExpression as Expr};
@@ -15,6 +16,80 @@ pub(crate) const OPERATIONS: [(&str, &str); 6] = [
     ("COUNTIFS", "Count matching records"),
     ("XLOOKUP", "Value from the first matching record"),
 ];
+
+const RESULT_OPERATIONS: &[(&str, &str)] = &[
+    ("*", "Multiply by"),
+    ("/", "Divide by"),
+    ("+", "Add"),
+    ("-", "Subtract"),
+    ("^", "Raise to a power"),
+    ("ROUND", "Round to decimal places"),
+    ("ROUNDUP", "Round away from zero"),
+    ("ROUNDDOWN", "Round towards zero"),
+];
+
+/// Applied in order to the result, before handling records with no match.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct ResultStep {
+    pub op: String,
+    /// `fixed` for a number, or `field:<name>` for a field on this record.
+    pub source: String,
+    pub value: String,
+}
+impl Default for ResultStep {
+    fn default() -> Self {
+        Self {
+            op: "*".into(),
+            source: "fixed".into(),
+            value: "2".into(),
+        }
+    }
+}
+impl ResultStep {
+    fn operand(&self) -> Result<String, String> {
+        if let Some(name) = self
+            .source
+            .strip_prefix("field:")
+            .filter(|name| !name.is_empty())
+        {
+            return Ok(format!("[{name}]"));
+        }
+        if self.source == "fixed" {
+            if let Ok(number) = self.value.trim().parse::<f64>() {
+                if number.is_finite() {
+                    return Ok(number.to_string());
+                }
+            }
+        }
+        Err("choose a numeric field or enter a number.".into())
+    }
+    fn apply(&self, expression: &str) -> Result<String, String> {
+        let value = self.operand()?;
+        match self.op.as_str() {
+            "+" | "-" | "*" | "/" | "^" => Ok(format!("({expression}) {} {value}", self.op)),
+            "ROUND" | "ROUNDUP" | "ROUNDDOWN" => Ok(format!("{}({expression}, {value})", self.op)),
+            _ => Err("choose a math operation.".into()),
+        }
+    }
+    fn from_expr(op: &str, value: &Expr) -> Option<Self> {
+        let (source, value) = match value {
+            Expr::Field(name) if !name.contains('.') => (format!("field:{name}"), String::new()),
+            Expr::Literal(v) if v.is_number() => ("fixed".into(), v.as_f64()?.to_string()),
+            Expr::Unary('-', inner) => {
+                let Expr::Literal(v) = inner.as_ref() else {
+                    return None;
+                };
+                ("fixed".into(), (-v.as_f64()?).to_string())
+            }
+            _ => return None,
+        };
+        Some(Self {
+            op: op.into(),
+            source,
+            value,
+        })
+    }
+}
 
 /// "Their `field` equals this record's `source` (plus `adjust`)", or a fixed value.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -36,6 +111,9 @@ pub(crate) struct LookupDraft {
     pub conditions: Vec<Condition>,
     /// XLOOKUP's result when nothing matches; empty for an error.
     pub fallback: String,
+    /// Guard the whole calculation, including math, with a matching-record count.
+    pub empty_when_missing: bool,
+    pub steps: Vec<ResultStep>,
 }
 
 /// Fields of another collection a formula may read: not calculated fields
@@ -81,6 +159,8 @@ impl LookupDraft {
                 ..Condition::default()
             }],
             fallback: String::new(),
+            empty_when_missing: false,
+            steps: Vec::new(),
         }
     }
 
@@ -123,6 +203,39 @@ impl LookupDraft {
     }
 
     pub fn formula(&self) -> Result<String, String> {
+        let base = self.base_formula()?;
+        let mut expression = base.trim_start_matches('=').to_string();
+        for (index, step) in self.steps.iter().enumerate() {
+            expression = step
+                .apply(&expression)
+                .map_err(|error| format!("Math step {}: {error}", index + 1))?;
+        }
+        if self.empty_when_missing {
+            let missing = if self.op == "XLOOKUP" {
+                // XLOOKUP matches literal keys; COUNTIFS interprets wildcards and
+                // comparison prefixes. Probe the matching key with XLOOKUP itself.
+                // Its text length is always >= 0, including empty/null keys.
+                let key = Self {
+                    field: self.conditions[0].field.clone(),
+                    fallback: String::new(),
+                    ..self.clone()
+                }
+                .base_formula()?;
+                format!("IFERROR(LEN({}), -1) = -1", key.trim_start_matches('='))
+            } else {
+                let count = Self {
+                    op: "COUNTIFS".into(),
+                    ..self.clone()
+                }
+                .base_formula()?;
+                format!("{} = 0", count.trim_start_matches('='))
+            };
+            expression = format!("IF({missing}, \"\", {expression})");
+        }
+        Ok(format!("={expression}"))
+    }
+
+    fn base_formula(&self) -> Result<String, String> {
         if self.collection.is_empty() {
             return Err("Choose a collection.".into());
         }
@@ -140,6 +253,11 @@ impl LookupDraft {
             pairs.push((self.column(&condition.field), self.value(condition, index)?));
         }
         if self.op == "XLOOKUP" {
+            if pairs.len() != 1 {
+                return Err(
+                    "Looking up the first matching record requires one matching field.".into(),
+                );
+            }
             let (column, value) = &pairs[0];
             let fallback = if self.fallback.trim().is_empty() {
                 String::new()
@@ -164,7 +282,39 @@ impl LookupDraft {
 
     /// Reads back a formula this builder wrote, or `None`.
     pub fn from_formula(formula: &str) -> Option<Self> {
-        let Expr::Call(op, args) = vulse_model::inspect_formula(formula).ok()? else {
+        let parsed = vulse_model::inspect_formula(formula).ok()?;
+        let mut expression = &parsed;
+        let mut empty_when_missing = false;
+        if let Expr::Call(name, args) = expression {
+            if name == "IF"
+                && args.len() == 3
+                && matches!(&args[1], Expr::Literal(Value::String(s)) if s.is_empty())
+            {
+                empty_when_missing = true;
+                expression = &args[2];
+            }
+        }
+        let mut steps = Vec::new();
+        loop {
+            match expression {
+                Expr::Binary(op, left, right)
+                    if ["+", "-", "*", "/", "^"].contains(&op.as_str()) =>
+                {
+                    steps.push(ResultStep::from_expr(op, right)?);
+                    expression = left;
+                }
+                Expr::Call(op, args)
+                    if ["ROUND", "ROUNDUP", "ROUNDDOWN"].contains(&op.as_str())
+                        && args.len() == 2 =>
+                {
+                    steps.push(ResultStep::from_expr(op, &args[1])?);
+                    expression = &args[0];
+                }
+                _ => break,
+            }
+        }
+        steps.reverse();
+        let Expr::Call(op, args) = expression else {
             return None;
         };
         let column = |e: &Expr| match e {
@@ -208,6 +358,8 @@ impl LookupDraft {
             field: String::new(),
             conditions: Vec::new(),
             fallback: String::new(),
+            empty_when_missing,
+            steps,
         };
         let mut collections = Vec::new();
         match op.as_str() {
@@ -246,7 +398,8 @@ impl LookupDraft {
         if collections.iter().any(|c| *c != draft.collection) {
             return None;
         }
-        // Only when writing it back gives the same formula.
+        // This also verifies the guard counts exactly the same records as the lookup,
+        // and that math order, fallback types and operator precedence are unchanged.
         (vulse_model::inspect_formula(&draft.formula().ok()?).ok()?
             == vulse_model::inspect_formula(formula).ok()?)
         .then_some(draft)
@@ -311,14 +464,37 @@ impl LookupDraft {
             })
             .collect();
         let mut text = format!("{start} where {}.", conditions.join(" and "));
-        if self.op == "XLOOKUP" {
+        for step in &self.steps {
+            let operation = RESULT_OPERATIONS
+                .iter()
+                .find(|(op, _)| *op == step.op)
+                .map(|(_, label)| *label)
+                .unwrap_or(&step.op);
+            let value = step
+                .source
+                .strip_prefix("field:")
+                .map(|name| format!("this record's {}", own(name)))
+                .unwrap_or_else(|| step.value.clone());
+            text.push_str(&match step.op.as_str() {
+                "ROUND" => format!(" Then round to {value} decimal places."),
+                "ROUNDUP" => format!(" Then round away from zero to {value} decimal places."),
+                "ROUNDDOWN" => format!(" Then round towards zero to {value} decimal places."),
+                _ => format!(" Then {} {value}.", operation.to_lowercase()),
+            });
+        }
+        if self.empty_when_missing {
+            text.push_str(" Returns empty text only when no records match.");
+        } else if self.op == "XLOOKUP" {
             text.push_str(&if self.fallback.trim().is_empty() {
                 " Shows an error when nothing matches.".to_string()
             } else {
-                format!(" Shows “{}” when nothing matches.", self.fallback)
+                format!(
+                    " Uses “{}” before any math steps when nothing matches.",
+                    self.fallback
+                )
             });
-        } else if self.op != "COUNTIFS" && self.op != "AVERAGEIFS" {
-            text.push_str(" Gives 0 when nothing matches.");
+        } else if self.op != "AVERAGEIFS" {
+            text.push_str(" Starts with 0 when nothing matches, then applies any math steps.");
         }
         text
     }
@@ -463,7 +639,31 @@ pub(crate) fn lookup_builder(props: &LookupBuilderProps) -> Html {
             })}
         </div>
         if draft.op != "XLOOKUP" {<button type="button" class="secondary" onclick={add}>{"+ Add condition"}</button>}
-        else {<label class="lookup-fallback">{"If nothing matches (optional)"}<input aria-label="Lookup fallback" placeholder="Leave empty to show an error" value={draft.fallback.clone()} oninput={on_fallback}/></label>}
+        <h4 class="lookup-heading">{"When no records match"}</h4>
+        <label class="lookup-empty"><input type="checkbox" checked={draft.empty_when_missing} onchange={Callback::from({let draft=draft.clone();let change=props.on_change.clone();move |e:Event|{let mut next=draft.clone();next.empty_when_missing=e.target_unchecked_into::<HtmlInputElement>().checked();change.emit(next);}})}/>{"Return empty text when no records match"}</label>
+        <p class="muted">{"When enabled, missing matches return empty text and skip the math steps below. Matching values, including 0, are calculated normally."}</p>
+        if draft.op=="XLOOKUP" && !draft.empty_when_missing {<label class="lookup-fallback">{"If nothing matches (optional)"}<input aria-label="Lookup fallback" placeholder="Leave empty to show an error" value={draft.fallback.clone()} oninput={on_fallback}/></label>}
+        <h4 class="lookup-heading">{"Calculate with the result"}</h4>
+        <p class="muted">{"Add steps to apply in order. Each step uses the result of the previous step."}</p>
+        <div class="lookup-result-steps">{for draft.steps.iter().enumerate().map(|(index, step)| {
+            let n = index + 1;
+            let on_op = {let draft=draft.clone();let change=props.on_change.clone();Callback::from(move |e:Event|{let mut next=draft.clone();next.steps[index].op=select_value(e);change.emit(next);})};
+            let on_source = {let draft=draft.clone();let change=props.on_change.clone();Callback::from(move |e:Event|{let mut next=draft.clone();next.steps[index].source=select_value(e);change.emit(next);})};
+            let on_value = {let draft=draft.clone();let change=props.on_change.clone();Callback::from(move |e:InputEvent|{let mut next=draft.clone();next.steps[index].value=input_value(e);change.emit(next);})};
+            let remove = {let draft=draft.clone();let change=props.on_change.clone();Callback::from(move |_|{let mut next=draft.clone();next.steps.remove(index);change.emit(next);})};
+            html!{<div class="lookup-result-step" role="group" aria-label={format!("Math step {n}")} key={index}>
+                <label>{format!("Step {n}")}<select aria-label={format!("Math step {n} operation")} onchange={on_op}>
+                    {for RESULT_OPERATIONS.iter().map(|(op,label)|html!{<option value={*op} selected={step.op==*op}>{*label}</option>})}
+                </select></label>
+                <label>{if step.op.starts_with("ROUND"){"Decimal places"}else{"Value"}}<select aria-label={format!("Math step {n} source")} onchange={on_source}>
+                    <option value="fixed" selected={step.source=="fixed"}>{"Fixed number"}</option>
+                    <optgroup label="This record">{for props.inputs.iter().filter(|f|numeric(f)).map(|f|html!{<option value={format!("field:{}",f.name)} selected={step.source==format!("field:{}",f.name)}>{format!("{} [{}]",f.display_label(),f.name)}</option>})}</optgroup>
+                </select></label>
+                if step.source=="fixed" {<label>{"Number"}<input type="number" step="any" aria-label={format!("Math step {n} number")} value={step.value.clone()} oninput={on_value}/></label>}
+                <button type="button" class="text-button" aria-label={format!("Remove math step {n}")} onclick={remove}>{"Remove"}</button>
+            </div>}
+        })}</div>
+        <button type="button" class="secondary" onclick={Callback::from({let draft=draft.clone();let change=props.on_change.clone();move |_|{let mut next=draft.clone();next.steps.push(ResultStep::default());change.emit(next);}})}>{"+ Add math step"}</button>
         <p class="lookup-sentence">{draft.sentence(&props.inputs, collection)}</p>
     </div>}
 }
@@ -471,6 +671,221 @@ pub(crate) fn lookup_builder(props: &LookupBuilderProps) -> Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GUARDED_SUM: &str = "=IF(COUNTIFS([aarsmelding.org_nummer]; [orgnummer]; [aarsmelding.aar]; [aar]) = 0; \"\"; SUMIFS([aarsmelding.aarsverk_ex_spesped]; [aarsmelding.org_nummer]; [orgnummer]; [aarsmelding.aar]; [aar]))";
+
+    fn evaluate(
+        formula: &str,
+        org: &str,
+        factor: f64,
+    ) -> (Value, std::collections::BTreeMap<String, String>) {
+        use serde_json::json;
+        use std::sync::Arc;
+        use vulse_model::{Blueprint, LookupColumn, Lookups, calculate_document_with};
+        let blueprint: Blueprint = serde_json::from_value(json!({"fields":[
+            {"name":"orgnummer", "type":"string"},
+            {"name":"aar", "type":"number"},
+            {"name":"factor", "type":"number"},
+            {"name":"result", "type":"calculated", "formula":formula}
+        ]}))
+        .unwrap();
+        let mut lookups = Lookups::default();
+        for (name, values) in [
+            (
+                "org_nummer",
+                vec![
+                    json!("positive"),
+                    json!("positive"),
+                    json!("zero"),
+                    json!("*"),
+                    json!("*"),
+                    json!("other-year"),
+                ],
+            ),
+            (
+                "aar",
+                vec![
+                    json!(2025),
+                    json!(2025),
+                    json!(2025),
+                    json!(2025),
+                    json!(2025),
+                    json!(2024),
+                ],
+            ),
+            (
+                "aarsverk_ex_spesped",
+                vec![
+                    json!(4.2),
+                    json!(8.3),
+                    json!(0),
+                    json!(0),
+                    json!(9),
+                    json!(7),
+                ],
+            ),
+        ] {
+            lookups.insert(
+                "aarsmelding",
+                name,
+                Arc::new(LookupColumn::new("aarsmelding", values)),
+            );
+        }
+        calculate_document_with(
+            &blueprint,
+            &json!({"orgnummer":org,"aar":2025,"factor":factor}),
+            &lookups,
+        )
+    }
+
+    #[test]
+    fn empty_when_missing_preserves_real_zero_and_all_matching_conditions() {
+        let draft = LookupDraft::from_formula(GUARDED_SUM).unwrap();
+        assert!(draft.empty_when_missing);
+        assert_eq!(draft.conditions.len(), 2);
+        assert_eq!(draft.op, "SUMIFS");
+        let formula = draft.formula().unwrap();
+        assert_eq!(
+            vulse_model::inspect_formula(&formula),
+            vulse_model::inspect_formula(GUARDED_SUM)
+        );
+        for (org, expected) in [
+            ("positive", serde_json::json!(12.5)),
+            ("zero", serde_json::json!(0.0)),
+            ("missing", serde_json::json!("")),
+            ("other-year", serde_json::json!("")),
+        ] {
+            let (body, errors) = evaluate(&formula, org, 2.0);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(body["result"], expected, "{org}");
+        }
+        // A guard for different records must stay in the advanced editor.
+        let different_guard = GUARDED_SUM.replacen(
+            "[aarsmelding.aar]; [aar]",
+            "[aarsmelding.aar]; [aar] - 1",
+            1,
+        );
+        assert!(LookupDraft::from_formula(&different_guard).is_none());
+        let different_fallback = GUARDED_SUM.replacen("\"\"", "\"Not found\"", 1);
+        assert!(LookupDraft::from_formula(&different_fallback).is_none());
+    }
+
+    #[test]
+    fn result_steps_preserve_order_and_keep_the_no_match_guard_outside_math() {
+        let mut draft = LookupDraft::from_formula(GUARDED_SUM).unwrap();
+        draft.steps = vec![
+            ResultStep {
+                op: "*".into(),
+                source: "field:factor".into(),
+                value: String::new(),
+            },
+            ResultStep {
+                op: "+".into(),
+                source: "fixed".into(),
+                value: "1".into(),
+            },
+            ResultStep {
+                op: "/".into(),
+                source: "fixed".into(),
+                value: "3".into(),
+            },
+            ResultStep {
+                op: "ROUND".into(),
+                source: "fixed".into(),
+                value: "2".into(),
+            },
+        ];
+        let formula = draft.formula().unwrap();
+        assert_eq!(LookupDraft::from_formula(&formula), Some(draft.clone()));
+        for (org, expected) in [
+            ("positive", serde_json::json!(8.67)),
+            ("zero", serde_json::json!(0.33)),
+            ("missing", serde_json::json!("")),
+        ] {
+            let (body, errors) = evaluate(&formula, org, 2.0);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(body["result"], expected, "{org}");
+        }
+        // No matches skip math errors; errors on a real match are still reported.
+        draft.steps[2].value = "0".into();
+        let formula = draft.formula().unwrap();
+        assert!(evaluate(&formula, "missing", 2.0).1.is_empty());
+        assert!(evaluate(&formula, "positive", 2.0).1.contains_key("result"));
+        for op in ["SUMIFS", "AVERAGEIFS", "MINIFS", "MAXIFS", "COUNTIFS"] {
+            draft.op = op.into();
+            let formula = draft.formula().unwrap();
+            let restored = LookupDraft::from_formula(&formula).unwrap();
+            assert_eq!(restored.steps, draft.steps);
+            assert_eq!(restored.formula().unwrap(), formula);
+        }
+    }
+
+    #[test]
+    fn first_match_math_uses_literal_lookup_keys_and_preserves_errors() {
+        let base =
+            "=XLOOKUP([orgnummer], [aarsmelding.org_nummer], [aarsmelding.aarsverk_ex_spesped])";
+        let mut draft = LookupDraft::from_formula(base).unwrap();
+        draft.empty_when_missing = true;
+        draft.steps = vec![ResultStep::default()];
+        let formula = draft.formula().unwrap();
+        assert_eq!(LookupDraft::from_formula(&formula), Some(draft.clone()));
+        for (org, expected) in [
+            ("positive", serde_json::json!(8.4)),
+            ("zero", serde_json::json!(0.0)),
+            ("*", serde_json::json!(0.0)),
+            ("?", serde_json::json!("")),
+            ("missing", serde_json::json!("")),
+        ] {
+            let (body, errors) = evaluate(&formula, org, 2.0);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(body["result"], expected, "{org}");
+        }
+        draft.steps[0].op = "/".into();
+        draft.steps[0].value = "0".into();
+        let formula = draft.formula().unwrap();
+        assert!(evaluate(&formula, "positive", 2.0).1.contains_key("result"));
+        assert!(evaluate(&formula, "missing", 2.0).1.is_empty());
+    }
+
+    #[test]
+    fn math_operations_round_trip_with_fields_and_negative_numbers() {
+        let mut draft = LookupDraft::from_formula(GUARDED_SUM).unwrap();
+        for (op, _) in RESULT_OPERATIONS {
+            for source in ["fixed", "field:factor"] {
+                draft.steps = vec![ResultStep {
+                    op: (*op).into(),
+                    source: source.into(),
+                    value: if source == "fixed" {
+                        "-2".into()
+                    } else {
+                        String::new()
+                    },
+                }];
+                for empty in [true, false] {
+                    draft.empty_when_missing = empty;
+                    let formula = draft.formula().unwrap();
+                    assert_eq!(
+                        LookupDraft::from_formula(&formula),
+                        Some(draft.clone()),
+                        "{formula}"
+                    );
+                }
+            }
+        }
+        draft.steps = vec![ResultStep {
+            value: "".into(),
+            ..ResultStep::default()
+        }];
+        assert!(draft.formula().unwrap_err().starts_with("Math step 1:"));
+        draft.steps[0].value = "NaN".into();
+        assert!(draft.formula().is_err());
+        // Neither swapping operands nor moving the guard inside math is silently rewritten.
+        assert!(LookupDraft::from_formula("=2 / SUMIFS([a.x], [a.y], [z])").is_none());
+        assert!(
+            LookupDraft::from_formula(&format!("=({}) * 2", GUARDED_SUM.trim_start_matches('=')))
+                .is_none()
+        );
+    }
 
     #[test]
     fn writes_and_reads_back_lookup_formulas() {
@@ -496,6 +911,8 @@ mod tests {
                 },
             ],
             fallback: String::new(),
+            empty_when_missing: false,
+            steps: Vec::new(),
         };
         let formula = draft.formula().unwrap();
         assert_eq!(
@@ -543,6 +960,8 @@ mod tests {
                 ..Condition::default()
             }],
             fallback: String::new(),
+            empty_when_missing: false,
+            steps: Vec::new(),
         };
         assert!(
             draft

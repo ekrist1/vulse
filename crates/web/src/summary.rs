@@ -11,7 +11,7 @@ use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
 use crate::api;
-use crate::formula_input::{FormulaInput, Suggestion};
+use crate::formula_builder::FormulaEditor;
 
 /// A useful first summary: grouped by the first text, reference or date
 /// field, summing the first number field.
@@ -554,17 +554,28 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
             }));
             Callback::from(move |_| run())
         };
-        // Other values can be used in the formula by name.
-        let others: Vec<Suggestion> = spec
-            .measures
-            .iter()
-            .filter(|m| m.name != measure.name && !m.name.is_empty())
-            .map(|m| Suggestion {
-                name: m.name.clone(),
-                label: m.name.clone(),
-                detail: describe(&props.fields, m),
-            })
-            .collect();
+        // Summary formulas read aggregated values, never raw document fields.
+        let formula_fields: Vec<FieldDef> = spec.measures.iter()
+            .filter(|m| !m.name.is_empty())
+            .map(|m| FieldDef {
+                name: m.name.clone(), label: None, description: None, example: None,
+                kind: match m.op {
+                    SummaryOp::Formula => FieldType::Calculated,
+                    SummaryOp::Min | SummaryOp::Max => m.field.as_ref()
+                        .and_then(|name| props.fields.iter().find(|f| f.name == *name))
+                        .map(|f| f.kind).unwrap_or(FieldType::Number),
+                    _ => FieldType::Number,
+                },
+                formula: m.formula.clone(), required: false, collection: None,
+                items: None, renamed_from: None, options: None, renamed_options: None,
+            }).collect();
+        let formula_field = formula_fields.iter().find(|f| f.name == measure.name).cloned()
+            .unwrap_or_else(|| FieldDef {
+                name: measure.name.clone(), kind: FieldType::Calculated,
+                formula: measure.formula.clone(), label: None, description: None,
+                example: None, required: false, collection: None, items: None,
+                renamed_from: None, options: None, renamed_options: None,
+            });
         html! {<div class="summary-row measure-row" key={format!("measure-{index}")}>
             <label>{"Name"}
                 <input aria-label={format!("Value {} name", index + 1)} value={measure.name.clone()} oninput={on_name}/>
@@ -575,7 +586,7 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
                 </select>
             </label>
             if measure.op == SummaryOp::Formula {
-                <FormulaInput label={format!("Value {} formula", index + 1)} rows={2} library={true} placeholder="=[total_revenue]/[records]" value={measure.formula.clone().unwrap_or_default()} suggestions={others.clone()} on_change={on_formula}/>
+                <FormulaEditor summary={true} formula_label={format!("Value {} formula", index + 1)} field={formula_field} fields={formula_fields} on_change={Callback::from(move |field:FieldDef|on_formula.emit(field.formula.unwrap_or_default()))}/>
             } else {
                 <label>{"Of field"}
                     <select aria-label={format!("Value {} field", index + 1)} onchange={on_field}>

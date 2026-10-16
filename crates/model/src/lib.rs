@@ -28,12 +28,12 @@ pub use summary::{
 
 pub use blueprint::{
     ArrayItems, Blueprint, CheckedDocument, DocumentRef, FieldDef, FieldType, MAX_FIELD_OPTIONS,
-    MAX_OPTION_LENGTH, record_title, reference_collections, take_field_renames,
+    MAX_OPTION_LENGTH, match_headers, record_title, reference_collections, take_field_renames,
     take_option_renames, validate_blueprint, validate_document,
 };
 pub use identity::{
-    check_collection_name, check_email, check_handle, check_key_name, check_password, is_date,
-    is_uuid, page_bounds,
+    check_collection_name, check_email, check_handle, check_key_name, check_password,
+    field_name_from, is_date, is_field_name, is_uuid, page_bounds,
 };
 pub use portable_text::{
     BlockStyle, EditorBlock, ListItem, Mark, MarkRange, clamp_marks, editor_blocks_from_json,
@@ -349,6 +349,29 @@ pub struct ImportResult {
     pub preview: Vec<serde_json::Value>,
     pub errors: Vec<ImportIssue>,
     pub imported: usize,
+}
+
+/// Fields suggested from a spreadsheet's columns, for review before they
+/// are added to a collection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldSuggestions {
+    pub sheets: Vec<String>,
+    pub sheet: String,
+    pub row_count: usize,
+    pub columns: Vec<SuggestedField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuggestedField {
+    /// The column header as written in the file.
+    pub header: String,
+    /// A valid field name made from the header, unique among the columns.
+    pub name: String,
+    /// The type every nonempty cell in the column can be imported as.
+    #[serde(rename = "type")]
+    pub kind: FieldType,
+    /// Up to three distinct values from the column.
+    pub samples: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

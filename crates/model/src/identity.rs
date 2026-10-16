@@ -105,6 +105,50 @@ pub fn is_field_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// A field name for a column header or label: lowercase ASCII letters,
+/// digits and underscores, with common accented letters spelled out
+/// (`Årlig premie` → `arlig_premie`). Names already in `taken` get a number.
+pub fn field_name_from(label: &str, taken: &[String]) -> String {
+    let mut name = String::new();
+    for c in label.trim().to_lowercase().chars() {
+        let spelled = match c {
+            'a'..='z' | '0'..='9' => None,
+            'æ' => Some("ae"),
+            'ø' | 'ö' | 'ó' | 'ò' | 'ô' | 'õ' => Some("o"),
+            'å' | 'ä' | 'á' | 'à' | 'â' | 'ã' => Some("a"),
+            'é' | 'è' | 'ê' | 'ë' => Some("e"),
+            'í' | 'ì' | 'î' | 'ï' => Some("i"),
+            'ú' | 'ù' | 'û' | 'ü' => Some("u"),
+            'ß' => Some("ss"),
+            'ç' => Some("c"),
+            'ñ' => Some("n"),
+            _ => Some("_"),
+        };
+        match spelled {
+            None => name.push(c),
+            Some("_") => {
+                if !name.is_empty() && !name.ends_with('_') {
+                    name.push('_');
+                }
+            }
+            Some(text) => name.push_str(text),
+        }
+    }
+    let mut name = name.trim_end_matches('_').to_string();
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        name.insert_str(0, if name.is_empty() { "field" } else { "f_" });
+    }
+    name.truncate(60);
+    let name = name.trim_end_matches('_').to_string();
+    let mut unique = name.clone();
+    let mut number = 2;
+    while taken.contains(&unique) {
+        unique = format!("{name}_{number}");
+        number += 1;
+    }
+    unique
+}
+
 fn is_slug(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -116,7 +160,26 @@ fn is_slug(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_date;
+    use super::{field_name_from, is_date, is_field_name};
+
+    #[test]
+    fn field_names_from_headers_are_valid_and_unique() {
+        let taken = vec!["premie".to_string(), "premie_2".to_string()];
+        for (label, name) in [
+            ("Årlig premie", "arlig_premie"),
+            ("  Sum (NOK) ", "sum_nok"),
+            ("Kjønn", "kjonn"),
+            ("2024", "f_2024"),
+            ("%", "field"),
+            ("Premie", "premie_3"),
+            ("Column 1", "column_1"),
+        ] {
+            let got = field_name_from(label, &taken);
+            assert_eq!(got, name);
+            assert!(is_field_name(&got), "{got}");
+        }
+        assert!(field_name_from(&"x".repeat(100), &[]).len() <= 64);
+    }
 
     #[test]
     fn dates_must_be_real_iso_calendar_days() {

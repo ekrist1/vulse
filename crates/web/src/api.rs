@@ -313,6 +313,25 @@ pub async fn import_file(
     expect(request.send().await.map_err(|e| e.to_string())?).await
 }
 
+/// Reads a spreadsheet's columns as suggested fields; changes nothing.
+pub async fn suggest_fields(
+    id: &str,
+    file: &File,
+    sheet: &str,
+) -> Result<vulse_model::FieldSuggestions, String> {
+    let form = FormData::new().map_err(|e| format!("{e:?}"))?;
+    form.append_with_blob_and_filename("file", file, &file.name())
+        .map_err(|e| format!("{e:?}"))?;
+    form.append_with_str("sheet", sheet)
+        .map_err(|e| format!("{e:?}"))?;
+    let request = with_credentials(Request::post(&format!(
+        "/api/v1/collections/{id}/import/fields"
+    )))
+    .body(form)
+    .map_err(|e| e.to_string())?;
+    expect(request.send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn query_records(
     id: &str,
     query: &vulse_model::RecordQuery,

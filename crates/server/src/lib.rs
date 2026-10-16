@@ -202,6 +202,10 @@ fn api() -> Router<AppState> {
 
     let imports = Router::new()
         .route("/collections/{id}/import", post(import::import_file))
+        .route(
+            "/collections/{id}/import/fields",
+            post(import::suggest_fields),
+        )
         .layer(DefaultBodyLimit::max(import::MAX_BYTES + 64 * 1024));
 
     let uploads = Router::new()

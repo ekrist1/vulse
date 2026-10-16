@@ -4,6 +4,7 @@ mod collection_api;
 mod confirm;
 mod drafts;
 mod editor;
+mod field_import;
 mod form;
 mod formula_builder;
 mod formula_input;

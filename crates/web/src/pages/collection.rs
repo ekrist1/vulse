@@ -3,6 +3,7 @@ use crate::{
     app::{Route, SessionCtx, Shell, signed_out},
     collection_api::CollectionApi,
     confirm::{ConfirmRequest, use_confirm},
+    field_import::FieldsFromFile,
     formula_builder::FormulaEditor,
     import::ImportPanel,
 };
@@ -478,7 +479,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 if *tab=="data" {<crate::records::RecordsPanel key={item.id.clone()} collection={item.clone()} collections={(*collections).clone()}/>}
                 if *tab=="fields" {<fieldset class="draft-fields" disabled={*busy||pending.is_some()}>
                     <div class="section-heading"><div><h2>{"Shape your collection"}</h2><p class="muted">{"Choose the fields each record contains. Calculated fields update automatically."}</p></div><button disabled={*busy} onclick={on_save.clone()}>{if *busy{"Saving…"}else{"Save fields"}}</button></div>
-                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} saved_options={item.blueprint.fields.iter().filter_map(|f|Some((f.name.clone(),f.options.clone()?))).collect::<std::collections::BTreeMap<_,_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
+                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor collection_id={item.id.clone()} records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} saved_options={item.blueprint.fields.iter().filter_map(|f|Some((f.name.clone(),f.options.clone()?))).collect::<std::collections::BTreeMap<_,_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
                 </fieldset>}
                 if *tab=="import" {<ImportPanel key={props.id.clone()} collection={item.clone()} on_import={Callback::from({let refresh=refresh.clone();move |_|refresh.set(*refresh+1)})}/>}
                 if *tab=="api" {<CollectionApi collection={item.clone()}/>}
@@ -493,6 +494,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
 
 #[derive(Properties, PartialEq)]
 struct BlueprintEditorProps {
+    collection_id: String,
     records: Vec<DocumentView>,
     fields: Vec<FieldDef>,
     collections: Vec<CollectionView>,
@@ -536,6 +538,15 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
             on_change.emit(next);
         })
     };
+    let add_many = {
+        let fields = props.fields.clone();
+        let on_change = props.on_change.clone();
+        Callback::from(move |added: Vec<FieldDef>| {
+            let mut next = fields.clone();
+            next.extend(added);
+            on_change.emit(next);
+        })
+    };
     html! {
         <section class="card">
             <h2>{"Collection fields"}</h2>
@@ -572,7 +583,7 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                     />
                 }
             }) }
-            <button type="button" onclick={add}>{"Add field"}</button>
+            <div class="row"><button type="button" onclick={add}>{"Add field"}</button><FieldsFromFile collection_id={props.collection_id.clone()} fields={props.fields.clone()} on_add={add_many}/></div>
         </section>
     }
 }

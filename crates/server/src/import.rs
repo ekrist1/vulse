@@ -1,5 +1,5 @@
 use crate::{
-    auth::Editor,
+    auth::{Editor, SchemaAdmin},
     content::{check_body, workspace_collection},
     error::AppError,
     state::AppState,
@@ -12,7 +12,9 @@ use axum::{
 use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use serde_json::{Map, Value};
 use std::{collections::HashSet, io::Cursor};
-use vulse_model::{Blueprint, FieldType, ImportIssue, ImportResult};
+use vulse_model::{
+    Blueprint, FieldSuggestions, FieldType, ImportIssue, ImportResult, SuggestedField,
+};
 
 pub const MAX_BYTES: usize = 50 * 1024 * 1024;
 const MAX_ROWS: usize = 50_000;
@@ -130,21 +132,18 @@ pub async fn import_file(
             let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
             let mapping = match mapping {
                 Some(m) => m,
-                None => table
-                    .headers
-                    .iter()
-                    .map(|h| {
-                        collection
-                            .blueprint
-                            .fields
-                            .iter()
-                            .find(|f| {
-                                f.name == h.trim().to_ascii_lowercase()
-                                    && f.kind != FieldType::Calculated
-                            })
-                            .map(|f| f.name.clone())
-                    })
-                    .collect(),
+                None => {
+                    let fields: Vec<_> = collection
+                        .blueprint
+                        .fields
+                        .iter()
+                        .filter(|f| f.kind != FieldType::Calculated)
+                        .collect();
+                    vulse_model::match_headers(&table.headers, &fields)
+                        .into_iter()
+                        .map(|index| index.map(|i| fields[i].name.clone()))
+                        .collect()
+                }
             };
             validate_mapping(&collection.blueprint, &table.headers, &mapping)?;
             let mut result = ImportResult {
@@ -292,6 +291,133 @@ pub async fn import_file(
         .await?;
     Ok(Json(result))
 }
+/// Reads a spreadsheet's columns and suggests a field for each, without
+/// changing the collection. The fields are added by a later schema update.
+pub async fn suggest_fields(
+    State(state): State<AppState>,
+    SchemaAdmin(principal): SchemaAdmin,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<FieldSuggestions>, AppError> {
+    let conn = state.db.connect().await?;
+    workspace_collection(&conn, &principal, &id).await?;
+    let mut file = None;
+    let mut sheet = String::new();
+    let mut has_headers = true;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad(e.to_string()))?
+    {
+        let name = field.name().unwrap_or("").to_owned();
+        if name == "file" {
+            if file.is_some() {
+                return Err(AppError::bad("send one file"));
+            }
+            let file_name = field.file_name().unwrap_or("").to_owned();
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::bad(e.to_string()))?;
+            if bytes.len() > MAX_BYTES {
+                return Err(AppError::PayloadTooLarge);
+            }
+            file = Some((file_name, bytes.to_vec()));
+            continue;
+        }
+        let value = field
+            .text()
+            .await
+            .map_err(|e| AppError::bad(e.to_string()))?;
+        match name.as_str() {
+            "sheet" => sheet = value,
+            "has_headers" if value == "true" || value == "false" => {
+                has_headers = value == "true"
+            }
+            "has_headers" => return Err(AppError::bad("has_headers must be true or false")),
+            _ => return Err(AppError::bad("unknown option")),
+        }
+    }
+    let (name, bytes) = file.ok_or_else(|| AppError::bad("missing file"))?;
+    let table = tokio::task::spawn_blocking(move || parse_file(&name, &bytes, &sheet, has_headers))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .map_err(AppError::bad)?;
+    Ok(Json(suggestions(&table)))
+}
+
+fn suggestions(table: &Table) -> FieldSuggestions {
+    let mut names = Vec::new();
+    let columns = table
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            let cells: Vec<&str> = table
+                .rows
+                .iter()
+                .filter_map(|row| row.get(index).map(|c| c.trim()))
+                .filter(|c| !c.is_empty())
+                .collect();
+            let mut samples: Vec<String> = Vec::new();
+            for cell in &cells {
+                if samples.len() == 3 {
+                    break;
+                }
+                if !samples.iter().any(|s| s == cell) {
+                    samples.push(cell.chars().take(80).collect());
+                }
+            }
+            let name = vulse_model::field_name_from(header, &names);
+            names.push(name.clone());
+            SuggestedField {
+                header: header.trim().into(),
+                name,
+                kind: suggested_kind(&cells),
+                samples,
+            }
+        })
+        .collect();
+    FieldSuggestions {
+        sheets: table.sheets.clone(),
+        sheet: table.sheet.clone(),
+        row_count: table
+            .rows
+            .iter()
+            .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+            .count(),
+        columns,
+    }
+}
+
+/// The narrowest type every cell imports as: number, then date, then
+/// yes/no, then text. Empty columns are text.
+fn suggested_kind(cells: &[&str]) -> FieldType {
+    let fits = |kind| {
+        !cells.is_empty()
+            && cells.iter().all(|cell| {
+                decimal_comma(kind, cell)
+                    .and_then(|c| convert(kind, &c))
+                    .is_ok()
+            })
+    };
+    let words = |cell: &&str| {
+        matches!(
+            cell.to_ascii_lowercase().as_str(),
+            "true" | "false" | "yes" | "no"
+        )
+    };
+    if fits(FieldType::Number) {
+        FieldType::Number
+    } else if fits(FieldType::Date) {
+        FieldType::Date
+    } else if !cells.is_empty() && cells.iter().all(words) {
+        FieldType::Boolean
+    } else {
+        FieldType::String
+    }
+}
+
 // Exact decimal normalization avoids treating large distinct integers as equal.
 fn match_key(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
@@ -688,6 +814,34 @@ mod tests {
             zip.write_all(data.as_bytes()).unwrap();
         }
         zip.finish().unwrap().into_inner()
+    }
+    #[test]
+    fn suggests_a_field_per_column_with_the_narrowest_type() {
+        let csv = "Navn;Årlig premie;Startdato;Aktiv;Postnr;Tom;Navn 2\nKari;12,5;2024-01-01;ja;0150;;x\nOla;7;2024-02-01;no;7010;;y\nKari;3;2024-03-01;yes;5003;;z\n";
+        let table = parse_file("data.csv", csv.as_bytes(), "", true).unwrap();
+        let found = suggestions(&table);
+        assert_eq!(found.row_count, 3);
+        let got: Vec<_> = found
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.kind))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("navn", FieldType::String),
+                ("arlig_premie", FieldType::Number),
+                ("startdato", FieldType::Date),
+                ("aktiv", FieldType::String),
+                ("postnr", FieldType::String),
+                ("tom", FieldType::String),
+                ("navn_2", FieldType::String),
+            ]
+        );
+        assert_eq!(found.columns[0].samples, vec!["Kari", "Ola"]);
+        assert_eq!(found.columns[1].header, "Årlig premie");
+        let yes_no = parse_file("data.csv", b"done\nyes\nNo\n", "", true).unwrap();
+        assert_eq!(suggestions(&yes_no).columns[0].kind, FieldType::Boolean);
     }
     #[test]
     fn parses_xlsx_worksheets_and_cached_formula_values() {

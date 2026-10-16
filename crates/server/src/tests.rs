@@ -1436,6 +1436,77 @@ async fn import_csv_with(
         .unwrap()
 }
 #[tokio::test]
+async fn fields_suggested_from_a_file_can_be_saved_and_then_imported() {
+    use vulse_model::{FieldSuggestions, ImportResult};
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "fields@example.com", "fields").await;
+    let c = create_collection(
+        &app,
+        &cookie,
+        "pensjon",
+        "private",
+        json!({"fields":[{"name":"ar","type":"number"}]}),
+    )
+    .await;
+    let csv = "År;Navn;Årlig premie;Startdato\n2024;Kari;12,5;2024-01-01\n2025;Ola;7;2025-02-01\n";
+    let suggest = |cookie: Option<String>| {
+        let body = format!(
+            "--s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--s--\r\n"
+        );
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/collections/{}/import/fields", c.id))
+            .header("content-type", "multipart/form-data; boundary=s");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", format!("vulse_session={cookie}"));
+        }
+        app.app
+            .clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+    };
+    assert_eq!(
+        suggest(None).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, found) =
+        json_of::<FieldSuggestions>(suggest(Some(cookie.clone())).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found.row_count, 2);
+    let names: Vec<_> = found.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["ar", "navn", "arlig_premie", "startdato"]);
+    // The client keeps the existing `ar` field and adds the rest, labeled
+    // with their headers.
+    let mut fields = vec![json!({"name":"ar","type":"number"})];
+    for column in &found.columns[1..] {
+        fields.push(json!({"name":column.name,"label":column.header,"type":column.kind}));
+    }
+    let saved = app
+        .call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", c.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":{"fields":fields}})),
+        )
+        .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    // Without a mapping, every column finds its field by name or label.
+    let (_, done) =
+        json_of::<ImportResult>(import_csv(&app, Some(&cookie), &c.id, csv, true, None).await)
+            .await;
+    assert!(done.errors.is_empty(), "{:?}", done.errors);
+    assert_eq!(
+        done.mapping,
+        vec![
+            Some("ar".to_string()),
+            Some("navn".into()),
+            Some("arlig_premie".into()),
+            Some("startdato".into())
+        ]
+    );
+    assert_eq!(done.imported, 2);
+}
+#[tokio::test]
 async fn imports_files_without_a_header_row() {
     use vulse_model::ImportResult;
     let app = TestApp::new().await;

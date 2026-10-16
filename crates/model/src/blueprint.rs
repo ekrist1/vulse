@@ -552,8 +552,91 @@ fn expect_id_at(name: &str, index: usize, value: &Value) -> Result<String, Strin
     }
 }
 
+
+/// The field each column header names, as an index into `fields`. A field
+/// goes to at most one column. Exact names win, then labels ignoring case,
+/// then the name `field_name_from` gives the header among the file's
+/// headers, so columns whose long headers share a beginning still find the
+/// `_2` field made for them.
+pub fn match_headers(headers: &[String], fields: &[&FieldDef]) -> Vec<Option<usize>> {
+    let mut made = Vec::new();
+    for header in headers {
+        made.push(crate::identity::field_name_from(header, &made));
+    }
+    let mut matched = vec![None; headers.len()];
+    let mut used = HashSet::new();
+    let rules: [&dyn Fn(usize, &FieldDef) -> bool; 3] = [
+        &|column, field| field.name == headers[column].trim().to_ascii_lowercase(),
+        &|column, field| {
+            let header = headers[column].trim().to_lowercase();
+            field.label.as_deref().is_some_and(|label| {
+                let label = label.trim().to_lowercase();
+                label == header || label == header.chars().take(200).collect::<String>()
+            })
+        },
+        &|column, field| field.name == made[column],
+    ];
+    for rule in rules {
+        for column in 0..headers.len() {
+            if matched[column].is_some() {
+                continue;
+            }
+            if let Some(index) =
+                (0..fields.len()).find(|&i| !used.contains(&i) && rule(column, fields[i]))
+            {
+                used.insert(index);
+                matched[column] = Some(index);
+            }
+        }
+    }
+    matched
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn headers_match_each_field_once() {
+        let field = |name: &str, label: Option<&str>| FieldDef {
+            label: label.map(Into::into),
+            description: None,
+            example: None,
+            formula: None,
+            name: name.into(),
+            required: false,
+            kind: FieldType::Number,
+            collection: None,
+            items: None,
+            options: None,
+            renamed_options: None,
+            renamed_from: None,
+        };
+        let under = "3B. Eierens vedtektsfestede norm for arealutnytting per barn under 3 år (m2):2";
+        let over = "3B. Eierens vedtektsfestede norm for arealutnytting per barn 3 år og eldre (m2):2";
+        let long = "f_3b_eierens_vedtektsfestede_norm_for_arealutnytting_per_bar";
+        let headers = vec![under.to_string(), over.into(), "Navn".into(), "År".into()];
+        // Made from the file, labeled with the headers.
+        let a = field(long, Some(under));
+        let b = field(&format!("{long}_2"), Some(over));
+        let navn = field("navn", None);
+        let ar = field("ar", None);
+        assert_eq!(
+            match_headers(&headers, &[&a, &b, &navn, &ar]),
+            vec![Some(0), Some(1), Some(2), Some(3)]
+        );
+        // Without labels, the names made among the headers still tell them apart.
+        let a = field(long, None);
+        let b = field(&format!("{long}_2"), None);
+        assert_eq!(
+            match_headers(&headers, &[&b, &a]),
+            vec![Some(1), Some(0), None, None]
+        );
+        // Only one column gets a field, even when two would match it.
+        assert_eq!(
+            match_headers(&["Navn".into(), "navn".into()], &[&navn]),
+            vec![Some(0), None]
+        );
+    }
 
     #[test]
     fn renames_move_formula_references_and_titles() {

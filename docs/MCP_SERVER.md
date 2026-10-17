@@ -101,7 +101,7 @@ Follows the MCP authorization spec (OAuth 2.1 profile).
 
 Unauthenticated or invalid requests to `/mcp` return `401` with
 `WWW-Authenticate: Bearer resource_metadata="https://vulse.example.com/.well-known/oauth-protected-resource"`.
-Insufficient scope returns `403` with `error="insufficient_scope"`.
+A token without the write scope reaches `/mcp`, but the write tools refuse it with a tool error ("this action requires the editor role"), because the scope sets the principal's role.
 
 The base URL comes from the configured public origin (`AuthSettings::public_origin`), never from the `Host` header. Make this setting required when MCP is enabled.
 
@@ -114,7 +114,7 @@ Advertises `issuer`, `authorization_endpoint`, `token_endpoint`, `registration_e
 - Accepts `client_name`, `redirect_uris`, `grant_types`, `token_endpoint_auth_method` (`none` only: public clients with PKCE).
 - `redirect_uris` must be `https://…`, or `http://localhost` / `http://127.0.0.1` with any port (for desktop and CLI clients). Reject fragments.
 - Rate limited per address with the existing `Throttle`.
-- Admins can turn registration off (setting `mcp.open_registration`, default on). When it is off, only clients pre-approved by an admin can connect.
+- Admins can close registration (phase 5). New clients then wait for an admin's approval before `/oauth/authorize` accepts them.
 - Unused clients (no grant within 24h) are deleted by the cleanup job.
 
 Later: support Client ID Metadata Documents (the `client_id` is an HTTPS URL to a JSON document) alongside DCR.
@@ -127,7 +127,7 @@ Required params: `response_type=code`, `client_id`, `redirect_uri` (exact match 
 - Other errors: redirect to `redirect_uri` with `error=…&state=…`.
 - Valid: store a pending authorization request (5 min TTL), then redirect to the web app at `/oauth/consent?request=<id>`. The web app sends the user through sign-in first if there is no session.
 
-### Consent page (`vulse-web`, `pages/oauth_consent.rs`)
+### Consent page (`vulse-web`, `pages/consent.rs`)
 
 Shows: client name and redirect host, the account being connected, requested permissions in plain language, an optional collection picker, and Allow / Deny buttons.
 
@@ -148,63 +148,15 @@ Form-encoded.
 
 - `GET /api/v1/oauth/grants` (`SessionOnly`): list my connected clients (name, scope, collection, created, last used).
 - `DELETE /api/v1/oauth/grants/{id}` (`SessionOnly`): revoke a grant and all its tokens.
-- Admins: list and revoke grants for any user. Disabling a user or resetting their password revokes their grants, the same as sessions.
+- Admins: `GET /api/v1/oauth/grants?all=true` lists every grant with its owner's handle, and admins can revoke any grant. On the Keys page, admins see the workspace-wide list.
+- Everything that ends a user's sessions also deletes their grants (`store::delete_user_sessions`): disabling the user, a password change or reset, and "log out everywhere".
 - Web: a **Connected apps** section on the Keys page.
 
-## Database (migration `011_oauth.sql`)
+## Database (migration `012_oauth.sql`)
 
-```sql
-CREATE TABLE oauth_clients (
-    id TEXT PRIMARY KEY,                 -- client_id
-    name TEXT NOT NULL,
-    redirect_uris TEXT NOT NULL,         -- JSON array
-    approved INTEGER NOT NULL DEFAULT 1, -- 0 when registration is closed
-    created_at TEXT NOT NULL
-);
+Tables: `oauth_clients`, `oauth_requests` (pending consent, 10 min), `oauth_grants` (one per approval), `oauth_codes` (5 min, with `used_at` for reuse detection) and `oauth_tokens` (`kind` is `access` or `refresh`, with `used_at` for refresh rotation). Codes and tokens are stored as SHA-256 hashes. Revoking a grant deletes it and its codes and tokens. `last_used_at` on a grant is updated whenever tokens are issued, so it is accurate to about an hour. See `crates/server/migrations/012_oauth.sql`.
 
-CREATE TABLE oauth_requests (            -- pending /authorize, 5 min
-    id TEXT PRIMARY KEY,
-    client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
-    redirect_uri TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    state TEXT NOT NULL,
-    code_challenge TEXT NOT NULL,
-    resource TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-);
-
-CREATE TABLE oauth_grants (              -- one per user per approval
-    id TEXT PRIMARY KEY,
-    client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    scope TEXT NOT NULL,
-    collection_id TEXT,
-    created_at TEXT NOT NULL,
-    last_used_at TEXT,
-    revoked_at TEXT
-);
-
-CREATE TABLE oauth_codes (
-    code_hash TEXT PRIMARY KEY,
-    grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
-    redirect_uri TEXT NOT NULL,
-    code_challenge TEXT NOT NULL,
-    resource TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-);
-
-CREATE TABLE oauth_tokens (
-    token_hash TEXT PRIMARY KEY,
-    grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL,                  -- 'access' | 'refresh'
-    expires_at TEXT NOT NULL,
-    used_at TEXT                         -- refresh reuse detection
-);
-CREATE INDEX idx_oauth_tokens_grant ON oauth_tokens(grant_id);
-CREATE INDEX idx_oauth_tokens_expiry ON oauth_tokens(expires_at);
-```
-
-Expired requests, codes and tokens are pruned by the same mechanism that expires `auth_sessions`.
+Expired requests, codes and tokens, and clients that nobody approved within a day, are pruned by the hourly cleanup (`oauth::purge`, called from `store::purge_expired`).
 
 ## MCP server
 
@@ -218,7 +170,7 @@ A small `mcp_auth` middleware runs in front of it:
 - Inserts the `Principal` into request extensions. Tool handlers read it from the rmcp request context (`RequestContext` → `http::request::Parts` extensions).
 - Validates `Origin` when present (spec requirement against DNS rebinding).
 
-Sessions: use rmcp's local session manager. MCP sessions are tied to the principal that created them, so a request with a different token for an existing `Mcp-Session-Id` is rejected.
+Sessions: none. The service runs stateless (`legacy_session_mode = false`) with JSON responses. Every request carries its own credential, any instance can answer it, and there is no session to hijack with a different token. `Host` is limited to localhost plus the host of `VULSE_PUBLIC_URL`, and a browser `Origin` must match `VULSE_PUBLIC_URL`.
 
 ### Refactor needed first
 
@@ -241,13 +193,13 @@ Tool descriptions are written for the model: say what the tool does, when to use
 | `describe_collection` | read | `collection` (id or name) | Fields with type, required, options for selects, relationship targets, calculated (read-only) marker. **Call before querying or writing.** |
 | `query_records` | read | `collection`, `search?`, `filters?` (`RecordFilter` incl. `or`), `sort?`, `descending?`, `limit` (default 25, max 100), `offset?` | Maps to `RecordQuery` and `run_query`. Returns records, total and `next_offset`. |
 | `get_record` | read | `collection`, `id` | Full record including calculated values and `calculation_errors`. |
-| `create_records` | write | `collection`, `records: [ {field: value} ]` (max 100) | Calculated fields in the input are ignored, with a warning in the result. |
-| `update_records` | write | `collection`, `updates: [ {id, patch, expected_version?} ]` (max 100) | Via `run_bulk` / patch, with optimistic version checks. Returns the action id for undo. |
-| `delete_records` | write | `collection`, `ids` (max 100) | Soft delete (restorable via history). Annotated `destructiveHint: true`. |
-| `undo_action` | write | `collection`, `action_id` | Undo the last bulk create, update or delete made through MCP. |
+| `create_records` | write | `collection`, `records: [ {field: value} ]` (max 100) | All or nothing (`mutations::run_create`). Calculated fields in the input are ignored and listed in `ignored_calculated_fields`. Returns the records and an `undo_id`. |
+| `update_records` | write | `collection`, `updates: [ {id, fields, expected_updated_at?} ]` (max 100) | Each update has its own fields. All or nothing, with optional version checks (`mutations::run_changes`). Returns the records and an `undo_id`. |
+| `delete_records` | write | `collection`, `ids` (max 100) | All or nothing. Deleted records go to the trash and can be restored. Records still referenced are refused. Returns an `undo_id`. |
+| `undo_action` | write | `collection`, `undo_id` | Reverts one write from the last 24 hours (`mutations::run_undo`). Refused if an affected record changed since. |
 | `run_sql` *(optional, phase 2)* | read | `sql` | `SELECT` only over MCP at first. Lets Claude do ad-hoc aggregation. |
 
-Tool annotations: read tools get `readOnlyHint: true`. Write tools get `readOnlyHint: false`, and `delete_records` also gets `destructiveHint: true`. This lets clients ask the user to confirm.
+Tool annotations: read tools get `readOnlyHint: true`. Write tools get `readOnlyHint: false`. `delete_records` and `undo_action` (which deletes records when it reverts a create) also get `destructiveHint: true`. This lets clients ask the user to confirm.
 
 Errors: validation problems are returned as tool results with `isError: true` and the `AppError` message, so the model can correct itself. Auth problems are returned as protocol and HTTP errors.
 
@@ -257,7 +209,7 @@ The `initialize` response includes short instructions, for example: "Vulse store
 
 ### Auditing
 
-Writes record the principal as today, so history shows the user. Also add `via = 'mcp'` and the OAuth client name to the action or revision metadata so changes made by Claude are visible as such in history.
+Record history does not store who made a change, for any client. MCP writes set `source = 'mcp'` on each revision (migration `011_revision_source.sql`, set through `Conn::set_source`), and the web history list shows "via AI assistant (MCP)". Recording the acting user (and the OAuth client name) on every revision is a separate change for all clients, not only MCP.
 
 ## Security checklist
 
@@ -277,48 +229,49 @@ Writes record the principal as today, so history shows the user. Also add `via =
 | Setting | Default | Purpose |
 |---|---|---|
 | `VULSE_MCP` | `off` | Enables `/mcp`, `/.well-known/*` and `/oauth/*`. |
-| `VULSE_PUBLIC_ORIGIN` | none | Required when MCP is on. Used as `issuer` and `resource`. |
-| `mcp.open_registration` (workspace setting) | `on` | When off, only clients approved by an admin can connect. |
+| `VULSE_PUBLIC_URL` | `http://BIND` | Existing setting. Used as the OAuth `issuer`, with `/mcp` appended as the `resource`. Its host is added to the MCP `Host` allowlist and its origin to the `Origin` allowlist. Must use `https://` when MCP is on, except for localhost. The server logs a warning when MCP is on without it. It must have no path, because the `.well-known` URLs are served at the root. |
 
 ## Implementation plan
 
 Each phase is shippable and tested before the next starts.
 
 ### Phase 1: MCP read tools with API keys
-- [ ] Add `rmcp` dependency. Mount `/mcp` behind the `VULSE_MCP` flag.
-- [ ] `mcp_auth` middleware: API key bearer → `Principal`, 401 otherwise.
-- [ ] Refactor the read handlers into core functions (see above).
-- [ ] Tools: `list_collections`, `describe_collection`, `query_records`, `get_record`.
-- [ ] Tests in `tests.rs`: role and collection-scope enforcement, pagination, unknown collection errors.
+- [x] Add `rmcp` dependency. Mount `/mcp` behind the `VULSE_MCP` flag.
+- [x] `mcp_auth` middleware: API key bearer → `Principal`, 401 otherwise (`mcp::authorize`, `auth::bearer_principal`).
+- [x] Refactor the read handlers into core functions (`content::visible_collections`, `content::read_document`; queries already shared `records::run_query`).
+- [x] Tools: `list_collections`, `describe_collection`, `query_records`, `get_record`.
+- [x] Tests in `tests/mcp.rs`: bearer-only access, foreign `Origin`, collection-scope enforcement, filters with OR, pagination, calculated values, unknown collection/field/record errors.
 - [ ] Manual test with MCP Inspector and Claude Code (`claude mcp add --transport http`).
 
 ### Phase 2: write tools
-- [ ] Refactor create, patch and bulk into core functions.
-- [ ] Tools: `create_records`, `update_records`, `delete_records`, `undo_action`.
-- [ ] `via = 'mcp'` in history.
-- [ ] Tests: viewer key rejected, calculated fields ignored, version conflicts, batch limits.
+- [x] Refactor create, patch and bulk into core functions (`run_changes` with a patch for each record, `run_create`, `run_undo`; `run_bulk` and the REST handlers use them).
+- [x] Tools: `create_records`, `update_records`, `delete_records`, `undo_action`. Each checks the Editor role itself.
+- [x] `source = 'mcp'` in history.
+- [x] Tests: viewer key rejected, atomic batches, calculated fields ignored or rejected, version conflicts, trash, undo of update, delete and create.
 
 ### Phase 3: OAuth authorization server
-- [ ] Migration `011_oauth.sql` and `store` functions.
-- [ ] Metadata endpoints and the 401 challenge.
-- [ ] `/oauth/register`, `/oauth/authorize`, `/oauth/token` (with PKCE, resource binding and refresh rotation).
-- [ ] `AuthVia::OAuth` in `authenticate()`.
-- [ ] Consent page and sign-in redirect in `vulse-web`.
-- [ ] Connected apps list and revoke on the Keys page. Admin view.
-- [ ] Cleanup of expired rows.
-- [ ] Tests: full code flow, PKCE failure, wrong resource, redirect mismatch, refresh reuse revokes grant, revoked user, scope downgrade for viewers.
-- [ ] End-to-end: add as a custom connector in Claude.ai and in Claude Desktop.
+- [x] Migration `012_oauth.sql`. The queries live in `crates/server/src/oauth.rs`.
+- [x] Metadata endpoints (with open CORS) and the 401 challenge.
+- [x] `/oauth/register`, `/oauth/authorize`, `/oauth/token` (with PKCE, resource binding, `iss` in responses, refresh rotation and code or refresh reuse detection).
+- [x] `AuthVia::OAuth`, accepted only on `/mcp` (`auth::bearer_principal`). The REST API keeps refusing OAuth tokens.
+- [x] Consent page (`/oauth/consent`) and returning to it after sign-in, in `vulse-web`.
+- [x] Connected apps list and disconnect on the Keys page. Admins see and disconnect every app in the workspace.
+- [x] Cleanup of expired rows.
+- [x] Tests in `tests/oauth.rs` and `oauth::unit`: metadata, full code flow, wrong PKCE verifier and code reuse, refresh rotation and reuse, unknown client or redirect (error page, no redirect), redirected errors, deny, viewer downgrade, read-only and single-collection grants, disconnect, disabling a user.
+- [x] Smoke test against a running server with curl: register, authorize, consent API, token, MCP `initialize` and `create_records`.
+- [ ] Consent page tested in a browser.
+- [ ] End-to-end: add as a custom connector in Claude.ai and in Claude Desktop. This needs a public https deployment.
 
 ### Phase 4: documentation
-- [ ] `docs/MCP.md`: user and admin guide (outline below).
-- [ ] Link from `README.md`.
-- [ ] In-app: a "Connect to Claude" hint on the Keys page that shows the server URL with a copy button.
+- [x] `docs/MCP.md`: user and admin guide (outline below).
+- [x] Link from `README.md`: a `VULSE_MCP` row in the settings table, and an "AI assistants (MCP)" section.
+- [x] In-app: the Keys page shows the `/mcp` address with a copy button and a one-line hint for connecting Claude.
 
 ### Phase 5: later
-- [ ] `run_sql` (SELECT only).
-- [ ] Client ID Metadata Documents.
-- [ ] Admin approval flow for clients when registration is closed.
-- [ ] MCP resources for collection schemas, if clients make good use of them.
+- [x] `run_sql` (SELECT only): `sql::select_only`, shared with `POST /sql`. Up to 200 rows go back to the model.
+- [x] Client ID Metadata Documents (`client_metadata.rs`). An `https://` `client_id` is read from its URL and cached for a day; the cached copy is used if the site is down. Fetching is limited to public addresses: Vulse resolves the name, refuses loopback, private, link-local, shared and translation ranges, connects only to the address it checked, follows no redirects, and stops at 5 s or 64 KiB. Each fetch counts against the address's rate limit. The document must name its own URL as `client_id` and be a public client. The consent page shows the domain. Advertised as `client_id_metadata_document_supported`.
+- [x] Closing registration (workspace setting `mcp_open_registration` in the new `workspace_settings` table, migration `013_oauth_clients.sql`) with admin approval. Clients registered or first seen while it is closed get no `approved_at`, and `/oauth/authorize` shows a page asking for an admin instead. Admins manage it under **API keys → Apps that can connect**: `GET/PUT /api/v1/oauth/settings`, `GET /api/v1/oauth/clients`, `POST /api/v1/oauth/clients/{id}/approve`, `DELETE /api/v1/oauth/clients/{id}`. Clients an admin approved (`approved_by`) are never removed by cleanup; ones still waiting are removed after 7 days. Error pages escape the client's name.
+- [ ] ~~MCP resources for collection schemas.~~ Not planned. `describe_collection` already gives the model each schema when it needs it, and Claude reads MCP resources only when a user attaches them by hand, so resources would duplicate the tool without being used. Reconsider if a client starts reading resources automatically.
 
 ## User and admin documentation (`docs/MCP.md`)
 
@@ -326,7 +279,7 @@ Written in the same style as `docs/CALCULATED_FIELDS.md`: task-focused and plain
 
 **For admins**
 1. What the MCP server is and what it can and cannot do (records only, no schema or user changes).
-2. Enabling it: `VULSE_MCP=on`, `VULSE_PUBLIC_ORIGIN`, HTTPS requirement, reverse proxy notes (pass through `Authorization`, don't buffer streaming responses).
+2. Enabling it: `VULSE_MCP=on`, `VULSE_PUBLIC_URL`, HTTPS requirement, reverse proxy notes (pass through `Authorization`, don't buffer streaming responses).
 3. Controlling access: roles and what each can do via MCP, open vs. closed client registration, approving clients.
 4. Auditing and revoking: where MCP changes appear in history, viewing and revoking any user's connected apps, effect of disabling a user.
 

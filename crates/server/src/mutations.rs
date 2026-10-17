@@ -116,45 +116,68 @@ pub(crate) async fn run_bulk(
     id: &str,
     body: BulkWrite,
 ) -> Result<MutationResult, AppError> {
-    if body.ids.is_empty()
-        || body.ids.len() > 100
-        || body
-            .ids
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != body.ids.len()
+    let changes = body
+        .ids
+        .into_iter()
+        .map(|doc_id| RecordChange {
+            expected: body.expected.get(&doc_id).cloned(),
+            patch: body.patch.clone(),
+            id: doc_id,
+        })
+        .collect();
+    let conn = state.db.connect().await?;
+    run_changes(&conn, principal, id, &body.action, changes).await
+}
+/// One record in a bulk write: the fields an update sets and the version the
+/// caller last saw.
+pub(crate) struct RecordChange {
+    pub id: String,
+    pub patch: Value,
+    pub expected: Option<String>,
+}
+/// Updates, duplicates or deletes records in one transaction that a single
+/// undo reverts. Each update applies its own patch.
+pub(crate) async fn run_changes(
+    conn: &Conn,
+    principal: &Principal,
+    id: &str,
+    action: &str,
+    changes: Vec<RecordChange>,
+) -> Result<MutationResult, AppError> {
+    let ids: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+    if ids.is_empty()
+        || ids.len() > 100
+        || ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len()
     {
         return Err(AppError::bad("choose 1–100 unique records"));
     }
-    if !["update", "duplicate", "delete"].contains(&body.action.as_str()) {
+    if !["update", "duplicate", "delete"].contains(&action) {
         return Err(AppError::bad("unknown bulk action"));
     }
-    let conn = state.db.connect().await?;
     conn.with_app_tx(async |conn| {
         let collection = workspace_collection(conn, principal, id).await?;
         let mut before = vec![];
-        for doc_id in &body.ids {
-            let doc = store::find_document(conn, id, doc_id)
+        for change in &changes {
+            let doc = store::find_document(conn, id, &change.id)
                 .await?
                 .ok_or(AppError::NotFound)?;
-            check_version(&doc, body.expected.get(doc_id).map(String::as_str))?;
+            check_version(&doc, change.expected.as_deref())?;
             before.push(doc);
         }
         let mut after = vec![];
         let now = timeutil::now_rfc3339();
         // Validate every update before writing any of the selected records.
         let mut writes = vec![];
-        if body.action != "delete" {
-            for doc in &before {
-                let next = if body.action == "update" {
-                    merged(&collection.blueprint, &doc.body, &body.patch)?
+        if action != "delete" {
+            for (doc, change) in before.iter().zip(&changes) {
+                let next = if action == "update" {
+                    merged(&collection.blueprint, &doc.body, &change.patch)?
                 } else {
                     doc.body.clone()
                 };
                 check_body(conn, id, &collection.name, &collection.blueprint, &next).await?;
                 writes.push((
-                    if body.action == "duplicate" {
+                    if action == "duplicate" {
                         crate::auth::new_id()
                     } else {
                         doc.id.clone()
@@ -163,14 +186,14 @@ pub(crate) async fn run_bulk(
                 ));
             }
         }
-        if body.action == "delete" {
-            crate::relationships::guard_delete(conn, id, &body.ids, "document").await?;
+        if action == "delete" {
+            crate::relationships::guard_delete(conn, id, &ids, "document").await?;
             for doc in &before {
                 store::delete_document(conn, id, &doc.id).await?;
             }
         } else {
             for (doc_id, next) in writes {
-                if body.action == "duplicate" {
+                if action == "duplicate" {
                     store::insert_document(conn, &doc_id, id, &next, &now).await?;
                 } else {
                     store::update_document(conn, id, &doc_id, &next, &now).await?;
@@ -185,7 +208,7 @@ pub(crate) async fn run_bulk(
         let undo_id = snapshot(
             conn,
             id,
-            if body.action == "duplicate" {
+            if action == "duplicate" {
                 vec![]
             } else {
                 before
@@ -199,7 +222,7 @@ pub(crate) async fn run_bulk(
         }
         Ok(MutationResult {
             documents: after,
-            affected: body.ids.len(),
+            affected: ids.len(),
             undo_id,
         })
     })
@@ -211,23 +234,73 @@ pub async fn undo_action(
     Path((id, action_id)): Path<(String, String)>,
 ) -> Result<Json<MutationResult>, AppError> {
     let conn = state.db.connect().await?;
-    let result=conn.with_app_tx(async |conn|{
-        let collection=workspace_collection(conn,&principal,&id).await?;
-        let rows=conn.query("SELECT snapshot,created_at FROM record_actions WHERE id=?1 AND collection_id=?2",&[text(&action_id),text(&id)]).await?;let row=rows.first().ok_or(AppError::NotFound)?;
+    Ok(Json(run_undo(&conn, &principal, &id, &action_id).await?))
+}
+pub(crate) async fn run_undo(
+    conn: &Conn,
+    principal: &Principal,
+    id: &str,
+    action_id: &str,
+) -> Result<MutationResult, AppError> {
+    conn.with_app_tx(async |conn|{
+        let collection=workspace_collection(conn,principal,id).await?;
+        let rows=conn.query("SELECT snapshot,created_at FROM record_actions WHERE id=?1 AND collection_id=?2",&[text(action_id),text(id)]).await?;let row=rows.first().ok_or(AppError::NotFound)?;
         let time=chrono::DateTime::parse_from_rfc3339(&text_at(row,1)?).map_err(anyhow::Error::from)?;
         if chrono::Utc::now().signed_duration_since(time).num_hours()>=24{return Err(AppError::conflict("This undo action has expired."));}
         let snapshot:Snapshot=serde_json::from_str(&text_at(row,0)?).map_err(anyhow::Error::from)?;
-        for doc in &snapshot.after {let current=store::find_document(conn,&id,&doc.id).await?.ok_or_else(||AppError::conflict("An affected record has since been deleted."))?;if current.updated_at!=doc.updated_at||current.body!=doc.body{return Err(AppError::conflict("An affected record changed after this action. Use revision history to recover earlier content."));}}
-        for doc in &snapshot.before {if !snapshot.after.iter().any(|after|after.id==doc.id)&&store::document_exists(conn,&id,&doc.id).await?{return Err(AppError::conflict("A deleted record has already been restored."));}}
+        for doc in &snapshot.after {let current=store::find_document(conn,id,&doc.id).await?.ok_or_else(||AppError::conflict("An affected record has since been deleted."))?;if current.updated_at!=doc.updated_at||current.body!=doc.body{return Err(AppError::conflict("An affected record changed after this action. Use revision history to recover earlier content."));}}
+        for doc in &snapshot.before {if !snapshot.after.iter().any(|after|after.id==doc.id)&&store::document_exists(conn,id,&doc.id).await?{return Err(AppError::conflict("A deleted record has already been restored."));}}
         let deletions:Vec<_>=snapshot.after.iter().filter(|d|!snapshot.before.iter().any(|b|b.id==d.id)).map(|d|d.id.clone()).collect();
-        crate::relationships::guard_delete(conn,&id,&deletions,"document").await?;
+        crate::relationships::guard_delete(conn,id,&deletions,"document").await?;
         let now=timeutil::now_rfc3339();
-        for doc in &snapshot.after {if !snapshot.before.iter().any(|before|before.id==doc.id){store::delete_document(conn,&id,&doc.id).await?;}}
-        for doc in &snapshot.before {if !store::document_exists(conn,&id,&doc.id).await?{store::insert_document(conn,&doc.id,&id,&doc.body,&doc.created_at).await?;}store::update_document(conn,&id,&doc.id,&doc.body,&now).await?;}
-        for doc in &snapshot.before {check_body(conn,&id,&collection.name,&collection.blueprint,&doc.body).await?;}
-        conn.execute("DELETE FROM record_actions WHERE id=?1",&[text(&action_id)]).await?;
-        let lookups=crate::lookups::load(conn,&collection.blueprint).await?;let mut documents=vec![];for doc in &snapshot.before {let mut current=store::find_document(conn,&id,&doc.id).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&lookups,&mut current);documents.push(current);}
+        for doc in &snapshot.after {if !snapshot.before.iter().any(|before|before.id==doc.id){store::delete_document(conn,id,&doc.id).await?;}}
+        for doc in &snapshot.before {if !store::document_exists(conn,id,&doc.id).await?{store::insert_document(conn,&doc.id,id,&doc.body,&doc.created_at).await?;}store::update_document(conn,id,&doc.id,&doc.body,&now).await?;}
+        for doc in &snapshot.before {check_body(conn,id,&collection.name,&collection.blueprint,&doc.body).await?;}
+        conn.execute("DELETE FROM record_actions WHERE id=?1",&[text(action_id)]).await?;
+        let lookups=crate::lookups::load(conn,&collection.blueprint).await?;let mut documents=vec![];for doc in &snapshot.before {let mut current=store::find_document(conn,id,&doc.id).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&lookups,&mut current);documents.push(current);}
         Ok(MutationResult{affected:snapshot.before.len().max(snapshot.after.len()),documents,undo_id:String::new()})
-    }).await?;
-    Ok(Json(result))
+    }).await
+}
+/// Inserts records in one transaction that a single undo removes again.
+/// Calculated fields in the bodies are ignored.
+pub(crate) async fn run_create(
+    conn: &Conn,
+    principal: &Principal,
+    id: &str,
+    bodies: Vec<Value>,
+) -> Result<MutationResult, AppError> {
+    if bodies.is_empty() || bodies.len() > 100 {
+        return Err(AppError::bad("create 1–100 records at a time"));
+    }
+    conn.with_app_tx(async |conn| {
+        let collection = workspace_collection(conn, principal, id).await?;
+        let mut sources = Vec::with_capacity(bodies.len());
+        for body in &bodies {
+            let source = vulse_model::source_document(&collection.blueprint, body);
+            check_body(conn, id, &collection.name, &collection.blueprint, &source).await?;
+            sources.push(source);
+        }
+        let now = timeutil::now_rfc3339();
+        let mut after = Vec::with_capacity(sources.len());
+        for source in &sources {
+            let doc_id = crate::auth::new_id();
+            store::insert_document(conn, &doc_id, id, source, &now).await?;
+            after.push(
+                store::find_document(conn, id, &doc_id)
+                    .await?
+                    .ok_or(AppError::NotFound)?,
+            );
+        }
+        let undo_id = snapshot(conn, id, vec![], after.clone()).await?;
+        let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+        for doc in &mut after {
+            materialize(&collection.blueprint, &lookups, doc);
+        }
+        Ok(MutationResult {
+            affected: after.len(),
+            documents: after,
+            undo_id,
+        })
+    })
+    .await
 }

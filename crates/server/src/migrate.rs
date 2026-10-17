@@ -13,6 +13,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, include_str!("../migrations/008_cell_index.sql")),
     (9, include_str!("../migrations/009_record_tables.sql")),
     (10, include_str!("../migrations/010_refresh_lookups.sql")),
+    (11, include_str!("../migrations/011_revision_source.sql")),
+    (12, include_str!("../migrations/012_oauth.sql")),
+    (13, include_str!("../migrations/013_oauth_clients.sql")),
 ];
 
 pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {

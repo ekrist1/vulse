@@ -40,25 +40,8 @@ pub async fn run_sql(
     let statement = parse_sql(&request.sql).map_err(|e| AppError::bad(e.to_string()))?;
     let conn = state.db.connect().await?;
     let collection = target(&conn, &principal, &statement).await?;
-    if let SqlStatement::Select(select) = &statement {
-        let records = records(&conn, &collection, &statement).await?;
-        let mut fields = vec!["id".to_string()];
-        fields.extend(collection.blueprint.fields.iter().map(|f| f.name.clone()));
-        let (columns, rows, total) =
-            run_select(select, &fields, &records).map_err(AppError::bad)?;
-        let wanted = (total as usize)
-            .saturating_sub(select.offset)
-            .min(select.limit.unwrap_or(usize::MAX));
-        return Ok(Json(SqlResult {
-            kind: "select".into(),
-            collection_id: collection.id,
-            collection: collection.name,
-            truncated: rows.len() < wanted,
-            columns,
-            rows,
-            total,
-            ..SqlResult::default()
-        }));
+    if matches!(statement, SqlStatement::Select(_)) {
+        return Ok(Json(select(&conn, collection, &statement).await?));
     }
     require_role(&principal, Role::Editor)?;
     let sql = request.sql.trim().to_string();
@@ -101,6 +84,50 @@ pub async fn run_sql(
         })
         .await?;
     Ok(Json(applied))
+}
+
+/// Runs `sql` if it is a `SELECT`, and refuses anything that would change
+/// records.
+pub(crate) async fn select_only(
+    conn: &Conn,
+    principal: &Principal,
+    sql: &str,
+) -> Result<SqlResult, AppError> {
+    let statement = parse_sql(sql).map_err(|e| AppError::bad(e.to_string()))?;
+    if !matches!(statement, SqlStatement::Select(_)) {
+        return Err(AppError::bad(
+            "Only SELECT statements can run here. Use update_records or delete_records to change records.",
+        ));
+    }
+    let collection = target(conn, principal, &statement).await?;
+    select(conn, collection, &statement).await
+}
+
+async fn select(
+    conn: &Conn,
+    collection: CollectionView,
+    statement: &SqlStatement,
+) -> Result<SqlResult, AppError> {
+    let SqlStatement::Select(select) = statement else {
+        return Err(AppError::bad("not a SELECT statement"));
+    };
+    let records = records(conn, &collection, statement).await?;
+    let mut fields = vec!["id".to_string()];
+    fields.extend(collection.blueprint.fields.iter().map(|f| f.name.clone()));
+    let (columns, rows, total) = run_select(select, &fields, &records).map_err(AppError::bad)?;
+    let wanted = (total as usize)
+        .saturating_sub(select.offset)
+        .min(select.limit.unwrap_or(usize::MAX));
+    Ok(SqlResult {
+        kind: "select".into(),
+        collection_id: collection.id,
+        collection: collection.name,
+        truncated: rows.len() < wanted,
+        columns,
+        rows,
+        total,
+        ..SqlResult::default()
+    })
 }
 
 /// The statement's collection, checked for access and unknown fields.

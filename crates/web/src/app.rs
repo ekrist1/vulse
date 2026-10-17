@@ -6,7 +6,7 @@ use crate::api;
 use crate::confirm::ConfirmProvider;
 use crate::pages::{
     AcceptPage, AccountPage, CollectionPage, CollectionsPage, DocumentPage, KeysPage, LoginPage, SqlPage,
-    PeoplePage, SetupPage,
+    OAuthConsentPage, PeoplePage, SetupPage,
 };
 
 #[derive(Clone, PartialEq)]
@@ -59,6 +59,8 @@ pub enum Route {
     Keys,
     #[at("/sql")]
     Sql,
+    #[at("/oauth/consent")]
+    OAuthConsent,
     #[at("/collections/:id")]
     Collection { id: String },
     #[at("/collections/:id/documents/:doc_id")]
@@ -112,6 +114,7 @@ fn switch(route: Route) -> Html {
         Route::People => html! { <PeoplePage /> },
         Route::Keys => html! { <KeysPage /> },
         Route::Sql => html! { <SqlPage /> },
+        Route::OAuthConsent => html! { <OAuthConsentPage /> },
         Route::Collection { id } => html! { <CollectionPage key={id.clone()} id={id.clone()} /> },
         Route::Document { id, doc_id } => {
             html! { <DocumentPage key={format!("{id}/{doc_id}")} id={id.clone()} doc_id={doc_id.clone()} /> }

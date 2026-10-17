@@ -34,21 +34,32 @@ pub async fn list_collections(
 ) -> Result<Json<Page<CollectionView>>, AppError> {
     let (limit, offset) = page_query(&query)?;
     let conn = state.db.connect().await?;
-    let items = if let Some(scope) = &principal.collection_scope {
-        store::find_collection(&conn, scope)
+    let items = visible_collections(&conn, &principal, limit, offset).await?;
+    Ok(Json(Page {
+        items,
+        limit,
+        offset,
+    }))
+}
+
+/// The collections a principal may read: all of them, or the one its key is
+/// limited to.
+pub(crate) async fn visible_collections(
+    conn: &Conn,
+    principal: &Principal,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<CollectionView>, AppError> {
+    Ok(if let Some(scope) = &principal.collection_scope {
+        store::find_collection(conn, scope)
             .await?
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
             .collect()
     } else {
-        store::list_collections(&conn, limit, offset).await?
-    };
-    Ok(Json(Page {
-        items,
-        limit,
-        offset,
-    }))
+        store::list_collections(conn, limit, offset).await?
+    })
 }
 
 pub async fn create_collection(
@@ -440,12 +451,21 @@ pub async fn get_document(
 ) -> Result<Json<DocumentView>, AppError> {
     let conn = state.db.connect().await?;
     let collection = workspace_collection(&conn, &principal, &id).await?;
-    let mut document = store::find_document(&conn, &collection.id, &doc_id)
+    Ok(Json(read_document(&conn, &collection, &doc_id).await?))
+}
+
+/// One record with its calculated and lookup values filled in.
+pub(crate) async fn read_document(
+    conn: &Conn,
+    collection: &CollectionView,
+    doc_id: &str,
+) -> Result<DocumentView, AppError> {
+    let mut document = store::find_document(conn, &collection.id, doc_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
+    let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
     materialize(&collection.blueprint, &lookups, &mut document);
-    Ok(Json(document))
+    Ok(document)
 }
 
 pub async fn update_document(

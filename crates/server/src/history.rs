@@ -1,7 +1,7 @@
 use crate::{
     auth::{AuthUser, Editor},
     content::{PageQuery, check_body, materialize, page_query, workspace_collection},
-    db::{Conn, text_at},
+    db::{Conn, opt_text_at, text_at},
     error::AppError,
     state::AppState,
     store, timeutil,
@@ -18,7 +18,8 @@ pub async fn snapshot(
     document: &str,
     action: &str,
 ) -> anyhow::Result<()> {
-    conn.execute("INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at) SELECT ?1,d.collection_id,d.id,?2,d.body,c.blueprint,d.created_at,?3 FROM documents d JOIN collections c ON c.id=d.collection_id WHERE d.collection_id=?4 AND d.id=?5",&[text(&crate::auth::new_id()),text(action),text(&timeutil::now_rfc3339()),text(collection),text(document)]).await?;
+    let source = conn.source().map_or(crate::db::SqlValue::Null, text);
+    conn.execute("INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) SELECT ?1,d.collection_id,d.id,?2,d.body,c.blueprint,d.created_at,?3,?6 FROM documents d JOIN collections c ON c.id=d.collection_id WHERE d.collection_id=?4 AND d.id=?5",&[text(&crate::auth::new_id()),text(action),text(&timeutil::now_rfc3339()),text(collection),text(document),source]).await?;
     Ok(())
 }
 fn decode(row: &crate::db::SqlRow) -> anyhow::Result<DocumentRevision> {
@@ -30,10 +31,11 @@ fn decode(row: &crate::db::SqlRow) -> anyhow::Result<DocumentRevision> {
         blueprint: serde_json::from_str(&text_at(row, 4)?)?,
         record_created_at: text_at(row, 5)?,
         created_at: text_at(row, 6)?,
+        source: opt_text_at(row, 7)?,
     })
 }
 const COLUMNS: &str =
-    "r.id,r.document_id,r.action,r.body,r.blueprint,r.record_created_at,r.created_at";
+    "r.id,r.document_id,r.action,r.body,r.blueprint,r.record_created_at,r.created_at,r.source";
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(principal): AuthUser,

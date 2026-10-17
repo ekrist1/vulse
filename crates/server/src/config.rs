@@ -15,6 +15,7 @@ pub struct Config {
     pub cookie_secure: bool,
     pub setup_token: Option<String>,
     pub trust_proxy: bool,
+    pub mcp: bool,
 }
 
 impl Config {
@@ -46,6 +47,20 @@ impl Config {
             Some(value) => flag("VULSE_TRUST_PROXY", &value)?,
             None => false,
         };
+        let mcp = match nonempty("VULSE_MCP") {
+            Some(value) => flag("VULSE_MCP", &value)?,
+            None => false,
+        };
+        // OAuth requires https, except on this machine during development.
+        if mcp
+            && let Some(url) = &public_url
+            && let Some(rest) = url.strip_prefix("http://")
+        {
+            let host = rest.split(['/', ':']).next().unwrap_or_default();
+            if !["localhost", "127.0.0.1", "[::1]"].contains(&host) {
+                anyhow::bail!("VULSE_PUBLIC_URL must use https:// when VULSE_MCP is on");
+            }
+        }
         let setup_token = nonempty("VULSE_SETUP_TOKEN");
         if setup_token.as_ref().is_some_and(|token| token.len() < 16) {
             anyhow::bail!("VULSE_SETUP_TOKEN must be at least 16 characters");
@@ -67,6 +82,7 @@ impl Config {
             cookie_secure,
             setup_token,
             trust_proxy,
+            mcp,
         })
     }
 

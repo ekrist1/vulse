@@ -249,7 +249,15 @@ fn signed_in(session: &SessionCtx, navigator: &Navigator, user: UserView) {
         user: Some(user),
         loaded: true,
     });
-    navigator.push(&Route::Home);
+    // Signing in to approve an app continues on its consent page.
+    match crate::pages::consent::take_return_path() {
+        Some(path) => {
+            if let Some(window) = web_sys::window() {
+                let _ = window.location().set_href(&path);
+            }
+        }
+        None => navigator.push(&Route::Home),
+    }
 }
 
 fn sign_in_error(err: String) -> String {

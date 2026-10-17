@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use vulse_model::{
     ApiErrorBody, ApiKeyView, AssetView, CollectionView, CreatedApiKey, CreatedInvite,
-    DocumentView, ManagedUser, Page, Role, UserView,
+    DocumentView, ManagedUser, OAuthClientView, OAuthGrantView, Page, Role, UserView,
 };
 
 use crate::app;
@@ -16,6 +16,10 @@ use crate::app;
 mod bench;
 #[path = "tests/beta.rs"]
 mod beta;
+#[path = "tests/mcp.rs"]
+mod mcp;
+#[path = "tests/oauth.rs"]
+mod oauth;
 
 struct TestApp {
     app: axum::Router,
@@ -2948,6 +2952,7 @@ async fn secure_cookies_use_the_host_prefix() {
         trust_proxy: false,
         public_origin: None,
         password_wait: state.auth.password_wait,
+        base_url: state.auth.base_url.clone(),
     });
     let app = TestApp::with_state(state, dir);
     let response = app

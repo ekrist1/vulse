@@ -293,6 +293,80 @@ pub struct ApiKeyView {
     pub created_at: String,
 }
 
+/// What the consent page shows about a pending OAuth sign-in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthRequestView {
+    pub client_name: String,
+    /// For apps identified by a metadata document URL, that URL's host,
+    /// which vouches for the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_domain: Option<String>,
+    /// Where the browser returns after consent, such as `claude.ai`.
+    pub redirect_host: String,
+    pub write_requested: bool,
+    /// False when the signed-in user is a viewer.
+    pub write_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthConsent {
+    pub request: String,
+    pub approve: bool,
+    /// Grant record writes, when requested and allowed.
+    #[serde(default)]
+    pub write: bool,
+    /// Limit the grant to one collection.
+    #[serde(default)]
+    pub collection_id: Option<String>,
+}
+
+/// Whether any MCP client may connect, or only ones an admin approved.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthSettings {
+    pub open_registration: bool,
+}
+
+/// An MCP client known to Vulse, for admins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthClientView {
+    /// A generated id, or the URL of the client's metadata document.
+    pub id: String,
+    pub name: String,
+    /// Hosts the client returns users to after sign-in.
+    pub redirect_hosts: Vec<String>,
+    pub approved: bool,
+    /// Identified by a metadata document URL rather than registered.
+    pub metadata_document: bool,
+    /// Users currently connected through it.
+    pub connections: u64,
+    pub created_at: String,
+}
+
+/// Where the browser goes next to finish an OAuth sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthRedirect {
+    pub redirect: String,
+}
+
+/// An app connected through OAuth, such as Claude.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthGrantView {
+    pub id: String,
+    pub client_name: String,
+    pub write: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_id: Option<String>,
+    pub created_at: String,
+    /// When the app last signed in or renewed its access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// The owner, in an admin's workspace-wide list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateApiKey {
     pub name: String,
@@ -383,6 +457,10 @@ pub struct DocumentRevision {
     pub blueprint: Blueprint,
     pub record_created_at: String,
     pub created_at: String,
+    /// Set when the change did not come from the web app or REST API, such as
+    /// `mcp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreRevision {

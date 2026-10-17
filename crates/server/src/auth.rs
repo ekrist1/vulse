@@ -29,6 +29,8 @@ use crate::timeutil::{self, SESSION_SECONDS};
 pub enum AuthVia {
     Session,
     ApiKey,
+    /// An access token from an app the user connected, such as Claude.
+    OAuth,
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +492,21 @@ async fn authenticate(state: &AppState, parts: &Parts) -> Result<Principal, AppE
         return session_principal(&conn, &token).await;
     }
     Err(AppError::Unauthorized)
+}
+
+/// A bearer credential only: an API key or an OAuth access token. Cookies are
+/// ignored, so a browser session cannot be used cross-site.
+pub(crate) async fn bearer_principal(
+    state: &AppState,
+    parts: &Parts,
+) -> Result<Principal, AppError> {
+    let token = bearer_token(parts).ok_or(AppError::Unauthorized)?;
+    let conn = state.db.connect().await?;
+    if crate::oauth::is_access_token(&token) {
+        crate::oauth::access_principal(&conn, &token).await
+    } else {
+        api_key_principal(&conn, &token).await
+    }
 }
 
 async fn session_principal(conn: &Conn, token: &str) -> Result<Principal, AppError> {

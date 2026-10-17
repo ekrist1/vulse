@@ -20,6 +20,11 @@ npm --prefix crates/web ci
 trunk build --config crates/web/Trunk.toml
 cargo run -p vulse-server
 ```
+Start Vulse server with MCP locally:
+
+```bash
+VULSE_MCP=on VULSE_PUBLIC_URL=http://localhost:8080 cargo run -p vulse-server
+```
 
 The server listens on `127.0.0.1:8080`. On first start with an empty database it logs a one-time setup token. Open `/setup` in a browser and use that token to create the first admin (see [Accounts and access](#accounts-and-access)). The admin is served from `crates/web/dist`. If that directory is missing, the API still runs and the site routes are absent.
 
@@ -43,6 +48,7 @@ With no Turso URL set, data is stored in `./vulse.db` and uploaded files in `./s
 | `VULSE_COOKIE_SECURE` | from `VULSE_PUBLIC_URL` | `true` adds `Secure` and the `__Host-` prefix to the session cookie. Set it when TLS ends at a proxy and `VULSE_PUBLIC_URL` is unset |
 | `VULSE_SETUP_TOKEN` | random | Fixed first-run setup token, at least 16 characters. Only used while no accounts exist |
 | `VULSE_TRUST_PROXY` | `false` | Take the client address from the last `X-Forwarded-For` entry. Enable only behind a proxy that sets it |
+| `VULSE_MCP` | `off` | `on` serves the MCP server at `/mcp` so Claude and other AI assistants can work with records. Requires an `https://` `VULSE_PUBLIC_URL` outside localhost. See [AI assistants (MCP)](#ai-assistants-mcp) |
 
 Set both Turso variables, or neither. The remote database should be created with `turso db create --tursodb`, because the server uses the current Turso Rust engine.
 
@@ -130,6 +136,10 @@ GET /api/v1/public/{collection}/assets/{asset_id}
 ```
 
 A missing collection and a private collection both respond with 404. Collection names are unique in the workspace.
+
+### AI assistants (MCP)
+
+With `VULSE_MCP=on`, people can connect Claude or another MCP client to Vulse and read, add and change records by asking in plain language. Each person approves the connection while signed in, chooses read-only or read-and-change access and optionally one collection, and can disconnect it under **API keys**. Admins can require their own approval before a new app may connect. Assistants never get admin rights. See [docs/MCP.md](docs/MCP.md) for setup, connecting Claude, and the tool reference, and [docs/MCP_SERVER.md](docs/MCP_SERVER.md) for the design.
 
 ### Upgrading an existing database
 

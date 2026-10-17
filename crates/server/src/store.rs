@@ -212,7 +212,8 @@ pub async fn delete_session(conn: &Conn, token_hash: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Ends every session of a user except `keep`, if given.
+/// Ends every session of a user except `keep`, if given, and disconnects
+/// the apps they connected through OAuth.
 pub async fn delete_user_sessions(
     conn: &Conn,
     user_id: &str,
@@ -223,11 +224,12 @@ pub async fn delete_user_sessions(
         &[text(user_id), keep.map(text).unwrap_or(SqlValue::Null)],
     )
     .await?;
-    Ok(())
+    crate::oauth::revoke_user(conn, user_id).await
 }
 
-/// Removes expired sessions and account links. Timestamps share one
-/// fixed-width UTC format, so text comparison orders them correctly.
+/// Removes expired sessions, account links and OAuth codes and tokens.
+/// Timestamps share one fixed-width UTC format, so text comparison orders
+/// them correctly.
 pub async fn purge_expired(conn: &Conn, now: &str) -> anyhow::Result<u64> {
     let sessions = conn
         .execute(
@@ -241,7 +243,8 @@ pub async fn purge_expired(conn: &Conn, now: &str) -> anyhow::Result<u64> {
             &[text(now)],
         )
         .await?;
-    Ok(sessions + links)
+    let oauth = crate::oauth::purge(conn, now).await?;
+    Ok(sessions + links + oauth)
 }
 
 #[allow(clippy::too_many_arguments)]

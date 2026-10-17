@@ -29,6 +29,8 @@ pub struct Conn {
     /// Collections changed in the open transaction, published on commit.
     changes: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub(crate) lookup_cache: crate::lookups::Cache,
+    /// Recorded in the history of records this connection changes.
+    source: std::sync::OnceLock<&'static str>,
 }
 
 enum ConnInner {
@@ -61,11 +63,13 @@ impl Db {
                 inner: ConnInner::Local(database.connect()?),
                 changes: Default::default(),
                 lookup_cache: Default::default(),
+                source: Default::default(),
             },
             DbInner::Remote(database) => Conn {
                 inner: ConnInner::Remote(database.connect()?),
                 changes: Default::default(),
                 lookup_cache: Default::default(),
+                source: Default::default(),
             },
         };
         if let ConnInner::Local(local) = &conn.inner {
@@ -81,6 +85,16 @@ impl Db {
 impl Conn {
     /// Notes that a collection's records or fields changed. Open views are
     /// told once the transaction commits, or right away outside one.
+    /// Marks this connection's record changes as coming from `source`, such as
+    /// `mcp`. The first call wins.
+    pub fn set_source(&self, source: &'static str) {
+        let _ = self.source.set(source);
+    }
+
+    pub fn source(&self) -> Option<&'static str> {
+        self.source.get().copied()
+    }
+
     pub fn changed(&self, collection_id: &str) {
         self.lookup_cache
             .lock()

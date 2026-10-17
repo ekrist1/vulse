@@ -473,3 +473,56 @@ pub async fn summarize(
 pub async fn run_sql(request: &vulse_model::SqlRequest) -> Result<vulse_model::SqlResult, String> {
     send_json(Request::post("/api/v1/sql"), request).await
 }
+
+pub async fn oauth_request(id: &str) -> Result<vulse_model::OAuthRequestView, String> {
+    get_json(&format!("/api/v1/oauth/requests/{id}")).await
+}
+
+pub async fn oauth_consent(
+    body: &vulse_model::OAuthConsent,
+) -> Result<vulse_model::OAuthRedirect, String> {
+    send_json(Request::post("/api/v1/oauth/consent"), body).await
+}
+
+/// The apps the user connected, or every connected app in the workspace.
+pub async fn oauth_grants(all: bool) -> Result<Vec<vulse_model::OAuthGrantView>, String> {
+    get_json(if all {
+        "/api/v1/oauth/grants?all=true"
+    } else {
+        "/api/v1/oauth/grants"
+    })
+    .await
+}
+
+pub async fn delete_oauth_grant(id: &str) -> Result<(), String> {
+    delete(&format!("/api/v1/oauth/grants/{id}")).await
+}
+
+pub async fn oauth_settings() -> Result<vulse_model::OAuthSettings, String> {
+    get_json("/api/v1/oauth/settings").await
+}
+
+pub async fn update_oauth_settings(
+    body: &vulse_model::OAuthSettings,
+) -> Result<vulse_model::OAuthSettings, String> {
+    send_json(Request::put("/api/v1/oauth/settings"), body).await
+}
+
+pub async fn oauth_clients() -> Result<Vec<vulse_model::OAuthClientView>, String> {
+    get_json("/api/v1/oauth/clients").await
+}
+
+/// Client ids may be URLs, so they are encoded into the path.
+pub async fn approve_oauth_client(id: &str) -> Result<(), String> {
+    let id = String::from(js_sys::encode_uri_component(id));
+    send_empty::<()>(
+        Request::post(&format!("/api/v1/oauth/clients/{id}/approve")),
+        None,
+    )
+    .await
+}
+
+pub async fn delete_oauth_client(id: &str) -> Result<(), String> {
+    let id = String::from(js_sys::encode_uri_component(id));
+    delete(&format!("/api/v1/oauth/clients/{id}")).await
+}

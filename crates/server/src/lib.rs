@@ -1,5 +1,6 @@
 mod assets;
 mod auth;
+mod client_metadata;
 mod config;
 mod content;
 mod convert;
@@ -10,8 +11,10 @@ mod export;
 mod history;
 mod import;
 mod lookups;
+mod mcp;
 mod migrate;
 mod mutations;
+mod oauth;
 mod public;
 mod records;
 mod relationships;
@@ -65,6 +68,15 @@ pub async fn run() -> anyhow::Result<()> {
     }
     security::spawn_cleanup(db.clone());
     let bind = config.bind.clone();
+    if config.mcp && config.public_url.is_none() {
+        tracing::warn!(
+            "VULSE_MCP is on without VULSE_PUBLIC_URL; MCP clients must reach this server at http://{bind}"
+        );
+    }
+    let base_url = config
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{bind}"));
     let app = app(AppState {
         db,
         password_work: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -76,8 +88,10 @@ pub async fn run() -> anyhow::Result<()> {
             trust_proxy: config.trust_proxy,
             public_origin: config.public_url,
             password_wait: Duration::from_secs(10),
+            base_url,
         }),
         throttle: Arc::new(Throttle::default()),
+        mcp: config.mcp,
     });
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "listening");
@@ -91,11 +105,18 @@ pub async fn run() -> anyhow::Result<()> {
 
 pub fn app(state: AppState) -> Router {
     let web_dist = state.web_dist.clone();
-    let api = api().layer(axum::middleware::from_fn_with_state(
+    let mut api = api();
+    if state.mcp {
+        api = api.merge(oauth::api_routes());
+    }
+    let api = api.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         security::same_origin_writes,
     ));
     let mut router = Router::new().nest("/api/v1", api);
+    if state.mcp {
+        router = router.merge(mcp::router(&state)).merge(oauth::routes());
+    }
     if web_dist.join("index.html").is_file() {
         let index = web_dist.join("index.html");
         let serve = ServeDir::new(&web_dist).fallback(ServeFile::new(index));
@@ -251,8 +272,10 @@ pub async fn test_state(root: PathBuf) -> anyhow::Result<AppState> {
             trust_proxy: false,
             public_origin: None,
             password_wait: Duration::from_millis(50),
+            base_url: "http://localhost".into(),
         }),
         throttle: Arc::new(Throttle::default()),
+        mcp: true,
     })
 }
 

@@ -13,6 +13,8 @@ pub struct AppState {
     pub web_dist: PathBuf,
     pub auth: Arc<AuthSettings>,
     pub throttle: Arc<Throttle>,
+    /// Serve the MCP endpoint at `/mcp`.
+    pub mcp: bool,
 }
 
 pub struct AuthSettings {
@@ -26,6 +28,9 @@ pub struct AuthSettings {
     pub public_origin: Option<String>,
     /// How long a sign-in waits for a free password hashing slot.
     pub password_wait: Duration,
+    /// The address clients reach this server at, without a trailing slash.
+    /// The OAuth issuer, and the MCP resource with `/mcp` appended.
+    pub base_url: String,
 }
 
 impl AuthSettings {

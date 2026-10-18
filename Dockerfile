@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# Build the server binary and the admin UI.
+# Build the admin UI, then the server binary with the UI inside it.
 FROM rust:1-bookworm AS build
 
 ARG TRUNK_VERSION=0.21.14
@@ -22,12 +22,11 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     trunk build --release --config crates/web/Trunk.toml \
-    && cargo build --release --locked -p vulse-server \
+    && cargo build --release --locked -p vulse-server --features embed-web \
     && mkdir -p /out \
-    && cp target/release/vulse /out/vulse \
-    && cp -r crates/web/dist /out/web
+    && cp target/release/vulse /out/vulse
 
-# `docker build --target dist --output release .` writes the binary and admin files to ./release.
+# `docker build --target dist --output release .` writes the binary to ./release.
 FROM scratch AS dist
 COPY --from=build /out/ /
 
@@ -41,12 +40,10 @@ RUN apt-get update \
     && chown vulse:vulse /data
 
 COPY --from=build /out/vulse /usr/local/bin/vulse
-COPY --from=build /out/web /app/web
 
 ENV BIND=0.0.0.0:8080 \
     VULSE_DB_PATH=/data/vulse.db \
-    ASSET_DIR=/data/storage \
-    VULSE_WEB_DIST=/app/web
+    ASSET_DIR=/data/storage
 
 USER vulse
 WORKDIR /data

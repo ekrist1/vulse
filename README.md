@@ -26,7 +26,7 @@ Start Vulse server with MCP locally:
 VULSE_MCP=on VULSE_PUBLIC_URL=http://localhost:8080 cargo run -p vulse-server
 ```
 
-The server listens on `127.0.0.1:8080`. On first start with an empty database it logs a one-time setup token. Open `/setup` in a browser and use that token to create the first admin (see [Accounts and access](#accounts-and-access)). The admin is served from `crates/web/dist`. If that directory is missing, the API still runs and the site routes are absent.
+The server listens on `127.0.0.1:8080`. On first start with an empty database it logs a one-time setup token. Open `/setup` in a browser and use that token to create the first admin (see [Accounts and access](#accounts-and-access)). The admin is served from `crates/web/dist`. If that directory is missing, the API still runs and the site routes are absent, unless the binary was built with the admin inside it (`--features embed-web`, as release binaries are).
 
 While changing the UI, run Trunk's dev server in another terminal. It serves the admin on `127.0.0.1:8081` and proxies `/api` to the Axum process:
 
@@ -41,7 +41,7 @@ With no Turso URL set, data is stored in `./vulse.db` and uploaded files in `./s
 | `BIND` | `127.0.0.1:8080` | Listen address |
 | `VULSE_DB_PATH` | `./vulse.db` | Local database file |
 | `ASSET_DIR` | `./storage` | Upload directory |
-| `VULSE_WEB_DIST` | `crates/web/dist` | Built admin files |
+| `VULSE_WEB_DIST` | `crates/web/dist` | Built admin files. When the directory has no `index.html`, a binary built with `embed-web` serves its built-in admin |
 | `TURSO_DATABASE_URL` | unset | Remote Turso database |
 | `TURSO_AUTH_TOKEN` | unset | Token for that database |
 | `VULSE_PUBLIC_URL` | unset | External address, such as `https://cms.example.com`. An `https://` value turns on secure cookies. Also accepted as the origin for signed-in writes |
@@ -100,9 +100,15 @@ Inside the container the database is `/data/vulse.db` and uploads are in `/data/
 
 ### Option 2: Binary with systemd
 
-The server compiles to a single binary, `vulse`. It serves the admin from a directory next to it, so a release is the binary plus the `web` folder.
+The server is a single binary, `vulse`, with the admin built in. Install the latest release (Linux, x86_64 or aarch64, glibc 2.35 or later: Debian 12+, Ubuntu 22.04+):
 
-#### Build on the VPS
+```bash
+curl -fsSL https://raw.githubusercontent.com/ekrist1/vulse/master/install.sh | sh
+```
+
+The script downloads the binary for your CPU from [GitHub releases](https://github.com/ekrist1/vulse/releases), checks its SHA-256 checksum and installs it to `/usr/local/bin/vulse`, using `sudo` if needed. Set `VULSE_VERSION=v0.2.0` to install a specific release, or `VULSE_INSTALL_DIR` to install somewhere else.
+
+#### Building it yourself
 
 Install the tools from [Start](#start) (Rust, Node.js 22, the wasm target and Trunk), plus a C toolchain (`sudo apt install build-essential pkg-config`). Then:
 
@@ -111,29 +117,19 @@ git clone https://github.com/ekrist1/vulse.git
 cd vulse
 npm --prefix crates/web ci
 trunk build --release --config crates/web/Trunk.toml
-cargo build --release --locked -p vulse-server
+cargo build --release --locked -p vulse-server --features embed-web
+sudo install -m 755 target/release/vulse /usr/local/bin/vulse
 ```
 
-#### Building on another machine
-
-Or build with Docker on any machine, so the VPS needs no Rust or Node:
-
-```bash
-docker build --target dist --output release .
-```
-
-This writes `release/vulse` and `release/web`. The binary is built on Debian 12 and runs on Debian 12 or later and Ubuntu 24.04 or later. Copy `release/` to the VPS with `scp` or `rsync`.
+Or build with Docker on any machine, so the VPS needs no Rust or Node: `docker build --target dist --output release .` writes `release/vulse`. It is built on Debian 12 and runs on Debian 12 or later and Ubuntu 24.04 or later.
 
 #### Install
 
-Create a system user and directories, then copy the build in. From a build on the VPS, the files are `target/release/vulse` and `crates/web/dist`. From a Docker build, they are `release/vulse` and `release/web`:
+Create a system user and a data directory:
 
 ```bash
 sudo useradd --system --home-dir /var/lib/vulse --shell /usr/sbin/nologin vulse
 sudo install -d -o vulse -g vulse /var/lib/vulse
-sudo install -d /opt/vulse
-sudo install -m 755 target/release/vulse /opt/vulse/vulse
-sudo rm -rf /opt/vulse/web && sudo cp -r crates/web/dist /opt/vulse/web
 ```
 
 Put the settings in `/etc/vulse.env`:
@@ -143,7 +139,6 @@ VULSE_PUBLIC_URL=https://cms.example.com
 VULSE_TRUST_PROXY=true
 VULSE_DB_PATH=/var/lib/vulse/vulse.db
 ASSET_DIR=/var/lib/vulse/storage
-VULSE_WEB_DIST=/opt/vulse/web
 ```
 
 Create `/etc/systemd/system/vulse.service`:
@@ -159,7 +154,7 @@ User=vulse
 Group=vulse
 EnvironmentFile=/etc/vulse.env
 WorkingDirectory=/var/lib/vulse
-ExecStart=/opt/vulse/vulse
+ExecStart=/usr/local/bin/vulse
 Restart=on-failure
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -197,24 +192,29 @@ docker image prune -f
 
 The volume name is the folder name plus `_vulse-data`. `docker volume ls` shows it.
 
-**Binary built on the VPS:**
+**Binary from a release:**
 
 ```bash
 sudo systemctl stop vulse
 sudo tar -czf /root/vulse-backup-$(date +%F).tar.gz -C /var/lib/vulse .
-cd vulse
-git pull
-npm --prefix crates/web ci
-trunk build --release --config crates/web/Trunk.toml
-cargo build --release --locked -p vulse-server
-sudo install -m 755 target/release/vulse /opt/vulse/vulse
-sudo rm -rf /opt/vulse/web && sudo cp -r crates/web/dist /opt/vulse/web
+curl -fsSL https://raw.githubusercontent.com/ekrist1/vulse/master/install.sh | sh
 sudo systemctl start vulse
 ```
 
-**Binary built elsewhere:** run `git pull` and `docker build --target dist --output release .` on the build machine, copy `release/` to the VPS, then stop Vulse, back up, install `release/vulse` and `release/web` as above, and start it again.
+**Binary built yourself:** stop Vulse and back up as above, then `git pull`, rebuild with the commands in [Building it yourself](#building-it-yourself), install `target/release/vulse` (or `release/vulse` from a Docker build) to `/usr/local/bin/vulse`, and start it again.
 
-After any update, `docker compose logs vulse` or `journalctl -u vulse` shows whether the server started. To go back, stop Vulse, restore the backup into the data directory, and run the previous version (`git checkout <commit>` and rebuild).
+After any update, `docker compose logs vulse` or `journalctl -u vulse` shows whether the server started. To go back, stop Vulse, restore the backup into the data directory, and run the previous version (`VULSE_VERSION=<previous tag>` with the install script, or `git checkout <commit>` and rebuild).
+
+### Publishing a release
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`). Set the new version in `crates/server/Cargo.toml`, commit, then tag and push:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow builds the admin once, builds the server with it inside for x86_64 and aarch64 Linux, starts each binary as a smoke test, and publishes `vulse-<target>.tar.gz` files with `.sha256` checksums as a GitHub release. The tag must match the version in `Cargo.toml`, or the workflow stops before building.
 
 ## Accounts and access
 

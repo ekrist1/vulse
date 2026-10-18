@@ -26,6 +26,8 @@ mod store;
 mod summary;
 mod timeutil;
 mod users;
+#[cfg(feature = "embed-web")]
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,6 +123,11 @@ pub fn app(state: AppState) -> Router {
         let index = web_dist.join("index.html");
         let serve = ServeDir::new(&web_dist).fallback(ServeFile::new(index));
         router = router.fallback_service(serve);
+    } else {
+        #[cfg(feature = "embed-web")]
+        if web::embedded() {
+            router = router.fallback(web::serve);
+        }
     }
     router
         .layer(axum::middleware::from_fn(security::page_headers))

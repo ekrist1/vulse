@@ -1,0 +1,132 @@
+# Pushing a tag such as v0.2.0 builds Linux binaries with the admin UI
+# inside and publishes them as a GitHub release, which install.sh downloads.
+# The tag must match the version in crates/server/Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  TRUNK_VERSION: "0.21.14"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Build admin UI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches server version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/server/Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match crates/server/Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+
+      - name: Install Trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin
+
+      - run: npm --prefix crates/web ci
+      - run: trunk build --release --config crates/web/Trunk.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: crates/web/dist
+          if-no-files-found: error
+
+  server:
+    name: Build ${{ matrix.target }}
+    needs: web
+    strategy:
+      matrix:
+        include:
+          # Ubuntu 22.04 sets the glibc floor (2.35): Debian 12+, Ubuntu 22.04+, RHEL 10+.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: crates/web/dist
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked -p vulse-server --features embed-web
+
+      - name: Smoke test
+        run: |
+          ./target/release/vulse --version
+          dir=$(mktemp -d)
+          (cd "$dir" && BIND=127.0.0.1:18080 VULSE_WEB_DIST="$dir/none" "$GITHUB_WORKSPACE/target/release/vulse" > "$dir/log" 2>&1 &)
+          for _ in $(seq 1 30); do
+            curl -fs http://127.0.0.1:18080/api/v1/auth/setup > /dev/null && break
+            sleep 1
+          done
+          curl -fs http://127.0.0.1:18080/ | grep -q "<html" || { cat "$dir/log"; exit 1; }
+          pkill -f target/release/vulse || true
+
+      - name: Package
+        run: |
+          archive="vulse-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C target/release vulse
+          sha256sum "$archive" > "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulse-${{ matrix.target }}
+          path: vulse-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: server
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vulse-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "Vulse $GITHUB_REF_NAME" \
+            --generate-notes

@@ -12,6 +12,11 @@ path = "src/lib.rs"
 name = "vulse"
 path = "src/main.rs"
 
+[features]
+# Builds the admin UI from crates/web/dist into the binary. Run
+# `trunk build --release --config crates/web/Trunk.toml` first.
+embed-web = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
 vulse-model = { path = "../model" }
 axum = { version = "0.8", features = ["multipart"] }
@@ -37,6 +42,8 @@ calamine = "0.36"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 reqwest = { version = "0.13", features = ["json"] }
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 
 [dev-dependencies]

@@ -5103,3 +5103,63 @@ async fn sql_statements_preview_confirm_and_use_the_record_path() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn admins_make_download_and_delete_backups() {
+    let app = TestApp::new().await;
+    let (admin, _) = register(&app, "ada@example.com", "ada").await;
+    let (editor, _) = register_as(&app, "grace@example.com", "grace", Role::Editor).await;
+    let (_, key) = json_of::<CreatedApiKey>(
+        app.call("POST", "/api/v1/api-keys", Some(&admin), None, Some(json!({"name":"admin key"})))
+            .await,
+    )
+    .await;
+    // A backup holds every account, so only admin sessions reach it.
+    for (cookie, bearer) in [(Some(editor.as_str()), None), (None, Some(key.secret.as_str()))] {
+        for method in ["GET", "POST"] {
+            assert_eq!(
+                app.call(method, "/api/v1/backups", cookie, bearer, None).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    let (status, made) = json_of::<vulse_model::BackupView>(
+        app.call("POST", "/api/v1/backups", Some(&admin), None, None).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(made.name.starts_with("vulse-backup-") && made.name.ends_with(".zip"));
+    assert!(made.created_at.ends_with('Z'));
+    let (_, overview) = json_of::<vulse_model::BackupOverview>(
+        app.call("GET", "/api/v1/backups", Some(&admin), None, None).await,
+    )
+    .await;
+    assert_eq!(overview.backups, vec![made.clone()]);
+    assert_eq!(overview.every_hours, None);
+
+    let download = app
+        .call("GET", &format!("/api/v1/backups/{}", made.name), Some(&admin), None, None)
+        .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(download.headers()["content-type"], "application/zip");
+    assert!(download.headers()["content-disposition"].to_str().unwrap().contains(&made.name));
+    let bytes = download.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.len() as u64, made.bytes);
+    let zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert!(zip.file_names().any(|name| name == "vulse.db"));
+
+    for name in ["vulse.db", "..%2Fvulse.db", "vulse-backup-..%2F..%2Fvulse.db.zip"] {
+        assert_eq!(
+            app.call("GET", &format!("/api/v1/backups/{name}"), Some(&admin), None, None)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "{name}"
+        );
+    }
+    let path = format!("/api/v1/backups/{}", made.name);
+    assert_eq!(app.call("DELETE", &path, Some(&editor), None, None).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(app.call("DELETE", &path, Some(&admin), None, None).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(app.call("DELETE", &path, Some(&admin), None, None).await.status(), StatusCode::NOT_FOUND);
+}

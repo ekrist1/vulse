@@ -15,6 +15,8 @@ pub struct AppState {
     pub throttle: Arc<Throttle>,
     /// Serve the MCP endpoint at `/mcp`.
     pub mcp: bool,
+    /// Where admins' backups go; `None` for a remote Turso database.
+    pub backup: Option<Arc<crate::backup::Settings>>,
 }
 
 pub struct AuthSettings {

@@ -2,7 +2,7 @@ use gloo_net::http::{Request, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use vulse_model::{
-    AcceptLink, ApiKeyView, AssetView, ChangePassword, CollectionView, CreateApiKey,
+    AcceptLink, ApiKeyView, AssetView, BackupOverview, BackupView, ChangePassword, CollectionView, CreateApiKey,
     CreateCollection, CreateInvite, CreatedApiKey, CreatedInvite, DocumentView, DocumentWrite,
     InviteView, LinkInfo, LinkTokenRequest, LoginRequest, ManagedUser, Page, SetupRequest,
     SetupStatus, UpdateCollection, UpdateUser, UserView,
@@ -41,6 +41,23 @@ pub async fn change_password(body: &ChangePassword) -> Result<(), String> {
 
 pub async fn logout_everywhere() -> Result<(), String> {
     send_empty::<()>(Request::post("/api/v1/auth/logout-everywhere"), None).await
+}
+
+pub async fn backups() -> Result<BackupOverview, String> {
+    get_json("/api/v1/backups").await
+}
+
+pub async fn create_backup() -> Result<BackupView, String> {
+    send_json(Request::post("/api/v1/backups"), &serde_json::json!({})).await
+}
+
+pub async fn delete_backup(name: &str) -> Result<(), String> {
+    delete(&format!("/api/v1/backups/{name}")).await
+}
+
+/// Downloads with the session cookie, as a plain link.
+pub fn backup_url(name: &str) -> String {
+    format!("/api/v1/backups/{name}")
 }
 
 pub async fn users() -> Result<Vec<ManagedUser>, String> {

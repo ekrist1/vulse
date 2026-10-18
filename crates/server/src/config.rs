@@ -16,6 +16,8 @@ pub struct Config {
     pub setup_token: Option<String>,
     pub trust_proxy: bool,
     pub mcp: bool,
+    /// Scheduled backups, from `VULSE_BACKUP_DIR`.
+    pub backup: Option<crate::backup::Schedule>,
 }
 
 impl Config {
@@ -65,6 +67,26 @@ impl Config {
         if setup_token.as_ref().is_some_and(|token| token.len() < 16) {
             anyhow::bail!("VULSE_SETUP_TOKEN must be at least 16 characters");
         }
+        let backup = match nonempty("VULSE_BACKUP_DIR") {
+            Some(dir) => {
+                if turso_url.is_some() {
+                    anyhow::bail!(
+                        "VULSE_BACKUP_DIR backs up a local database; Turso keeps its own backups of remote ones"
+                    );
+                }
+                let hours = number("VULSE_BACKUP_INTERVAL_HOURS", 24)?;
+                let keep = number("VULSE_BACKUP_KEEP", 7)?;
+                if hours == 0 || keep == 0 {
+                    anyhow::bail!("VULSE_BACKUP_INTERVAL_HOURS and VULSE_BACKUP_KEEP must be at least 1");
+                }
+                Some(crate::backup::Schedule {
+                    dir: std::path::absolute(dir)?,
+                    every: std::time::Duration::from_secs(hours * 60 * 60),
+                    keep: keep as usize,
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             bind: std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8080".into()),
             turso_url,
@@ -83,6 +105,7 @@ impl Config {
             setup_token,
             trust_proxy,
             mcp,
+            backup,
         })
     }
 
@@ -108,6 +131,17 @@ fn nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn number(name: &str, default: u64) -> anyhow::Result<u64> {
+    match nonempty(name) {
+        Some(value) => value
+            .parse()
+            .ok()
+            .filter(|n| *n <= 100_000)
+            .with_context(|| format!("{name} must be a whole number")),
+        None => Ok(default),
+    }
 }
 
 fn flag(name: &str, value: &str) -> anyhow::Result<bool> {

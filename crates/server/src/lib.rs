@@ -1,5 +1,6 @@
 mod assets;
 mod auth;
+mod backup;
 mod client_metadata;
 mod config;
 mod content;
@@ -33,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
@@ -69,6 +71,19 @@ pub async fn run() -> anyhow::Result<()> {
         );
     }
     security::spawn_cleanup(db.clone());
+    if let Some(schedule) = config.backup.clone() {
+        tracing::info!(
+            dir = %schedule.dir.display(),
+            hours = schedule.every.as_secs() / 3600,
+            keep = schedule.keep,
+            "scheduled backups on"
+        );
+        backup::spawn_scheduled(db.clone(), config.asset_dir.clone(), schedule);
+    }
+    #[cfg(unix)]
+    if config.turso_url.is_none() {
+        backup::spawn_socket(db.clone(), config.asset_dir.clone(), &config.db_path);
+    }
     let bind = config.bind.clone();
     if config.mcp && config.public_url.is_none() {
         tracing::warn!(
@@ -94,6 +109,18 @@ pub async fn run() -> anyhow::Result<()> {
         }),
         throttle: Arc::new(Throttle::default()),
         mcp: config.mcp,
+        backup: config.turso_url.is_none().then(|| {
+            Arc::new(backup::Settings {
+                dir: config
+                    .backup
+                    .as_ref()
+                    .map(|schedule| schedule.dir.clone())
+                    .unwrap_or_else(|| {
+                        std::path::absolute("backups").unwrap_or_else(|_| PathBuf::from("backups"))
+                    }),
+                schedule: config.backup.clone(),
+            })
+        }),
     });
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "listening");
@@ -103,6 +130,85 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// `vulse backup [DIR] [--keep N]`: writes one backup and exits. `DIR`
+/// defaults to `VULSE_BACKUP_DIR`, then `./backups`.
+pub async fn backup_command(args: &[String]) -> anyhow::Result<()> {
+    let mut dir = None;
+    let mut keep = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--keep" => {
+                let value = args.next().context("--keep needs a number")?;
+                keep = Some(
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .context("--keep must be a whole number of at least 1")?,
+                );
+            }
+            flag if flag.starts_with('-') => anyhow::bail!("unknown option '{flag}'"),
+            path if dir.is_none() => dir = Some(PathBuf::from(path)),
+            extra => anyhow::bail!("unexpected argument '{extra}'"),
+        }
+    }
+    let config = Config::from_env()?;
+    if config.turso_url.is_some() {
+        anyhow::bail!("vulse backup copies a local database; Turso keeps its own backups of remote ones");
+    }
+    if !config.db_path.is_file() {
+        anyhow::bail!(
+            "no database at {}; set VULSE_DB_PATH to the database Vulse uses",
+            config.db_path.display()
+        );
+    }
+    let dir = std::path::absolute(
+        dir.or_else(|| config.backup.as_ref().map(|b| b.dir.clone()))
+            .unwrap_or_else(|| PathBuf::from("backups")),
+    )?;
+    let request = backup::Request { dir, keep };
+    // A running server holds the database lock, so it makes the backup.
+    #[cfg(unix)]
+    if let Some(reply) = backup::request(&config.db_path, &request).await? {
+        let Some(path) = reply.path else {
+            anyhow::bail!(reply.error.unwrap_or_else(|| "backup failed".into()));
+        };
+        print_backup(&path, reply.assets, reply.bytes, reply.removed, keep);
+        return Ok(());
+    }
+    let db = config.open_db().await.map_err(|e| {
+        if format!("{e:#}").contains("locked") {
+            anyhow::anyhow!(
+                "Vulse is running but did not answer at {}; start it with this version of vulse, or stop it and run vulse backup again",
+                backup::socket_path(&config.db_path).display()
+            )
+        } else {
+            e
+        }
+    })?;
+    let made = backup::create(&db, &config.asset_dir, &request.dir).await?;
+    let removed = match keep {
+        Some(keep) => backup::prune(&request.dir, keep).await?,
+        None => 0,
+    };
+    print_backup(&made.path, made.assets, made.bytes, removed, keep);
+    Ok(())
+}
+
+fn print_backup(path: &std::path::Path, assets: usize, bytes: u64, removed: usize, keep: Option<usize>) {
+    println!(
+        "Backup written to {} ({assets} uploaded files, {:.1} MB)",
+        path.display(),
+        bytes as f64 / 1_000_000.0
+    );
+    if let Some(keep) = keep
+        && removed > 0
+    {
+        println!("Removed {removed} older backups, keeping the newest {keep}");
+    }
 }
 
 pub fn app(state: AppState) -> Router {
@@ -153,6 +259,11 @@ fn api() -> Router<AppState> {
         )
         .route("/invites/{id}", delete(users::delete_invite))
         .route("/api-keys", get(auth::list_keys).post(auth::create_key))
+        .route("/backups", get(backup::list_backups).post(backup::create_backup))
+        .route(
+            "/backups/{name}",
+            get(backup::download_backup).delete(backup::delete_backup),
+        )
         .route("/api-keys/{id}", delete(auth::delete_key))
         .route(
             "/collections",
@@ -283,6 +394,10 @@ pub async fn test_state(root: PathBuf) -> anyhow::Result<AppState> {
         }),
         throttle: Arc::new(Throttle::default()),
         mcp: true,
+        backup: Some(Arc::new(backup::Settings {
+            dir: root.join("backups"),
+            schedule: None,
+        })),
     })
 }
 

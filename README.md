@@ -49,6 +49,9 @@ With no Turso URL set, data is stored in `./vulse.db` and uploaded files in `./s
 | `VULSE_SETUP_TOKEN` | random | Fixed first-run setup token, at least 16 characters. Only used while no accounts exist |
 | `VULSE_TRUST_PROXY` | `false` | Take the client address from the last `X-Forwarded-For` entry. Enable only behind a proxy that sets it |
 | `VULSE_MCP` | `off` | `on` serves the MCP server at `/mcp` so Claude and other AI assistants can work with records. Requires an `https://` `VULSE_PUBLIC_URL` outside localhost. See [AI assistants (MCP)](#ai-assistants-mcp) |
+| `VULSE_BACKUP_DIR` | unset | Turns on scheduled backups into this directory. See [Backups](#backups) |
+| `VULSE_BACKUP_INTERVAL_HOURS` | `24` | Hours between scheduled backups |
+| `VULSE_BACKUP_KEEP` | `7` | Scheduled backups to keep; older ones are deleted |
 
 Set both Turso variables, or neither. The remote database should be created with `turso db create --tursodb`, because the server uses the current Turso Rust engine.
 
@@ -174,36 +177,55 @@ sudo systemctl enable --now vulse
 sudo journalctl -u vulse | grep "setup token"
 ```
 
+### Backups
+
+A backup is one zip file, `vulse-backup-<UTC time>.zip`, with a consistent copy of the database (`vulse.db`), the uploaded files (`storage/`) and a `backup.json` describing them. Vulse keeps running while it is made. The database copy is written next to the archive first, so the backup directory needs free space for about the database size plus the archive.
+
+**On a schedule.** Set `VULSE_BACKUP_DIR` and Vulse writes a backup every 24 hours (`VULSE_BACKUP_INTERVAL_HOURS`), starting one interval after it starts, and keeps the newest 7 (`VULSE_BACKUP_KEEP`). Each backup and any failure is logged.
+
+**From the admin.** Admins see a Backups section on their account page. It shows where backups are saved and whether a schedule is on, makes a backup on demand, and lists the backups with Download and Delete. Backups go to `VULSE_BACKUP_DIR`, or `backups/` in Vulse's working directory when that is unset. Only signed-in admins can use it, not API keys, because a backup contains every account and record.
+
+**On demand.** `vulse backup [DIR] [--keep N]` writes one backup to `DIR` (default: `VULSE_BACKUP_DIR`, then `./backups`) and, with `--keep`, deletes all but the newest N there. Run it as the same user as the server, with the same `VULSE_DB_PATH`. When Vulse is running, the command asks it for the backup over a socket next to the database (`vulse.db-backup.sock`, readable only by that user), because the running server holds the database lock. When Vulse is stopped, the command copies the database itself.
+
+```bash
+# systemd: the service may only write inside /var/lib/vulse
+sudo -u vulse VULSE_DB_PATH=/var/lib/vulse/vulse.db vulse backup /var/lib/vulse/backups --keep 14
+
+# Docker
+docker compose exec vulse vulse backup /data/backups --keep 14
+```
+
+In Docker, the backups stay in the data volume; `docker compose cp vulse:/data/backups ./backups` copies them out. Backups on the same disk do not survive losing that disk. Copy them elsewhere, for example with `rsync` or `rclone` from a cron job.
+
+**Restoring.** Stop Vulse. Unzip the backup, put `vulse.db` at `VULSE_DB_PATH` and delete any `vulse.db-wal` beside it, and replace the `ASSET_DIR` directory with `storage/`. Make the files owned by the service user (`sudo chown -R vulse:vulse /var/lib/vulse`) and start Vulse. A backup can be restored by the version that made it or a newer one, which migrates it on start.
+
+Turso databases (`TURSO_DATABASE_URL`) are not covered: Turso keeps its own backups, and `vulse backup` and `VULSE_BACKUP_DIR` refuse to run with them.
+
 ### Updating to a new version
 
-Back up first. Each new version can migrate the database when it starts, and a migration cannot be undone. Stop Vulse before copying the data, so the database file and its `-wal` file match.
+Back up first. Each new version can migrate the database when it starts, and a migration cannot be undone.
 
 **Docker:**
 
 ```bash
 cd vulse
-docker compose stop vulse
-docker run --rm -v vulse_vulse-data:/data -v "$PWD":/backup debian:bookworm-slim \
-  tar -czf /backup/vulse-backup-$(date +%F).tar.gz -C /data .
+docker compose exec vulse vulse backup /data/backups
 git pull
 docker compose up -d --build
 docker image prune -f
 ```
 
-The volume name is the folder name plus `_vulse-data`. `docker volume ls` shows it.
-
 **Binary from a release:**
 
 ```bash
-sudo systemctl stop vulse
-sudo tar -czf /root/vulse-backup-$(date +%F).tar.gz -C /var/lib/vulse .
+sudo -u vulse VULSE_DB_PATH=/var/lib/vulse/vulse.db vulse backup /var/lib/vulse/backups
 curl -fsSL https://raw.githubusercontent.com/ekrist1/vulse/master/install.sh | sh
-sudo systemctl start vulse
+sudo systemctl restart vulse
 ```
 
-**Binary built yourself:** stop Vulse and back up as above, then `git pull`, rebuild with the commands in [Building it yourself](#building-it-yourself), install `target/release/vulse` (or `release/vulse` from a Docker build) to `/usr/local/bin/vulse`, and start it again.
+**Binary built yourself:** back up as above, then `git pull`, rebuild with the commands in [Building it yourself](#building-it-yourself), install `target/release/vulse` (or `release/vulse` from a Docker build) to `/usr/local/bin/vulse`, and restart Vulse.
 
-After any update, `docker compose logs vulse` or `journalctl -u vulse` shows whether the server started. To go back, stop Vulse, restore the backup into the data directory, and run the previous version (`VULSE_VERSION=<previous tag>` with the install script, or `git checkout <commit>` and rebuild).
+After any update, `docker compose logs vulse` or `journalctl -u vulse` shows whether the server started. To go back, [restore the backup](#backups) and run the previous version (`VULSE_VERSION=<previous tag>` with the install script, or `git checkout <commit>` and rebuild).
 
 ### Publishing a release
 

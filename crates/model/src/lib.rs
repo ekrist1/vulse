@@ -273,6 +273,28 @@ pub struct MutationResult {
     pub undo_id: String,
 }
 
+/// A backup archive in the server's backup directory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupView {
+    pub name: String,
+    pub bytes: u64,
+    /// When the backup was made, as RFC 3339 UTC.
+    pub created_at: String,
+}
+
+/// The backup page: where backups go, the schedule, and the archives there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupOverview {
+    pub dir: String,
+    /// Hours between scheduled backups; `None` when scheduling is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every_hours: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep: Option<usize>,
+    /// Newest first.
+    pub backups: Vec<BackupView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssetView {
     pub id: String,

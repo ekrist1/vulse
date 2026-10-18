@@ -1,6 +1,6 @@
 use crate::api;
 use vulse_model::{CollectionView, FieldType, ImportResult};
-use web_sys::{File, HtmlInputElement, HtmlSelectElement};
+use web_sys::{File, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -22,8 +22,37 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
     let mode = use_state(|| "append".to_string());
     let match_field = use_state(String::new);
     let has_headers = use_state(|| true);
+    // "file" uploads a spreadsheet; "paste" imports text copied from a spreadsheet or CSV.
+    let source = use_state(|| "file".to_string());
+    let pasted = use_state(String::new);
+    let ready = if *source == "paste" {
+        !pasted.trim().is_empty()
+    } else {
+        file.is_some()
+    };
+    // Clears the mapping and preview whenever the data being imported changes.
+    let reset = {
+        let result = result.clone();
+        let mapping = mapping.clone();
+        let sheet = sheet.clone();
+        let validated = validated.clone();
+        let error = error.clone();
+        let success = success.clone();
+        let completed = completed.clone();
+        Callback::from(move |_: ()| {
+            result.set(None);
+            mapping.set(vec![]);
+            sheet.set(String::new());
+            validated.set(false);
+            error.set(String::new());
+            success.set(0);
+            completed.set(false);
+        })
+    };
     let run = {
         let file = file.clone();
+        let source = source.clone();
+        let pasted = pasted.clone();
         let result = result.clone();
         let mapping = mapping.clone();
         let sheet = sheet.clone();
@@ -40,8 +69,21 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
             if *busy || (commit && !*validated) {
                 return;
             }
-            let Some(file) = (*file).clone() else {
-                return;
+            // Pasted text is sent as a CSV file; the server detects tab, semicolon or comma delimiters.
+            let file = if *source == "paste" {
+                let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(&pasted));
+                match File::new_with_str_sequence(&parts, "pasted.csv") {
+                    Ok(file) => file,
+                    Err(e) => {
+                        error.set(format!("{e:?}"));
+                        return;
+                    }
+                }
+            } else {
+                let Some(file) = (*file).clone() else {
+                    return;
+                };
+                file
             };
             busy.set(true);
             error.set(String::new());
@@ -94,30 +136,34 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
     };
     let on_file = {
         let file = file.clone();
-        let result = result.clone();
-        let mapping = mapping.clone();
-        let sheet = sheet.clone();
-        let validated = validated.clone();
-        let error = error.clone();
-        let success = success.clone();
-        let completed = completed.clone();
+        let reset = reset.clone();
         Callback::from(move |e: Event| {
             let input: HtmlInputElement = e.target_unchecked_into();
             file.set(input.files().and_then(|f| f.get(0)));
-            result.set(None);
-            mapping.set(vec![]);
-            sheet.set(String::new());
-            validated.set(false);
-            error.set(String::new());
-            success.set(0);
-            completed.set(false);
+            reset.emit(());
         })
+    };
+    let on_paste = {
+        let pasted = pasted.clone();
+        let reset = reset.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlTextAreaElement = e.target_unchecked_into();
+            pasted.set(input.value());
+            reset.emit(());
+        })
+    };
+    let source_tab = |value: &'static str, label: &'static str| {
+        let source = source.clone();
+        let reset = reset.clone();
+        html! {<button type="button" class={if *source==value{"active"}else{""}} aria-pressed={(*source==value).to_string()} disabled={*busy} onclick={Callback::from(move |_|{if *source!=value{source.set(value.into());reset.emit(());}})}>{label}</button>}
     };
     html! {
         <section class="card import-panel">
-            <div class="section-heading"><div><p class="eyebrow">{"BRING YOUR DATA"}</p><h2>{"From spreadsheet to collection"}</h2><p class="muted">{"Choose a file, map its columns, and review before importing."}</p></div><span class="badge">{"CSV · XLSX"}</span></div>
+            <div class="section-heading"><div><p class="eyebrow">{"BRING YOUR DATA"}</p><h2>{"From spreadsheet to collection"}</h2><p class="muted">{"Choose a file or paste your data, map its columns, and review before importing."}</p></div><span class="badge">{"CSV · XLSX · Paste"}</span></div>
             <ol class="steps"><li class="active">{"1. Upload"}</li><li class={if result.is_some(){"active"}else{""}}>{"2. Map & validate"}</li><li class={if *validated || *completed{"active"}else{""}}>{"3. Import"}</li></ol>
-            <label class="upload-zone"><strong>{"Choose your spreadsheet"}</strong><span class="muted">{"Up to 50 MB, 50,000 rows and 200 columns."}</span><input type="file" accept=".csv,.xlsx" disabled={*busy} onchange={on_file}/></label>
+            <div class="row tabs import-source">{source_tab("file","Upload a file")}{source_tab("paste","Paste data")}</div>
+            if *source=="paste"{<label class="paste-zone"><strong>{"Paste your data"}</strong><span class="muted">{"Copy cells from Excel or Google Sheets, or paste CSV text. Tab, semicolon and comma separators are detected automatically."}</span><textarea aria-label="Pasted data" rows="10" spellcheck="false" placeholder={"Name\tEmail\nAda\tada@example.com"} disabled={*busy} value={(*pasted).clone()} oninput={on_paste}/></label>}
+            else{<label class="upload-zone"><strong>{"Choose your spreadsheet"}</strong><span class="muted">{"Up to 50 MB, 50,000 rows and 200 columns."}</span><input type="file" accept=".csv,.xlsx" disabled={*busy} onchange={on_file}/></label>}
             <label class="check"><input type="checkbox" checked={*has_headers} disabled={*busy||*completed} onchange={Callback::from({let has_headers=has_headers.clone();let result=result.clone();let mapping=mapping.clone();let validated=validated.clone();move |e:Event|{has_headers.set(e.target_unchecked_into::<HtmlInputElement>().checked());result.set(None);mapping.set(vec![]);validated.set(false);}})}/>{"First row contains column headers"}</label>
             <div class="field-metadata"><label>{"Import behavior"}<select aria-label="Import behavior" disabled={*busy||*completed} onchange={Callback::from({let mode=mode.clone();let validated=validated.clone();move |e:Event|{mode.set(e.target_unchecked_into::<HtmlSelectElement>().value());validated.set(false);}})}><option value="append" selected={*mode=="append"}>{"Add new records"}</option><option value="upsert" selected={*mode=="upsert"}>{"Create or update by a unique field"}</option></select></label>
             if *mode=="upsert"{<label>{"Match existing records by"}<select aria-label="Match existing records by" disabled={*busy||*completed} onchange={Callback::from({let match_field=match_field.clone();let validated=validated.clone();move |e:Event|{match_field.set(e.target_unchecked_into::<HtmlSelectElement>().value());validated.set(false);}})}><option value="" selected={match_field.is_empty()}>{"Choose a unique field, such as SKU or email"}</option>{for props.collection.blueprint.fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number)).map(|f|html!{<option value={f.name.clone()} selected={*match_field==f.name}>{f.display_label()}</option>})}</select></label>}
@@ -133,8 +179,8 @@ pub fn import_panel(props: &ImportPanelProps) -> Html {
                 if next.errors.is_empty(){<p class="import-summary" role="status">{format!("{} new · {} updates · {} unchanged",next.created,next.updated,next.unchanged)}</p>}
                 if !next.preview.is_empty(){<h3>{format!("Preview · first {} of {} rows",next.preview.len(),next.row_count)}</h3><div class="table-scroll"><table><thead><tr><th>{"Action"}</th>{for props.collection.blueprint.fields.iter().map(|f|html!{<th>{f.display_label()}</th>})}</tr></thead><tbody>{for next.preview.iter().enumerate().map(|(index,row)|html!{<tr><td><span class="badge">{next.preview_actions.get(index).cloned().unwrap_or_default()}</span></td>{for props.collection.blueprint.fields.iter().map(|f|html!{<td title={vulse_model::text_value(&row[&f.name])}>{vulse_model::text_value(&row[&f.name])}</td>})}</tr>})}</tbody></table></div>}
             }
-            if *completed{<div class="success" role="status"><strong>{format!("✓ Import complete · {} records written",*success)}</strong><p>{"Unchanged rows were left as they were. Choose another file above to start a new import."}</p><button onclick={Callback::from({let on_import=props.on_import.clone();move |_|on_import.emit(())})}>{"View records →"}</button></div>}
-            else{<div class="row"><button class="secondary" disabled={file.is_none() || *busy || (*mode=="upsert" && match_field.is_empty())} onclick={Callback::from({let run=run.clone();move |_|run.emit(false)})}>{if *busy{"Processing…"}else if result.is_none(){"Read file & preview"}else{"Validate & preview"}}</button><button disabled={!*validated || *busy} onclick={Callback::from(move |_|run.emit(true))}>{result.as_ref().map(|r|format!("Import {} records",r.row_count)).unwrap_or_else(||"Import records".into())}</button><span class="muted">{if *validated{"✓ All rows valid. Ready to import."}else{"Validate your data to enable import."}}</span></div>}
+            if *completed{<div class="success" role="status"><strong>{format!("✓ Import complete · {} records written",*success)}</strong><p>{if *source=="paste"{"Unchanged rows were left as they were. Paste new data above to start a new import."}else{"Unchanged rows were left as they were. Choose another file above to start a new import."}}</p><button onclick={Callback::from({let on_import=props.on_import.clone();move |_|on_import.emit(())})}>{"View records →"}</button></div>}
+            else{<div class="row"><button class="secondary" disabled={!ready || *busy || (*mode=="upsert" && match_field.is_empty())} onclick={Callback::from({let run=run.clone();move |_|run.emit(false)})}>{if *busy{"Processing…"}else if result.is_none(){if *source=="paste"{"Read data & preview"}else{"Read file & preview"}}else{"Validate & preview"}}</button><button disabled={!*validated || *busy} onclick={Callback::from(move |_|run.emit(true))}>{result.as_ref().map(|r|format!("Import {} records",r.row_count)).unwrap_or_else(||"Import records".into())}</button><span class="muted">{if *validated{"✓ All rows valid. Ready to import."}else{"Validate your data to enable import."}}</span></div>}
         </section>
     }
 }

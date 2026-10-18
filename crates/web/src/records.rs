@@ -1,7 +1,7 @@
 use crate::confirm::ConfirmRequest;
 use crate::{api, app::Route};
 use vulse_model::{
-    CollectionView, DocumentView, FieldType, RecordFilter, RecordPage, RecordQuery, SavedView,
+    ArrayItems, CollectionView, DocumentView, FieldDef, FieldType, RecordFilter, RecordPage, RecordQuery, SavedView,
     SavedViewWrite, display_value, record_title,
 };
 use web_sys::{HtmlInputElement, HtmlSelectElement};
@@ -585,7 +585,7 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         if !picked.is_empty(){<div class="bulk-toolbar"><button type="button" class="secondary" disabled={*working||columns.is_empty()} onclick={Callback::from({let export=run_export.clone();move |_|export.emit(true)})}>{"Export selected"}</button><strong>{format!("{} selected",picked.len())}</strong><button type="button" class="secondary" disabled={*working||bulk_field.is_empty()} onclick={Callback::from({let open=bulk_open.clone();move |_|open.set(!*open)})}>{"Bulk edit"}</button><button type="button" class="secondary" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("duplicate".into())})}>{"Duplicate selected"}</button><button type="button" class="danger" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("delete".into())})}>{"Delete selected"}</button><button type="button" class="text-button" onclick={Callback::from({let picked=picked.clone();move |_|picked.set(vec![])})}>{"Clear selection"}</button></div>}
         if *bulk_open&&!picked.is_empty(){<div class="bulk-editor"><label>{"Field to update"}<select aria-label="Bulk field" onchange={Callback::from({let field=bulk_field.clone();let value=bulk_value.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();field.set(input.value());value.set(String::new());}})}>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date)).map(|f|html!{<option value={f.name.clone()} selected={*bulk_field==f.name}>{f.display_label().to_string()}</option>})}</select></label><label>{"New value"}{if fields.iter().find(|f|f.name==*bulk_field).is_some_and(|f|f.kind==FieldType::Date){html!{<input aria-label="Bulk value" type="date" value={(*bulk_value).clone()} oninput={Callback::from({let value=bulk_value.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();value.set(input.value());}})}/>}}else if let Some(options)=fields.iter().find(|f|f.name==*bulk_field).and_then(|f|f.options.clone()){html!{<crate::form::OptionSelect label="Bulk value" {options} value={(*bulk_value).clone()} on_change={Callback::from({let value=bulk_value.clone();move |next:String|value.set(next)})}/>}}else if fields.iter().find(|f|f.name==*bulk_field).is_some_and(|f|f.kind==FieldType::Boolean){html!{<select aria-label="Bulk value" onchange={Callback::from({let value=bulk_value.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();value.set(input.value());}})}><option value="false" selected={!bulk_value.eq_ignore_ascii_case("true")}>{"False"}</option><option value="true" selected={bulk_value.eq_ignore_ascii_case("true")}>{"True"}</option></select>}}else{html!{<input aria-label="Bulk value" value={(*bulk_value).clone()} oninput={Callback::from({let value=bulk_value.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();value.set(input.value());}})}/>}}}</label><button type="button" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("update".into())})}>{"Apply to selected"}</button><p class="muted">{"Only this field changes. Calculated fields stay read-only. The whole batch must pass validation."}</p></div>}
         if page.items.is_empty() && !*loading{<div class="empty-state"><h2>{if page.total==0&&query.filters.is_empty()&&query.search.is_empty(){"No records yet"}else{"No matching records"}}</h2><p>{"Add a record, import data, or adjust your view."}</p></div>}
-        else{<div class="table-scroll"><table class="records-table"><thead><tr><th><input type="checkbox" aria-label="Select visible records" disabled={*loading||*working} checked={!page.items.is_empty()&&page.items.iter().all(|d|picked.iter().any(|p|p.id==d.id))} onchange={Callback::from({let picked=picked.clone();let items=page.items.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();picked.set(if input.checked(){items.clone()}else{vec![]});}})}/></th><th>{"Record"}</th>{for visible.iter().map(|f|html!{<th>{if f.kind==FieldType::Calculated{"ƒx "}else{""}}{f.display_label().to_string()}</th>})}<th>{"Updated"}</th></tr></thead><tbody>{for page.items.iter().enumerate().map(|(index,document)|{
+        else{<div class="table-scroll"><table class="records-table"><thead><tr><th><input type="checkbox" aria-label="Select visible records" disabled={*loading||*working} checked={!page.items.is_empty()&&page.items.iter().all(|d|picked.iter().any(|p|p.id==d.id))} onchange={Callback::from({let picked=picked.clone();let items=page.items.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();picked.set(if input.checked(){items.clone()}else{vec![]});}})}/></th><th>{"Record"}</th>{for visible.iter().map(|f|html!{<ColumnHeader key={f.name.clone()} field={(*f).clone()}/>})}<th>{"Updated"}</th></tr></thead><tbody>{for page.items.iter().enumerate().map(|(index,document)|{
             let group=if query.group_field.is_empty(){None}else{let value=display_value(&document.body[&query.group_field]);if index==0||display_value(&page.items[index-1].body[&query.group_field])!=value{Some(if value.is_empty(){"Empty".into()}else{value})}else{None}};
             html!{<>{if let Some(group)=group{html!{<tr class="group-row"><th colspan={(visible.len()+3).to_string()}>{group}</th></tr>}}else{html!{}}}<tr key={document.id.clone()}><td><input type="checkbox" aria-label={format!("Select record {}",document.id)} disabled={*loading||*working} checked={picked.iter().any(|p|p.id==document.id)} onchange={Callback::from({let picked=picked.clone();let document=document.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=(*picked).clone();next.retain(|d|d.id!=document.id);if input.checked(){next.push(document.clone());}picked.set(next);}})}/></td><td><Link<Route> to={Route::Document{id:props.collection.id.clone(),doc_id:document.id.clone()}}>{format!("{} →",record_title(&props.collection.blueprint,&document.body,&document.id))}</Link<Route>></td>{for visible.iter().map(|field|html!{<crate::record_cell::RecordCell key={field.name.clone()} collections={props.collections.clone()} collection_id={props.collection.id.clone()} document={document.clone()} field={(*field).clone()} on_saved={on_saved.clone()}/>})}<td class="muted">{document.updated_at.chars().take(10).collect::<String>()}</td></tr></>}
         })}</tbody></table></div>}
@@ -727,4 +727,63 @@ fn related_export_options(
             </fieldset>}
         }) }
     </div>}
+}
+
+#[derive(Properties, PartialEq)]
+struct ColumnHeaderProps {
+    field: FieldDef,
+}
+
+/// A column title that shows the field's type, or its formula, on hover or focus.
+/// The popover is fixed-positioned so the table's scroll container does not clip it.
+#[function_component(ColumnHeader)]
+fn column_header(props: &ColumnHeaderProps) -> Html {
+    let anchor = use_state(|| None::<(f64, f64)>);
+    let f = &props.field;
+    let show = {
+        let anchor = anchor.clone();
+        Callback::from(move |e: web_sys::Event| {
+            let target: web_sys::Element = e.target_unchecked_into();
+            let rect = target.get_bounding_client_rect();
+            // Keep the popover (at most 380px wide) inside the viewport.
+            let width = web_sys::window()
+                .and_then(|w| w.inner_width().ok())
+                .and_then(|w| w.as_f64())
+                .unwrap_or(f64::MAX);
+            let left = rect.left().min(width - 396.0).max(16.0);
+            anchor.set(Some((left, rect.bottom() + 6.0)));
+        })
+    };
+    let hide = {
+        let anchor = anchor.clone();
+        Callback::from(move |_: web_sys::Event| anchor.set(None))
+    };
+    let kind = match f.kind {
+        FieldType::Array => match f.items {
+            Some(ArrayItems::String) => "List of text".to_string(),
+            Some(ArrayItems::Number) => "List of numbers".to_string(),
+            Some(ArrayItems::Asset) => "List of assets".to_string(),
+            Some(ArrayItems::Reference) => format!("List of references to {}", f.collection.as_deref().unwrap_or("records")),
+            None => "List".to_string(),
+        },
+        FieldType::Reference => format!("Reference to {}", f.collection.as_deref().unwrap_or("records")),
+        FieldType::String if f.options.as_ref().is_some_and(|o| !o.is_empty()) => format!("Text · one of {} values", f.options.as_ref().map_or(0, Vec::len)),
+        _ => crate::formula_builder::type_label(f).to_string(),
+    };
+    let label = f.display_label().to_string();
+    html! {
+        <th class="column-header" tabindex="0" aria-describedby={format!("column-tip-{}", f.name)}
+            onmouseenter={show.reform(web_sys::Event::from)} onmouseleave={hide.reform(web_sys::Event::from)}
+            onfocus={show.reform(web_sys::Event::from)} onblur={hide.reform(web_sys::Event::from)}
+            onkeydown={Callback::from({let anchor=anchor.clone();move |e:KeyboardEvent|if e.key()=="Escape"{anchor.set(None);}})}>
+            {if f.kind==FieldType::Calculated{"ƒx "}else{""}}{label.clone()}
+            <div id={format!("column-tip-{}", f.name)} role="tooltip" class="column-tip" hidden={anchor.is_none()}
+                style={anchor.map(|(x, y)| format!("left:{x}px;top:{y}px")).unwrap_or_default()}>
+                <div class="column-tip-title"><strong>{label.clone()}</strong>if label!=f.name{<code>{f.name.clone()}</code>}</div>
+                <div class="column-tip-type">{kind}{if f.required{" · required"}else{""}}</div>
+                if let Some(formula)=f.formula.as_ref().filter(|_| f.kind==FieldType::Calculated){<pre class="column-tip-formula">{formula.clone()}</pre>}
+                if let Some(description)=f.description.as_ref().filter(|d|!d.trim().is_empty()){<p>{description.clone()}</p>}
+            </div>
+        </th>
+    }
 }

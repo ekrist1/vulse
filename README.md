@@ -54,6 +54,168 @@ Set both Turso variables, or neither. The remote database should be created with
 
 In production, serve Vulse over HTTPS and set `VULSE_PUBLIC_URL`.
 
+## Deployment
+
+Vulse runs as one process. It needs its admin files, a directory for the database and uploads, and a reverse proxy in front for HTTPS. There are two ways to run it on a VPS: as a Docker container, or as a plain binary under systemd. Both serve on `127.0.0.1:8080` and use the same proxy setup.
+
+Database migrations run automatically when the server starts, so an update only needs a new build and a restart.
+
+### HTTPS with Caddy
+
+[Caddy](https://caddyserver.com/) gets and renews the certificate on its own. Point your domain's DNS at the VPS, install Caddy, and put this in `/etc/caddy/Caddyfile`:
+
+```text
+cms.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
+```
+
+Then run `sudo systemctl reload caddy`. With any proxy, set these variables for Vulse:
+
+```bash
+VULSE_PUBLIC_URL=https://cms.example.com
+VULSE_TRUST_PROXY=true
+```
+
+If you use nginx, raise `client_max_body_size` to at least `60m`. Uploads can be 25 MB and imports 50 MB, and nginx refuses anything over 1 MB by default.
+
+### Option 1: Docker
+
+You need Docker with the Compose plugin on the VPS. The `Dockerfile` builds the server and the admin; `compose.yaml` runs it with the data in a named volume and the port bound to localhost only.
+
+```bash
+git clone https://github.com/ekrist1/vulse.git
+cd vulse
+cat > .env <<'EOF'
+VULSE_PUBLIC_URL=https://cms.example.com
+VULSE_TRUST_PROXY=true
+EOF
+docker compose up -d --build
+docker compose logs vulse | grep "setup token"
+```
+
+Open `https://cms.example.com/setup` and use the logged token to create the first admin. Add other variables from the table above, such as `VULSE_MCP=on`, to `.env` and run `docker compose up -d` to apply them.
+
+Inside the container the database is `/data/vulse.db` and uploads are in `/data/storage`. The first build compiles everything and takes several minutes. On a VPS with 2 GB of memory or less, add swap first, or build elsewhere (see [Building on another machine](#building-on-another-machine)).
+
+### Option 2: Binary with systemd
+
+The server compiles to a single binary, `vulse`. It serves the admin from a directory next to it, so a release is the binary plus the `web` folder.
+
+#### Build on the VPS
+
+Install the tools from [Start](#start) (Rust, Node.js 22, the wasm target and Trunk), plus a C toolchain (`sudo apt install build-essential pkg-config`). Then:
+
+```bash
+git clone https://github.com/ekrist1/vulse.git
+cd vulse
+npm --prefix crates/web ci
+trunk build --release --config crates/web/Trunk.toml
+cargo build --release --locked -p vulse-server
+```
+
+#### Building on another machine
+
+Or build with Docker on any machine, so the VPS needs no Rust or Node:
+
+```bash
+docker build --target dist --output release .
+```
+
+This writes `release/vulse` and `release/web`. The binary is built on Debian 12 and runs on Debian 12 or later and Ubuntu 24.04 or later. Copy `release/` to the VPS with `scp` or `rsync`.
+
+#### Install
+
+Create a system user and directories, then copy the build in. From a build on the VPS, the files are `target/release/vulse` and `crates/web/dist`. From a Docker build, they are `release/vulse` and `release/web`:
+
+```bash
+sudo useradd --system --home-dir /var/lib/vulse --shell /usr/sbin/nologin vulse
+sudo install -d -o vulse -g vulse /var/lib/vulse
+sudo install -d /opt/vulse
+sudo install -m 755 target/release/vulse /opt/vulse/vulse
+sudo rm -rf /opt/vulse/web && sudo cp -r crates/web/dist /opt/vulse/web
+```
+
+Put the settings in `/etc/vulse.env`:
+
+```bash
+VULSE_PUBLIC_URL=https://cms.example.com
+VULSE_TRUST_PROXY=true
+VULSE_DB_PATH=/var/lib/vulse/vulse.db
+ASSET_DIR=/var/lib/vulse/storage
+VULSE_WEB_DIST=/opt/vulse/web
+```
+
+Create `/etc/systemd/system/vulse.service`:
+
+```ini
+[Unit]
+Description=Vulse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vulse
+Group=vulse
+EnvironmentFile=/etc/vulse.env
+WorkingDirectory=/var/lib/vulse
+ExecStart=/opt/vulse/vulse
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vulse
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start it and read the setup token:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now vulse
+sudo journalctl -u vulse | grep "setup token"
+```
+
+### Updating to a new version
+
+Back up first. Each new version can migrate the database when it starts, and a migration cannot be undone. Stop Vulse before copying the data, so the database file and its `-wal` file match.
+
+**Docker:**
+
+```bash
+cd vulse
+docker compose stop vulse
+docker run --rm -v vulse_vulse-data:/data -v "$PWD":/backup debian:bookworm-slim \
+  tar -czf /backup/vulse-backup-$(date +%F).tar.gz -C /data .
+git pull
+docker compose up -d --build
+docker image prune -f
+```
+
+The volume name is the folder name plus `_vulse-data`. `docker volume ls` shows it.
+
+**Binary built on the VPS:**
+
+```bash
+sudo systemctl stop vulse
+sudo tar -czf /root/vulse-backup-$(date +%F).tar.gz -C /var/lib/vulse .
+cd vulse
+git pull
+npm --prefix crates/web ci
+trunk build --release --config crates/web/Trunk.toml
+cargo build --release --locked -p vulse-server
+sudo install -m 755 target/release/vulse /opt/vulse/vulse
+sudo rm -rf /opt/vulse/web && sudo cp -r crates/web/dist /opt/vulse/web
+sudo systemctl start vulse
+```
+
+**Binary built elsewhere:** run `git pull` and `docker build --target dist --output release .` on the build machine, copy `release/` to the VPS, then stop Vulse, back up, install `release/vulse` and `release/web` as above, and start it again.
+
+After any update, `docker compose logs vulse` or `journalctl -u vulse` shows whether the server started. To go back, stop Vulse, restore the backup into the data directory, and run the previous version (`git checkout <commit>` and rebuild).
+
 ## Accounts and access
 
 There is no public sign-up. All accounts belong to one shared workspace, and an admin decides who joins.

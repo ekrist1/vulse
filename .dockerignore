@@ -1,0 +1,10 @@
+target
+storage
+release
+*.db
+*.db-*
+.git
+.cursor
+crates/web/dist
+crates/web/node_modules
+crates/web/editor-assets

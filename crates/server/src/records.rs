@@ -26,19 +26,17 @@ pub async fn sync_collection_cells(
 ) -> anyhow::Result<()> {
     let lookups = crate::lookups::load(conn, blueprint).await?;
     crate::rows::rebuild(conn, id, blueprint, &lookups).await?;
+    // Links are rewritten, which also drops those of removed fields.
+    conn.execute(
+        "DELETE FROM document_links WHERE source_id IN (SELECT id FROM documents WHERE collection_id=?1)",
+        &[text(id)],
+    )
+    .await?;
     if !crate::relationships::has_links(blueprint) {
-        // Nothing to link from; drop links of fields that were removed.
-        conn.execute(
-            "DELETE FROM document_links WHERE source_id IN (SELECT id FROM documents WHERE collection_id=?1)",
-            &[text(id)],
-        )
-        .await?;
         return Ok(());
     }
-    for (document, body) in store::list_document_bodies(conn, id).await? {
-        crate::relationships::sync(conn, id, &document, blueprint, &body).await?;
-    }
-    Ok(())
+    let records = store::list_document_bodies(conn, id).await?;
+    crate::relationships::insert_many(conn, id, blueprint, &records).await
 }
 /// Rebuilds every collection's record table from the record bodies.
 pub async fn rebuild_all_tables(conn: &Conn) -> anyhow::Result<()> {

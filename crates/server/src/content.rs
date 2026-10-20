@@ -183,6 +183,7 @@ pub async fn update_collection(
             let mut stripped = Vec::new();
             let mut failing = Vec::new();
             let mut first_error = None;
+            let mut found = Found::default();
             for (doc, mut source) in store::list_document_bodies(conn, &id).await? {
                 if let Some(object) = source.as_object_mut() {
                     let mut renamed = false;
@@ -255,7 +256,7 @@ pub async fn update_collection(
                         stripped.push((doc.clone(), source.clone(), action));
                     }
                 }
-                match check_body(conn, &id, &name, &blueprint, &source).await {
+                match check_body_with(conn, &id, &name, &blueprint, &source, &mut found).await {
                     Ok(()) => {}
                     Err(AppError::BadRequest(message)) => {
                         first_error.get_or_insert(message);
@@ -536,6 +537,35 @@ pub(crate) async fn check_body(
     blueprint: &Blueprint,
     body: &serde_json::Value,
 ) -> Result<(), AppError> {
+    let mut found = Found::default();
+    check_body_with(
+        conn,
+        collection_id,
+        collection_name,
+        blueprint,
+        body,
+        &mut found,
+    )
+    .await
+}
+
+/// Collections (name → id) and records that references were found to point
+/// at, so checking many bodies in one transaction looks each up once.
+#[derive(Default)]
+pub(crate) struct Found {
+    collections: std::collections::HashMap<String, String>,
+    documents: std::collections::HashSet<(String, String)>,
+}
+
+/// Like `check_body`, remembering what was found in `found`.
+pub(crate) async fn check_body_with(
+    conn: &Conn,
+    collection_id: &str,
+    collection_name: &str,
+    blueprint: &Blueprint,
+    body: &serde_json::Value,
+    found: &mut Found,
+) -> Result<(), AppError> {
     let checked = validate_document(blueprint, body).map_err(AppError::bad)?;
     for asset_id in &checked.asset_ids {
         if !store::asset_exists(conn, collection_id, asset_id).await? {
@@ -545,20 +575,28 @@ pub(crate) async fn check_body(
     for reference in checked.references {
         let target_id = if reference.collection == collection_name {
             collection_id.to_string()
+        } else if let Some(id) = found.collections.get(&reference.collection) {
+            id.clone()
         } else {
-            store::find_collection_by_name(conn, &reference.collection)
+            let id = store::find_collection_by_name(conn, &reference.collection)
                 .await?
                 .ok_or_else(|| {
                     AppError::bad(format!("unknown collection '{}'", reference.collection))
                 })?
-                .id
+                .id;
+            found
+                .collections
+                .insert(reference.collection.clone(), id.clone());
+            id
         };
-        if !store::document_exists(conn, &target_id, &reference.document_id).await? {
-            return Err(AppError::bad(format!(
-                "unknown document {}",
-                reference.document_id
-            )));
+        let key = (target_id, reference.document_id);
+        if found.documents.contains(&key) {
+            continue;
         }
+        if !store::document_exists(conn, &key.0, &key.1).await? {
+            return Err(AppError::bad(format!("unknown document {}", key.1)));
+        }
+        found.documents.insert(key);
     }
     Ok(())
 }

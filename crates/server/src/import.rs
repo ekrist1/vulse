@@ -1,6 +1,6 @@
 use crate::{
     auth::{Editor, SchemaAdmin},
-    content::{check_body, workspace_collection},
+    content::{check_body_with, workspace_collection},
     error::AppError,
     state::AppState,
     store,
@@ -172,6 +172,7 @@ pub async fn import_file(
                 }
             }
             let mut seen_keys=HashSet::new();
+            let mut found = crate::content::Found::default();
             let mut bodies = vec![];
             for (i, row) in table.rows.iter().enumerate() {
                 if row.iter().all(|c| c.trim().is_empty()) {
@@ -222,12 +223,13 @@ pub async fn import_file(
                 }
                 let action=if target.is_none(){"create"}else if same{"unchanged"}else{"update"};
                 if !failed {
-                    match check_body(
+                    match check_body_with(
                         conn,
                         &id,
                         &collection.name,
                         &collection.blueprint,
                         &body,
+                        &mut found,
                     )
                     .await
                     {
@@ -280,11 +282,13 @@ pub async fn import_file(
             }
             if commit && result.errors.is_empty() {
                 let now = crate::timeutil::now_rfc3339();
+                let mut created = vec![];
                 for (target,body,action) in bodies {
                     if action=="unchanged"{continue;}
-                    if let Some(doc)=target{store::update_document(conn,&id,&doc,&body,&now).await?;}else{store::insert_document(conn,&crate::auth::new_id(),&id,&body,&now).await?;}
+                    if let Some(doc)=target{store::update_document(conn,&id,&doc,&body,&now).await?;}else{created.push((crate::auth::new_id(),body));}
                     result.imported += 1;
                 }
+                store::insert_documents(conn,&id,&created,&now).await?;
             }
             Ok(result)
         })

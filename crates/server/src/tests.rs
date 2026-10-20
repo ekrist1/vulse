@@ -14,6 +14,8 @@ use crate::app;
 
 #[path = "tests/bench.rs"]
 mod bench;
+#[path = "tests/bench_write.rs"]
+mod bench_write;
 #[path = "tests/beta.rs"]
 mod beta;
 #[path = "tests/mcp.rs"]
@@ -1509,6 +1511,81 @@ async fn fields_suggested_from_a_file_can_be_saved_and_then_imported() {
         ]
     );
     assert_eq!(done.imported, 2);
+}
+/// Imported records get the history, links and record table rows that
+/// records created one at a time get, whether the record table is rebuilt
+/// (a large import) or written row by row (a small one).
+#[tokio::test]
+async fn imports_record_history_links_and_sortable_rows() {
+    use crate::db::{SqlValue, int_at};
+    use vulse_model::{ImportResult, RecordPage};
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "bulk@example.com", "bulk").await;
+    let authors = create_collection(
+        &app,
+        &cookie,
+        "authors",
+        "private",
+        json!({"fields":[{"name":"name","type":"string"}]}),
+    )
+    .await;
+    let author = create_document(&app, &cookie, &authors.id, json!({"name":"Ada"})).await;
+    let books = create_collection(
+        &app,
+        &cookie,
+        "books",
+        "private",
+        json!({"fields":[
+            {"name":"title","type":"string"},
+            {"name":"pages","type":"number"},
+            {"name":"author","type":"reference","collection":"authors"},
+            {"name":"double","type":"calculated","formula":"=[pages]*2"}
+        ]}),
+    )
+    .await;
+    let a = &author.id;
+    for (csv, total) in [
+        (format!("title,pages,author\nB,20,{a}\nA,30,{a}\nC,10,{a}\n"), 3),
+        (format!("title,pages,author\nD,5,{a}\n"), 4),
+    ] {
+        let (status, result) = json_of::<ImportResult>(
+            import_csv(&app, Some(&cookie), &books.id, &csv, true, None).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{:?}", result.errors);
+        let (_, page) = json_of::<RecordPage>(
+            app.call(
+                "POST",
+                &format!("/api/v1/collections/{}/query", books.id),
+                Some(&cookie),
+                None,
+                Some(json!({"sort_field":"double","descending":false,"limit":10})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(page.total, total);
+        let doubles: Vec<_> = page.items.iter().map(|d| d.body["double"].clone()).collect();
+        let mut sorted = doubles.clone();
+        sorted.sort_by(|x, y| x.as_f64().partial_cmp(&y.as_f64()).unwrap());
+        assert_eq!(doubles, sorted);
+        assert_eq!(page.items[0].body["double"], json!(if total == 3 { 20.0 } else { 10.0 }));
+        let conn = app.db.connect().await.unwrap();
+        let book = SqlValue::Text(books.id.clone());
+        let count = |sql: &'static str| {
+            let conn = &conn;
+            let book = book.clone();
+            async move { int_at(&conn.query(sql, &[book]).await.unwrap()[0], 0).unwrap() }
+        };
+        assert_eq!(
+            count("SELECT count(*) FROM record_revisions r JOIN documents d ON d.id=r.document_id AND d.body=r.body AND r.blueprint=(SELECT b.id FROM revision_blueprints b JOIN collections c ON c.blueprint=b.blueprint WHERE c.id=?1) WHERE r.action='create'").await,
+            total as i64
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM document_links l JOIN documents d ON d.id=l.source_id WHERE d.collection_id=?1").await,
+            total as i64
+        );
+    }
 }
 #[tokio::test]
 async fn imports_files_without_a_header_row() {
@@ -3050,6 +3127,20 @@ async fn migrations_backfill_legacy_history_search_and_relationships() {
         .unwrap();
     assert_eq!(history.len(), 2);
     assert!(history.iter().all(|r| text_at(r, 0).unwrap() == "baseline"));
+    // Revisions refer to one stored copy of the blueprint they were made with.
+    let shared = conn
+        .query(
+            "SELECT DISTINCT r.blueprint,b.blueprint FROM record_revisions r JOIN revision_blueprints b ON b.id=r.blueprint",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(text_at(&shared[0], 0).unwrap().len(), 64);
+    assert_eq!(
+        serde_json::from_str::<Value>(&text_at(&shared[0], 1).unwrap()).unwrap(),
+        blueprint
+    );
     let c = crate::store::find_collection(&conn, "collection")
         .await
         .unwrap()
@@ -3387,6 +3478,10 @@ async fn removing_fields_with_values_needs_confirmation_and_keeps_history() {
             .iter()
             .any(|r| r.body["memo"] == "keep me")
     );
+    // Each revision reads the fields it was made with.
+    let has_memo = |r: &vulse_model::DocumentRevision| r.blueprint.fields.iter().any(|f| f.name == "memo");
+    assert!(!has_memo(&revisions.items[0]));
+    assert!(revisions.items[1..].iter().all(has_memo));
     // The search index no longer finds the removed value.
     let (_, page) = json_of::<vulse_model::RecordPage>(
         app.call(

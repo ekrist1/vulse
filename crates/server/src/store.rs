@@ -489,6 +489,12 @@ pub async fn update_collection(
 pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM collections WHERE id = ?1", &[text(id)])
         .await?;
+    // Blueprints only revisions of the deleted collection used.
+    conn.execute(
+        "DELETE FROM revision_blueprints WHERE id NOT IN (SELECT blueprint FROM record_revisions)",
+        &[],
+    )
+    .await?;
     crate::rows::drop(conn, id).await?;
     conn.changed(id);
     Ok(())
@@ -628,6 +634,138 @@ pub async fn insert_document(
     crate::records::sync_stored_document(conn, collection_id, id, body).await?;
     crate::history::snapshot(conn, collection_id, id, "create").await?;
     Ok(())
+}
+
+/// Inserts many new records at once, like `insert_document` for each, with
+/// a few multi-row statements instead of several statements per record.
+pub async fn insert_documents(
+    conn: &Conn,
+    collection_id: &str,
+    bodies: &[(String, serde_json::Value)],
+    created_at: &str,
+) -> anyhow::Result<()> {
+    if bodies.is_empty() {
+        return Ok(());
+    }
+    let rows = conn
+        .query(
+            "SELECT blueprint FROM collections WHERE id=?1",
+            &[text(collection_id)],
+        )
+        .await?;
+    let stored_blueprint = text_at(
+        rows.first()
+            .ok_or_else(|| anyhow::anyhow!("missing collection"))?,
+        0,
+    )?;
+    let blueprint: Blueprint = serde_json::from_str(&stored_blueprint)?;
+    let blueprint_id = crate::history::store_blueprint(conn, &stored_blueprint).await?;
+    let existing = int_at(
+        &conn
+            .query(
+                "SELECT count(*) FROM documents WHERE collection_id=?1",
+                &[text(collection_id)],
+            )
+            .await?[0],
+        0,
+    )?;
+    let encoded = bodies
+        .iter()
+        .map(|(_, body)| serde_json::to_string(body))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source = conn.source().map_or(SqlValue::Null, text);
+    let revised_at = crate::timeutil::now_rfc3339();
+    // Parameters per statement, as for record table rows.
+    for (chunk, encoded) in bodies.chunks(2000).zip(encoded.chunks(2000)) {
+        let mut params = Vec::with_capacity(chunk.len() * 5);
+        let mut tuples = Vec::with_capacity(chunk.len());
+        for ((id, _), body) in chunk.iter().zip(encoded) {
+            let n = params.len();
+            tuples.push(format!(
+                "(?{},?{},?{},?{},?{})",
+                n + 1,
+                n + 2,
+                n + 3,
+                n + 4,
+                n + 5
+            ));
+            params.extend([
+                text(id),
+                text(collection_id),
+                text(body),
+                text(created_at),
+                text(created_at),
+            ]);
+        }
+        conn.execute(
+            &format!(
+                "INSERT INTO documents (id, collection_id, body, created_at, updated_at) VALUES {}",
+                tuples.join(",")
+            ),
+            &params,
+        )
+        .await?;
+        // The history rows `history::snapshot` would copy from the records.
+        let mut params = Vec::with_capacity(chunk.len() * 9);
+        let mut tuples = Vec::with_capacity(chunk.len());
+        for ((id, _), body) in chunk.iter().zip(encoded) {
+            let n = params.len();
+            tuples.push(format!(
+                "({})",
+                (n + 1..=n + 9)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            params.extend([
+                text(&crate::auth::new_id()),
+                text(collection_id),
+                text(id),
+                text("create"),
+                text(body),
+                text(&blueprint_id),
+                text(created_at),
+                text(&revised_at),
+                source.clone(),
+            ]);
+        }
+        conn.execute(
+            &format!(
+                "INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) VALUES {}",
+                tuples.join(",")
+            ),
+            &params,
+        )
+        .await?;
+    }
+    conn.changed(collection_id);
+    let lookups = crate::lookups::load(conn, &blueprint).await?;
+    if bodies.len() as i64 > existing {
+        // Building the indexes once is faster than updating them per row.
+        crate::rows::rebuild(conn, collection_id, &blueprint, &lookups).await?;
+    } else {
+        let records: Vec<_> = bodies
+            .iter()
+            .map(|(id, body)| {
+                (
+                    id.clone(),
+                    created_at.to_string(),
+                    created_at.to_string(),
+                    body.clone(),
+                )
+            })
+            .collect();
+        crate::rows::write(
+            conn,
+            collection_id,
+            &blueprint,
+            &lookups,
+            "INSERT",
+            &records,
+        )
+        .await?;
+    }
+    crate::relationships::insert_many(conn, collection_id, &blueprint, bodies).await
 }
 
 pub async fn update_document(

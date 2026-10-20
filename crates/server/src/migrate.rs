@@ -16,6 +16,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (11, include_str!("../migrations/011_revision_source.sql")),
     (12, include_str!("../migrations/012_oauth.sql")),
     (13, include_str!("../migrations/013_oauth_clients.sql")),
+    (
+        14,
+        include_str!("../migrations/014_revision_blueprints.sql"),
+    ),
 ];
 
 pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
@@ -40,6 +44,9 @@ pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
                 if *version == 9 || *version == 10 {
                     crate::records::rebuild_all_tables(conn).await?;
                 }
+                if *version == 14 {
+                    share_revision_blueprints(conn).await?;
+                }
                 if *version == 5 {
                     crate::relationships::rebuild(conn).await?;
                 }
@@ -57,6 +64,24 @@ pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
             })
             .await?;
         }
+    }
+    Ok(())
+}
+
+/// Replaces the blueprint copies in record revisions with ids of blueprints
+/// stored once.
+async fn share_revision_blueprints(conn: &Conn) -> anyhow::Result<()> {
+    for row in conn
+        .query("SELECT DISTINCT blueprint FROM record_revisions", &[])
+        .await?
+    {
+        let blueprint = text_at(&row, 0)?;
+        let id = crate::history::store_blueprint(conn, &blueprint).await?;
+        conn.execute(
+            "UPDATE record_revisions SET blueprint=?1 WHERE blueprint=?2",
+            &[SqlValue::Text(id), SqlValue::Text(blueprint)],
+        )
+        .await?;
     }
     Ok(())
 }

@@ -37,16 +37,111 @@ pub async fn sync(
         &[text(document)],
     )
     .await?;
-    let rows = conn
-        .query(
-            "SELECT name FROM collections WHERE id=?1",
-            &[text(collection)],
-        )
-        .await?;
-    let row = rows
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
-    let name = text_at(row, 0)?;
+    let mut targets = Targets::new(conn, collection).await?;
+    for (field, kind, target_collection, target) in
+        record_links(conn, collection, blueprint, body, &mut targets).await?
+    {
+        insert_link(conn, document, &field, kind, &target_collection, &target).await?;
+    }
+    Ok(())
+}
+
+/// Writes the links of records that have none yet, such as new records or
+/// a collection whose links were all removed, with multi-row inserts.
+pub(crate) async fn insert_many(
+    conn: &Conn,
+    collection: &str,
+    blueprint: &Blueprint,
+    records: &[(String, serde_json::Value)],
+) -> anyhow::Result<()> {
+    if !has_links(blueprint) {
+        return Ok(());
+    }
+    let mut targets = Targets::new(conn, collection).await?;
+    let mut params = Vec::new();
+    let mut tuples = Vec::new();
+    for (document, body) in records {
+        for (field, kind, target_collection, target) in
+            record_links(conn, collection, blueprint, body, &mut targets).await?
+        {
+            let n = params.len();
+            tuples.push(format!(
+                "(?{},?{},?{},?{},?{})",
+                n + 1,
+                n + 2,
+                n + 3,
+                n + 4,
+                n + 5
+            ));
+            params.extend([
+                text(document),
+                text(&field),
+                text(kind),
+                text(&target_collection),
+                text(&target),
+            ]);
+            if tuples.len() == 2000 {
+                insert_links(conn, &mut tuples, &mut params).await?;
+            }
+        }
+    }
+    insert_links(conn, &mut tuples, &mut params).await
+}
+
+async fn insert_links(
+    conn: &Conn,
+    tuples: &mut Vec<String>,
+    params: &mut Vec<SqlValue>,
+) -> anyhow::Result<()> {
+    if tuples.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO document_links(source_id,field,kind,target_collection,target_id) VALUES {}",
+            tuples.join(",")
+        ),
+        params,
+    )
+    .await?;
+    tuples.clear();
+    params.clear();
+    Ok(())
+}
+
+/// The ids of collections that records link to, by name, found once.
+struct Targets {
+    name: String,
+    ids: std::collections::HashMap<String, Option<String>>,
+}
+
+impl Targets {
+    async fn new(conn: &Conn, collection: &str) -> anyhow::Result<Self> {
+        let rows = conn
+            .query(
+                "SELECT name FROM collections WHERE id=?1",
+                &[text(collection)],
+            )
+            .await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
+        Ok(Self {
+            name: text_at(row, 0)?,
+            ids: Default::default(),
+        })
+    }
+}
+
+/// A record's links as (field, kind, target collection id, target id).
+async fn record_links(
+    conn: &Conn,
+    collection: &str,
+    blueprint: &Blueprint,
+    body: &serde_json::Value,
+    targets: &mut Targets,
+) -> anyhow::Result<Vec<(String, &'static str, String, String)>> {
+    let mut out = Vec::new();
     for field in &blueprint.fields {
         if !links(field) {
             continue;
@@ -62,30 +157,31 @@ pub async fn sync(
         )
         .map_err(anyhow::Error::msg)?;
         for asset in checked.asset_ids {
-            insert_link(conn, document, &field.name, "asset", collection, &asset).await?;
+            out.push((field.name.clone(), "asset", collection.to_string(), asset));
         }
         for reference in checked.references {
-            let target = if reference.collection == name {
-                Some(collection.into())
+            let target = if reference.collection == targets.name {
+                Some(collection.to_string())
+            } else if let Some(id) = targets.ids.get(&reference.collection) {
+                id.clone()
             } else {
-                store::find_collection_by_name(conn, &reference.collection)
+                let id = store::find_collection_by_name(conn, &reference.collection)
                     .await?
-                    .map(|c| c.id)
+                    .map(|c| c.id);
+                targets.ids.insert(reference.collection.clone(), id.clone());
+                id
             };
             if let Some(target) = target {
-                insert_link(
-                    conn,
-                    document,
-                    &field.name,
+                out.push((
+                    field.name.clone(),
                     "document",
-                    &target,
-                    &reference.document_id,
-                )
-                .await?;
+                    target,
+                    reference.document_id,
+                ));
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 /// Whether a field can link to records or assets.
 fn links(field: &vulse_model::FieldDef) -> bool {

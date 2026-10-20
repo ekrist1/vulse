@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/model", "crates/server", "crates/web"]
+
+# Dependencies such as the turso database engine are slow unoptimized. Dev
+# builds optimize them once and keep the workspace crates fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 3

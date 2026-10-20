@@ -269,23 +269,39 @@ async fn fill(
     lookups: &Lookups,
     insert: &str,
 ) -> anyhow::Result<()> {
-    let names = columns(blueprint);
     let rows = conn
         .query(
             "SELECT id, body, created_at, updated_at FROM documents WHERE collection_id=?1",
             &[SqlValue::Text(collection_id.into())],
         )
         .await?;
-    for chunk in rows.chunks((BATCH_PARAMS / names.len()).max(1)) {
+    let mut records = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let body: Value = serde_json::from_str(&text_at(row, 1)?)?;
+        records.push((text_at(row, 0)?, text_at(row, 2)?, text_at(row, 3)?, body));
+    }
+    write(conn, collection_id, blueprint, lookups, insert, &records).await
+}
+
+/// Writes the rows of the given records (id, created_at, updated_at, body).
+pub(crate) async fn write(
+    conn: &Conn,
+    collection_id: &str,
+    blueprint: &Blueprint,
+    lookups: &Lookups,
+    insert: &str,
+    records: &[(String, String, String, Value)],
+) -> anyhow::Result<()> {
+    let names = columns(blueprint);
+    for chunk in records.chunks((BATCH_PARAMS / names.len()).max(1)) {
         let mut params = Vec::new();
         let mut tuples = Vec::new();
-        for row in chunk {
-            let body: Value = serde_json::from_str(&text_at(row, 1)?)?;
+        for (id, created_at, updated_at, body) in chunk {
             let start = params.len();
-            params.push(SqlValue::Text(text_at(row, 0)?));
-            params.push(SqlValue::Text(text_at(row, 2)?));
-            params.push(SqlValue::Text(text_at(row, 3)?));
-            params.extend(values(blueprint, lookups, &body));
+            params.push(SqlValue::Text(id.clone()));
+            params.push(SqlValue::Text(created_at.clone()));
+            params.push(SqlValue::Text(updated_at.clone()));
+            params.extend(values(blueprint, lookups, body));
             let slots: Vec<String> = (start + 1..=params.len())
                 .map(|i| format!("?{i}"))
                 .collect();

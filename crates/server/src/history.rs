@@ -19,8 +19,31 @@ pub async fn snapshot(
     action: &str,
 ) -> anyhow::Result<()> {
     let source = conn.source().map_or(crate::db::SqlValue::Null, text);
-    conn.execute("INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) SELECT ?1,d.collection_id,d.id,?2,d.body,c.blueprint,d.created_at,?3,?6 FROM documents d JOIN collections c ON c.id=d.collection_id WHERE d.collection_id=?4 AND d.id=?5",&[text(&crate::auth::new_id()),text(action),text(&timeutil::now_rfc3339()),text(collection),text(document),source]).await?;
+    let rows = conn
+        .query(
+            "SELECT blueprint FROM collections WHERE id=?1",
+            &[text(collection)],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let blueprint = store_blueprint(conn, &text_at(row, 0)?).await?;
+    conn.execute("INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) SELECT ?1,d.collection_id,d.id,?2,d.body,?7,d.created_at,?3,?6 FROM documents d WHERE d.collection_id=?4 AND d.id=?5",&[text(&crate::auth::new_id()),text(action),text(&timeutil::now_rfc3339()),text(collection),text(document),source,text(&blueprint)]).await?;
     Ok(())
+}
+
+/// Stores a collection's blueprint text once for the revisions made with
+/// it, and returns the id that `record_revisions.blueprint` holds.
+pub(crate) async fn store_blueprint(conn: &Conn, blueprint: &str) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let id = hex::encode(sha2::Sha256::digest(blueprint.as_bytes()));
+    conn.execute(
+        "INSERT OR IGNORE INTO revision_blueprints(id,blueprint) VALUES(?1,?2)",
+        &[text(&id), text(blueprint)],
+    )
+    .await?;
+    Ok(id)
 }
 fn decode(row: &crate::db::SqlRow) -> anyhow::Result<DocumentRevision> {
     Ok(DocumentRevision {
@@ -34,8 +57,8 @@ fn decode(row: &crate::db::SqlRow) -> anyhow::Result<DocumentRevision> {
         source: opt_text_at(row, 7)?,
     })
 }
-const COLUMNS: &str =
-    "r.id,r.document_id,r.action,r.body,r.blueprint,r.record_created_at,r.created_at,r.source";
+// Revisions hold the id of a stored blueprint; rows that predate it hold the text.
+const COLUMNS: &str = "r.id,r.document_id,r.action,r.body,COALESCE((SELECT b.blueprint FROM revision_blueprints b WHERE b.id=r.blueprint),r.blueprint),r.record_created_at,r.created_at,r.source";
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(principal): AuthUser,

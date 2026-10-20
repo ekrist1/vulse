@@ -547,9 +547,47 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
             on_change.emit(next);
         })
     };
+    // Names of collapsed fields; saved fields start collapsed in long lists.
+    // A collapsed field cannot be renamed, so its name keeps identifying it.
+    let collapsed = use_state(|| None::<std::collections::BTreeSet<String>>);
+    let collapsed_names = (*collapsed).clone().unwrap_or_else(|| {
+        if props.saved_fields.len() > 5 {
+            props.saved_fields.iter().cloned().collect()
+        } else {
+            Default::default()
+        }
+    });
+    let set_all = |collapse: bool| {
+        let collapsed = collapsed.clone();
+        let names: std::collections::BTreeSet<String> =
+            props.fields.iter().map(|f| f.name.clone()).collect();
+        Callback::from(move |_| {
+            collapsed.set(Some(if collapse {
+                names.clone()
+            } else {
+                Default::default()
+            }))
+        })
+    };
+    let all_open = props
+        .fields
+        .iter()
+        .all(|f| !collapsed_names.contains(&f.name));
+    let all_closed = props
+        .fields
+        .iter()
+        .all(|f| collapsed_names.contains(&f.name));
     html! {
         <section class="card">
-            <h2>{"Collection fields"}</h2>
+            <div class="fields-heading">
+                <h2>{"Collection fields"}</h2>
+                if props.fields.len() > 1 {
+                    <div class="row">
+                        <button type="button" class="secondary" disabled={all_open} onclick={set_all(false)}>{"Expand all"}</button>
+                        <button type="button" class="secondary" disabled={all_closed} onclick={set_all(true)}>{"Collapse all"}</button>
+                    </div>
+                }
+            </div>
             if props.fields.is_empty() {
                 <p class="muted">{"Add your first field to start shaping your records."}</p>
             }
@@ -565,8 +603,22 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                     .and_then(|name| props.saved_options.get(name))
                     .cloned()
                     .unwrap_or_default();
+                let on_toggle = {
+                    let collapsed = collapsed.clone();
+                    let names = collapsed_names.clone();
+                    let name = field.name.clone();
+                    Callback::from(move |_| {
+                        let mut next = names.clone();
+                        if !next.remove(&name) {
+                            next.insert(name.clone());
+                        }
+                        collapsed.set(Some(next));
+                    })
+                };
                 html! {
                     <FieldRow
+                        open={!collapsed_names.contains(&field.name)}
+                        {on_toggle}
                         key={index}
                         records={props.records.clone()}
                         index={index}
@@ -604,6 +656,9 @@ struct FieldRowProps {
     on_removed: Callback<String>,
     on_renamed: Callback<(String, String)>,
     on_change: Callback<Vec<FieldDef>>,
+    /// Whether the field's settings are shown, or only its summary.
+    open: bool,
+    on_toggle: Callback<()>,
 }
 
 #[function_component(FieldRow)]
@@ -725,8 +780,46 @@ fn field_row(props: &FieldRowProps) -> Html {
         })
     };
     let field = props.field.clone();
+    let type_label = field_types()
+        .into_iter()
+        .find(|(value, _)| *value == type_value(field.kind))
+        .map_or("", |(_, label)| label);
+    let title = if field.name.is_empty() {
+        "Unnamed field"
+    } else {
+        field.display_label()
+    };
+    let summary = html! {
+        <div class="field-summary">
+            <button type="button" class="field-toggle" aria-expanded={props.open.to_string()} onclick={props.on_toggle.reform(|_| ())}>
+                <span class="field-chevron" aria-hidden="true">{"▸"}</span>
+                <strong>{title.to_string()}</strong>
+                if !field.display_label().eq_ignore_ascii_case(&field.name) && !field.name.is_empty() {
+                    <code>{field.name.clone()}</code>
+                }
+                <span class="badge">{type_label}</span>
+                if field.required {<span class="badge">{"Required"}</span>}
+                if field.renamed_from.is_some() {<span class="badge">{"Renamed"}</span>}
+            </button>
+            <div class="row field-actions">
+                <button class="secondary" type="button" aria-label={format!("Move {title} up")} disabled={props.index == 0} onclick={Callback::from({
+                    let move_by = move_by.clone();
+                    move |_| move_by.emit(-1)
+                })}>{"Up"}</button>
+                <button class="secondary" type="button" aria-label={format!("Move {title} down")} disabled={props.index + 1 == props.total} onclick={Callback::from({
+                    let move_by = move_by.clone();
+                    move |_| move_by.emit(1)
+                })}>{"Down"}</button>
+                <button type="button" class="danger" aria-label={format!("Remove {title}")} onclick={remove}>{"Remove"}</button>
+            </div>
+        </div>
+    };
+    if !props.open {
+        return html! { <div class="field-row collapsed">{summary}</div> };
+    }
     html! {
         <div class="field-row">
+            {summary}
             <label>{"Name"}
                 <input aria-label="Name" value={field.name.clone()} onfocus={Callback::from({
                     let focused = focused_name.clone();
@@ -849,17 +942,6 @@ fn field_row(props: &FieldRowProps) -> Html {
             if field.kind == FieldType::Calculated {
                 <FormulaEditor records={props.records.clone()} field={field.clone()} fields={props.fields.clone()} collections={props.collections.clone()} current={props.current.clone()} on_change={patch.clone()}/>
             }
-            <div class="row field-actions">
-                <button class="secondary" type="button" disabled={props.index == 0} onclick={Callback::from({
-                    let move_by = move_by.clone();
-                    move |_| move_by.emit(-1)
-                })}>{"Up"}</button>
-                <button class="secondary" type="button" disabled={props.index + 1 == props.total} onclick={Callback::from({
-                    let move_by = move_by.clone();
-                    move |_| move_by.emit(1)
-                })}>{"Down"}</button>
-                <button type="button" class="danger" onclick={remove}>{"Remove"}</button>
-            </div>
         </div>
     }
 }

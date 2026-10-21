@@ -42,6 +42,10 @@ pub struct FieldDef {
     /// value. Records holding a saved value get the new one. Never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed_options: Option<BTreeMap<String, String>>,
+    /// How the admin shows a number or calculated field's numbers. Display
+    /// only: stored values, the API, filters and exports keep plain numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_format: Option<NumberFormat>,
     /// Only in schema updates: the saved field this one renames. Its values,
     /// formula references, title setting and saved views move to `name`.
     /// Never stored.
@@ -64,6 +68,26 @@ pub enum FieldType {
     Reference,
     Array,
 }
+
+/// Display format for numbers: digit grouping, fixed decimals and an
+/// optional currency, laid out by a locale's conventions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NumberFormat {
+    /// ISO 4217 code, such as `NOK`. Unset shows a plain grouped number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Digits after the decimal mark. Unset keeps up to the stored digits
+    /// (none for whole kroner, two for currency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u8>,
+    /// BCP 47 tag, such as `nb-NO`. Unset follows the viewer's browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+}
+
+/// Most decimals a number format may fix.
+pub const MAX_FORMAT_DECIMALS: u8 = 6;
 
 /// Allowed values one text field may list.
 pub const MAX_FIELD_OPTIONS: usize = 500;
@@ -140,6 +164,9 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
         if let Some(options) = &field.options {
             validate_options(field, options)?;
         }
+        if let Some(format) = &field.number_format {
+            validate_number_format(field, format)?;
+        }
         match field.kind {
             FieldType::Reference => {
                 require_collection(field)?;
@@ -184,6 +211,45 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<(), String> {
             );
         }
     crate::validate_formulas(blueprint)
+}
+
+fn validate_number_format(field: &FieldDef, format: &NumberFormat) -> Result<(), String> {
+    if !matches!(field.kind, FieldType::Number | FieldType::Calculated) {
+        return Err(format!(
+            "{}: only number and calculated fields can set number_format",
+            field.name
+        ));
+    }
+    if format
+        .currency
+        .as_ref()
+        .is_some_and(|code| code.len() != 3 || !code.bytes().all(|b| b.is_ascii_uppercase()))
+    {
+        return Err(format!(
+            "{}: currency must be a three-letter ISO 4217 code, such as NOK",
+            field.name
+        ));
+    }
+    if format.decimals.is_some_and(|d| d > MAX_FORMAT_DECIMALS) {
+        return Err(format!(
+            "{}: decimals must be 0 to {MAX_FORMAT_DECIMALS}",
+            field.name
+        ));
+    }
+    if format.locale.as_ref().is_some_and(|tag| {
+        tag.len() > 35
+            || tag.split('-').any(|part| {
+                part.is_empty()
+                    || part.len() > 8
+                    || !part.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
+    }) {
+        return Err(format!(
+            "{}: locale must be a language tag, such as nb-NO",
+            field.name
+        ));
+    }
+    Ok(())
 }
 
 fn validate_options(field: &FieldDef, options: &[String]) -> Result<(), String> {
@@ -610,9 +676,12 @@ mod tests {
             options: None,
             renamed_options: None,
             renamed_from: None,
+            number_format: None,
         };
-        let under = "3B. Eierens vedtektsfestede norm for arealutnytting per barn under 3 år (m2):2";
-        let over = "3B. Eierens vedtektsfestede norm for arealutnytting per barn 3 år og eldre (m2):2";
+        let under =
+            "3B. Eierens vedtektsfestede norm for arealutnytting per barn under 3 år (m2):2";
+        let over =
+            "3B. Eierens vedtektsfestede norm for arealutnytting per barn 3 år og eldre (m2):2";
         let long = "f_3b_eierens_vedtektsfestede_norm_for_arealutnytting_per_bar";
         let headers = vec![under.to_string(), over.into(), "Navn".into(), "År".into()];
         // Made from the file, labeled with the headers.
@@ -697,6 +766,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn number_formats_are_checked_and_only_for_numbers() {
+        let check = |field: serde_json::Value| {
+            let blueprint: Blueprint = serde_json::from_value(json!({"fields":[field]})).unwrap();
+            validate_blueprint(&blueprint)
+        };
+        check(json!({"name":"amount","type":"number","number_format":{"currency":"NOK","decimals":0,"locale":"nb-NO"}})).unwrap();
+        check(json!({"name":"total","type":"calculated","formula":"=1","number_format":{}}))
+            .unwrap();
+        for bad in [
+            json!({"name":"title","type":"string","number_format":{}}),
+            json!({"name":"amount","type":"number","number_format":{"currency":"kr"}}),
+            json!({"name":"amount","type":"number","number_format":{"decimals":7}}),
+            json!({"name":"amount","type":"number","number_format":{"locale":"nb_NO"}}),
+        ] {
+            assert!(check(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_value::<Blueprint>(json!({"fields":[{"name":"amount","type":"number","number_format":{"style":"percent"}}]})).is_err());
+    }
+
+    #[test]
     fn labels_are_metadata_and_titles_use_the_selected_field() {
         let blueprint: Blueprint = serde_json::from_value(json!({"title_field":"price", "fields":[{"name":"name","type":"string","label":"Product name","description":"Customer-facing name","example":"Notebook"},{"name":"price","type":"number","label":"Unit price"}]})).unwrap();
         validate_blueprint(&blueprint).unwrap();
@@ -740,6 +829,7 @@ mod tests {
             collection: None,
             items: None,
             renamed_from: None,
+            number_format: None,
             options: None,
             renamed_options: None,
         }
@@ -792,6 +882,7 @@ mod tests {
                     collection: None,
                     items: None,
                     renamed_from: None,
+                    number_format: None,
                     options: None,
                     renamed_options: None,
                 },
@@ -806,6 +897,7 @@ mod tests {
                     collection: Some("authors".into()),
                     items: None,
                     renamed_from: None,
+                    number_format: None,
                     options: None,
                     renamed_options: None,
                 },

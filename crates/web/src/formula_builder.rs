@@ -1592,6 +1592,7 @@ mod tests {
             collection: None,
             items: None,
             renamed_from: None,
+            number_format: None,
             options: None,
             renamed_options: None,
         }

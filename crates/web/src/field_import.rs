@@ -143,6 +143,7 @@ pub fn fields_from_file(props: &FieldsFromFileProps) -> Html {
                     options: None,
                     renamed_options: None,
                     renamed_from: None,
+                    number_format: None,
                 })
                 .collect();
             on_add.emit(fields);

@@ -21,6 +21,9 @@ pub fn record_cell(props: &CellProps) -> Html {
     let error = use_state(String::new);
     let busy = use_state(|| false);
     let value = display_value(&props.document.body[&props.field.name]);
+    // Edits start from the plain stored number; only the cell is formatted.
+    let shown =
+        crate::number_format::field_display(&props.field, &props.document.body[&props.field.name]);
     let calculated_error = props.document.calculation_errors.get(&props.field.name);
     let start = Callback::from({
         let editing = editing.clone();
@@ -114,8 +117,8 @@ pub fn record_cell(props: &CellProps) -> Html {
             else {<input aria-label={format!("Edit {}",props.field.display_label())} type={match props.field.kind{FieldType::Number=>"number",FieldType::Date=>"date",_=>"text"}} step="any" disabled={*busy} value={(*draft).clone()} oninput={Callback::from({let draft=draft.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();draft.set(input.value());}})} onkeydown={Callback::from({let save=save.clone();let cancel=cancel.clone();move |e:KeyboardEvent|{if e.key()=="Enter"{e.prevent_default();save.emit(());}else if e.key()=="Escape"{e.prevent_default();cancel.emit(());}}})}/>}
             <div class="row"><button type="button" class="secondary" disabled={*busy} aria-label={format!("Save {} cell",props.field.display_label())} onclick={Callback::from(move |_|save.emit(()))}>{"Save"}</button><button type="button" class="text-button" disabled={*busy} onclick={Callback::from(move |_|cancel.emit(()))}>{"Cancel"}</button></div>
             if !error.is_empty(){<p class="error" role="alert">{(*error).clone()}</p>}
-        </div>} else if editable {<button type="button" class="cell-edit" aria-label={format!("Edit {} for {}",props.field.display_label(),props.document.id)} onclick={start}>{if value.is_empty(){"—".into()}else{value}}<span aria-hidden="true">{" ✎"}</span></button>}
+        </div>} else if editable {<button type="button" class="cell-edit" aria-label={format!("Edit {} for {}",props.field.display_label(),props.document.id)} onclick={start}>{if shown.is_empty(){"—".into()}else{shown}}<span aria-hidden="true">{" ✎"}</span></button>}
         else if props.field.kind==FieldType::Reference || (props.field.kind==FieldType::Array && props.field.items==Some(vulse_model::ArrayItems::Reference)) {<crate::relationships::ReferenceLinks collection={props.collections.iter().find(|c|Some(c.name.as_str())==props.field.collection.as_deref()).cloned()} ids={if let Some(id)=props.document.body[&props.field.name].as_str(){vec![id.to_string()]}else{props.document.body[&props.field.name].as_array().map(|a|a.iter().filter_map(|v|v.as_str().map(str::to_string)).collect()).unwrap_or_default()}}/>}
-        else {{calculated_error.cloned().unwrap_or_else(||if value.is_empty(){"—".into()}else{value})}}
+        else {{calculated_error.cloned().unwrap_or_else(||if shown.is_empty(){"—".into()}else{shown})}}
     </td>}
 }

@@ -28,7 +28,8 @@ pub use summary::{
 
 pub use blueprint::{
     ArrayItems, Blueprint, CheckedDocument, DocumentRef, FieldDef, FieldType, MAX_FIELD_OPTIONS,
-    MAX_OPTION_LENGTH, match_headers, record_title, reference_collections, take_field_renames,
+    MAX_FORMAT_DECIMALS, MAX_OPTION_LENGTH, NumberFormat, match_headers, record_title,
+    reference_collections, take_field_renames,
     take_option_renames, validate_blueprint, validate_document,
 };
 pub use identity::{

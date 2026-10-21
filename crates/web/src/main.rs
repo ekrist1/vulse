@@ -12,6 +12,7 @@ mod history;
 mod import;
 mod live;
 mod lookup_builder;
+mod number_format;
 mod pages;
 mod record_cell;
 mod records;

@@ -244,6 +244,15 @@ pub struct DocumentFormProps {
     pub saved: Option<serde_json::Value>,
 }
 
+/// A calculated result as text, in the field's number format when it has one.
+fn calculated_text(field: &FieldDef, value: &Value) -> String {
+    if field.number_format.is_some() && value.is_number() {
+        crate::number_format::field_display(field, value)
+    } else {
+        vulse_model::text_value(value)
+    }
+}
+
 #[function_component(DocumentForm)]
 pub fn document_form(props: &DocumentFormProps) -> Html {
     if props.blueprint.fields.is_empty() {
@@ -255,7 +264,7 @@ pub fn document_form(props: &DocumentFormProps) -> Html {
                 if field.kind == FieldType::Calculated && !vulse_model::formula_lookups(field.formula.as_deref().unwrap_or_default()).is_empty() {
                     // Other collections' values are only read on the server.
                     let result = match props.saved.as_ref().map(|body| &body[&field.name]) {
-                        Some(value) if !value.is_null() => format!("{} · saved value, updates when you save", vulse_model::text_value(value)),
+                        Some(value) if !value.is_null() => format!("{} · saved value, updates when you save", calculated_text(field, value)),
                         _ => "Calculated from other collections when the record is saved".into(),
                     };
                     return html! { <div class="computed-field"><span class="badge">{"ƒx Calculated"}</span><strong>{field.display_label().to_string()}</strong><output>{result}</output><code>{field.formula.clone().unwrap_or_default()}</code></div> };
@@ -263,7 +272,7 @@ pub fn document_form(props: &DocumentFormProps) -> Html {
                 if field.kind == FieldType::Calculated {
                     let preview = body_from_inputs(&props.blueprint, &props.inputs).map(|body| vulse_model::calculate_document(&props.blueprint, &body));
                     let result = match preview {
-                        Ok((body, errors)) => errors.get(&field.name).cloned().unwrap_or_else(|| vulse_model::text_value(&body[&field.name])),
+                        Ok((body, errors)) => errors.get(&field.name).cloned().unwrap_or_else(|| calculated_text(field, &body[&field.name])),
                         Err(_) => "Complete the input fields to see the result".into(),
                     };
                     return html! { <div class="computed-field"><span class="badge">{"ƒx Calculated"}</span><strong>{field.display_label().to_string()}</strong><output>{result}</output><code>{field.formula.clone().unwrap_or_default()}</code></div> };

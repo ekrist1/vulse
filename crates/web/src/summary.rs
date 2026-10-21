@@ -148,6 +148,34 @@ fn field_label(fields: &[FieldDef], name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// The number format a measure's values share: its field's, for sums,
+/// averages, minimums and maximums of one field.
+fn measure_format<'a>(
+    fields: &'a [FieldDef],
+    measure: &SummaryMeasure,
+) -> Option<&'a vulse_model::NumberFormat> {
+    if !matches!(
+        measure.op,
+        SummaryOp::Sum | SummaryOp::Average | SummaryOp::Min | SummaryOp::Max
+    ) {
+        return None;
+    }
+    let name = measure.field.as_deref()?;
+    fields
+        .iter()
+        .find(|f| f.name == name)?
+        .number_format
+        .as_ref()
+}
+
+/// A measure's value, in its field's number format when it has one.
+fn measure_value(fields: &[FieldDef], measure: &SummaryMeasure, value: &Value) -> String {
+    match (measure_format(fields, measure), value.as_f64()) {
+        (Some(format), Some(number)) => crate::number_format::format_number(number, format),
+        _ => format_value(value),
+    }
+}
+
 /// Plain numbers with up to two decimals; text as is.
 fn format_value(value: &Value) -> String {
     match value {
@@ -227,7 +255,7 @@ fn summary_table(
                         <td class="number">{row.count}</td>
                         {for spec.measures.iter().map(|m| match row.errors.get(&m.name) {
                             Some(error) => html!{<td class="number cell-error" title={error.clone()}>{"Error"}</td>},
-                            None => html!{<td class="number">{format_value(row.values.get(&m.name).unwrap_or(&Value::Null))}</td>},
+                            None => html!{<td class="number">{measure_value(fields, m, row.values.get(&m.name).unwrap_or(&Value::Null))}</td>},
                         })}
                         if !spec.group_by.is_empty() {
                             <td><button type="button" class="text-button" aria-label={format!("View records for {}", row.labels.join(" · "))} onclick={drill}>{"View records →"}</button></td>
@@ -241,7 +269,7 @@ fn summary_table(
                     <th class="number">{result.totals.count}</th>
                     {for spec.measures.iter().map(|m| match result.totals.errors.get(&m.name) {
                         Some(error) => html!{<th class="number cell-error" title={error.clone()}>{"Error"}</th>},
-                        None => html!{<th class="number">{format_value(result.totals.values.get(&m.name).unwrap_or(&Value::Null))}</th>},
+                        None => html!{<th class="number">{measure_value(fields, m, result.totals.values.get(&m.name).unwrap_or(&Value::Null))}</th>},
                     })}
                     <th></th>
                 </tr></tfoot>
@@ -567,14 +595,14 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
                     _ => FieldType::Number,
                 },
                 formula: m.formula.clone(), required: false, collection: None,
-                items: None, renamed_from: None, options: None, renamed_options: None,
+                items: None, renamed_from: None, number_format: None, options: None, renamed_options: None,
             }).collect();
         let formula_field = formula_fields.iter().find(|f| f.name == measure.name).cloned()
             .unwrap_or_else(|| FieldDef {
                 name: measure.name.clone(), kind: FieldType::Calculated,
                 formula: measure.formula.clone(), label: None, description: None,
                 example: None, required: false, collection: None, items: None,
-                renamed_from: None, options: None, renamed_options: None,
+                renamed_from: None, number_format: None, options: None, renamed_options: None,
             });
         html! {<div class="summary-row measure-row" key={format!("measure-{index}")}>
             <label>{"Name"}
@@ -928,7 +956,10 @@ fn summary_chart(props: &ChartProps) -> Html {
             {for series.iter().enumerate().map(|(s, name)| html!{
                 <div class="tooltip-row">
                     <span class={format!("key series-{}", s + 1)} aria-hidden="true"></span>
-                    <strong>{format_value(row.values.get(name.as_str()).unwrap_or(&Value::Null))}</strong>
+                    <strong>{match props.spec.measures.iter().find(|m| m.name == **name) {
+                        Some(m) => measure_value(&props.fields, m, row.values.get(name.as_str()).unwrap_or(&Value::Null)),
+                        None => format_value(row.values.get(name.as_str()).unwrap_or(&Value::Null)),
+                    }}</strong>
                     <span class="muted">{name.to_string()}</span>
                 </div>
             })}

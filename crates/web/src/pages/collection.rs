@@ -532,6 +532,7 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                 items: None,
                 formula: None,
                 renamed_from: None,
+                number_format: None,
                 options: None,
                 renamed_options: None,
             });
@@ -866,6 +867,9 @@ fn field_row(props: &FieldRowProps) -> Html {
                             next.options = None;
                             next.renamed_options = None;
                         }
+                        if !matches!(next.kind, FieldType::Number | FieldType::Calculated) {
+                            next.number_format = None;
+                        }
                         if next.kind == FieldType::Calculated {next.required=false;}
                         patch.emit(next);
                     }
@@ -939,8 +943,112 @@ fn field_row(props: &FieldRowProps) -> Html {
             if field.kind == FieldType::String {
                 <OptionsEditor field={field.clone()} saved={props.saved_options.clone()} records={props.records.clone()} origin={props.origin.clone()} on_change={patch.clone()}/>
             }
+            if matches!(field.kind, FieldType::Number | FieldType::Calculated) {
+                {number_format_editor(&field, &patch)}
+            }
             if field.kind == FieldType::Calculated {
                 <FormulaEditor records={props.records.clone()} field={field.clone()} fields={props.fields.clone()} collections={props.collections.clone()} current={props.current.clone()} on_change={patch.clone()}/>
+            }
+        </div>
+    }
+}
+
+/// Locales offered for number formats, as tag and name.
+const FORMAT_LOCALES: [(&str, &str); 6] = [
+    ("nb-NO", "Norwegian (1 234 567,89)"),
+    ("sv-SE", "Swedish (1 234 567,89)"),
+    ("da-DK", "Danish (1.234.567,89)"),
+    ("de-DE", "German (1.234.567,89)"),
+    ("en-GB", "English UK (1,234,567.89)"),
+    ("en-US", "English US (1,234,567.89)"),
+];
+
+/// Currencies offered for number formats; others can be typed.
+const FORMAT_CURRENCIES: [&str; 6] = ["NOK", "SEK", "DKK", "EUR", "USD", "GBP"];
+
+/// How a number or calculated field's numbers are shown: plain, grouped, or
+/// as an amount in a currency. Display only; stored values stay numbers.
+fn number_format_editor(field: &FieldDef, patch: &Callback<FieldDef>) -> Html {
+    let format = field.number_format.clone();
+    let style = match &format {
+        None => "plain",
+        Some(f) if f.currency.is_some() => "currency",
+        Some(_) => "grouped",
+    };
+    let emit = {
+        let (field, patch) = (field.clone(), patch.clone());
+        move |format: Option<vulse_model::NumberFormat>| {
+            let mut next = field.clone();
+            next.number_format = format;
+            patch.emit(next);
+        }
+    };
+    let on_style = {
+        let (emit, format) = (emit.clone(), format.clone());
+        Callback::from(move |event: Event| {
+            let element: HtmlSelectElement = event.target_unchecked_into();
+            let mut next = format.clone().unwrap_or_default();
+            match element.value().as_str() {
+                "plain" => return emit(None),
+                "currency" => {
+                    next.currency.get_or_insert_with(|| "NOK".into());
+                    next.locale.get_or_insert_with(|| "nb-NO".into());
+                }
+                _ => next.currency = None,
+            }
+            emit(Some(next));
+        })
+    };
+    let update = {
+        let (emit, format) = (emit.clone(), format.clone());
+        move |change: fn(&mut vulse_model::NumberFormat, String)| {
+            let (emit, format) = (emit.clone(), format.clone());
+            Callback::from(move |event: Event| {
+                let element: HtmlSelectElement = event.target_unchecked_into();
+                let mut next = format.clone().unwrap_or_default();
+                change(&mut next, element.value());
+                emit(Some(next));
+            })
+        }
+    };
+    html! {
+        <div class="field-options number-format">
+            <label>{"Number display"}
+                <select aria-label="Number display" onchange={on_style}>
+                    <option value="plain" selected={style == "plain"}>{"Plain (1234567.5)"}</option>
+                    <option value="grouped" selected={style == "grouped"}>{"Formatted number (1 234 567,5)"}</option>
+                    <option value="currency" selected={style == "currency"}>{"Currency (1 234 567,50 kr)"}</option>
+                </select>
+            </label>
+            if let Some(current) = &format {
+                <div class="field-metadata">
+                    if let Some(code) = &current.currency {
+                        <label>{"Currency"}
+                            <select aria-label="Currency" onchange={update(|f, value| f.currency = Some(value))}>
+                                { for FORMAT_CURRENCIES.iter().map(|c| html! { <option value={*c} selected={code == c}>{*c}</option> }) }
+                                if !FORMAT_CURRENCIES.contains(&code.as_str()) {
+                                    <option value={code.clone()} selected=true>{code.clone()}</option>
+                                }
+                            </select>
+                        </label>
+                    }
+                    <label>{"Decimals"}
+                        <select aria-label="Decimals" onchange={update(|f, value| f.decimals = value.parse().ok())}>
+                            <option value="" selected={current.decimals.is_none()}>{if current.currency.is_some() {"Currency default"} else {"As stored"}}</option>
+                            { for (0..=vulse_model::MAX_FORMAT_DECIMALS).map(|d| html! { <option value={d.to_string()} selected={current.decimals == Some(d)}>{d.to_string()}</option> }) }
+                        </select>
+                    </label>
+                    <label>{"Separators"}
+                        <select aria-label="Separators" onchange={update(|f, value| f.locale = (!value.is_empty()).then_some(value))}>
+                            <option value="" selected={current.locale.is_none()}>{"Viewer's browser language"}</option>
+                            { for FORMAT_LOCALES.iter().map(|(tag, name)| html! { <option value={*tag} selected={current.locale.as_deref() == Some(*tag)}>{*name}</option> }) }
+                            if let Some(tag) = current.locale.as_deref().filter(|tag| !FORMAT_LOCALES.iter().any(|(t, _)| t == tag)) {
+                                <option value={tag.to_string()} selected=true>{tag.to_string()}</option>
+                            }
+                        </select>
+                    </label>
+                </div>
+                <p class="muted">{format!("Example: {}. Only the admin's display changes; the API, filters, imports and exports keep plain numbers.", crate::number_format::format_number(1234567.5, current))}</p>
             }
         </div>
     }

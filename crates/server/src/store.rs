@@ -507,8 +507,9 @@ pub async fn list_collections(
 ) -> anyhow::Result<Vec<CollectionView>> {
     let rows = conn
         .query(
-            "SELECT id, name, visibility, blueprint, created_at, updated_at
-             FROM collections
+            "SELECT id, name, visibility, blueprint, created_at, updated_at,
+                    (SELECT COUNT(*) FROM documents d WHERE d.collection_id = c.id)
+             FROM collections c
              ORDER BY created_at DESC, id DESC
              LIMIT ?1 OFFSET ?2",
             &[
@@ -517,7 +518,13 @@ pub async fn list_collections(
             ],
         )
         .await?;
-    rows.iter().map(collection_from_row).collect()
+    rows.iter()
+        .map(|row| {
+            let mut collection = collection_from_row(row)?;
+            collection.record_count = Some(int_at(row, 6)?.max(0) as u64);
+            Ok(collection)
+        })
+        .collect()
 }
 
 pub async fn find_collection(conn: &Conn, id: &str) -> anyhow::Result<Option<CollectionView>> {
@@ -980,6 +987,7 @@ fn collection_from_row(row: &SqlRow) -> anyhow::Result<CollectionView> {
         blueprint: serde_json::from_str(&text_at(row, 3)?)?,
         created_at: text_at(row, 4)?,
         updated_at: text_at(row, 5)?,
+        record_count: None,
     })
 }
 

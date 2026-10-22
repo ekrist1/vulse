@@ -202,6 +202,9 @@ pub struct CollectionView {
     pub blueprint: Blueprint,
     pub created_at: String,
     pub updated_at: String,
+    /// How many records the collection holds, when listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1585,6 +1585,13 @@ async fn imports_record_history_links_and_sortable_rows() {
             count("SELECT count(*) FROM document_links l JOIN documents d ON d.id=l.source_id WHERE d.collection_id=?1").await,
             total as i64
         );
+        let (_, listed) = json_of::<Page<CollectionView>>(
+            app.call("GET", "/api/v1/collections", Some(&cookie), None, None)
+                .await,
+        )
+        .await;
+        let listed = listed.items.iter().find(|c| c.id == books.id).unwrap();
+        assert_eq!(listed.record_count, Some(total as u64));
     }
 }
 #[tokio::test]

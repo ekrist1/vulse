@@ -410,6 +410,7 @@ mod tests {
                 blueprint: blueprint.clone(),
                 created_at: String::new(),
                 updated_at: String::new(),
+                record_count: None,
             })
             .collect()
     }

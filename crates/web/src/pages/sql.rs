@@ -100,7 +100,7 @@ fn template_fields(collection: &CollectionView) -> (String, String) {
 fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{} {}", group_digits(n), if n == 1 { one } else { many })
 }
-fn group_digits(n: u64) -> String {
+pub(super) fn group_digits(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {

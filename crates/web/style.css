@@ -204,6 +204,7 @@ button.toolbar-toggle.active{background:#e7f4f1;border-color:#9ccfc4;color:var(-
 .field-options{grid-column:1/-1;padding:1rem 1.2rem;background:#f7fafb;border:1px solid var(--line);border-radius:10px}.field-options label.check{margin:0}.option-list{list-style:none;padding:0;margin:.8rem 0 0;display:grid;gap:.5rem}.option-list .row{margin:0;flex-wrap:nowrap}.option-list input{flex:1;min-width:0}.option-list button{min-height:34px;padding:.3rem .6rem}.field-options>p{font-size:12px;margin:.6rem 0 0}
 
 /* Recursive formula inputs keep each calculation readable on narrow screens. */
+.calculation-hint{margin:12px 0 0;font-size:12px!important;line-height:1.5}
 .nested-calculation{margin-top:12px;border-left:3px solid #bce0cc;padding-left:12px;min-width:0}
 .nested-calculation .calculation-inputs{grid-template-columns:minmax(0,1fr)}
 .guided-calculation>.secondary{margin-top:12px}

@@ -1,6 +1,7 @@
 use crate::formula_input::{FormulaInput, Suggestion};
 use crate::lookup_builder::{LookupBuilder, LookupDraft};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use vulse_model::{
     ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType,
@@ -687,6 +688,33 @@ impl Binding {
         }
         Ok(formula_literal(&value))
     }
+    /// This input as formula text even when unfinished: a missing value stays
+    /// blank, so the formula editor points at it.
+    fn text(&self, argument: &Argument, fields: &[FieldDef]) -> String {
+        if let Ok(expression) = self.expression(argument, fields) {
+            return expression;
+        }
+        match self.source.as_str() {
+            "calculation" => self
+                .calculation
+                .as_ref()
+                .map(|draft| format!("({})", draft.text(fields).trim_start_matches('=')))
+                .unwrap_or_default(),
+            "expression" => {
+                let expression = self.value.trim().trim_start_matches('=');
+                if expression.is_empty() {
+                    String::new()
+                } else {
+                    format!("({expression})")
+                }
+            }
+            "text" => formula_literal(&json!(self.value)),
+            source => source
+                .strip_prefix("field:")
+                .map(|name| format!("[{name}]"))
+                .unwrap_or_else(|| self.value.trim().into()),
+        }
+    }
 }
 fn formula_literal(value: &Value) -> String {
     if let Some(text) = value.as_str() {
@@ -705,8 +733,6 @@ fn preview_text(value: &Value) -> String {
         "Empty".into()
     } else if value.as_str() == Some("") {
         "Empty text".into()
-    } else if let Some(number) = value.as_f64() {
-        number.to_string()
     } else if let Some(boolean) = value.as_bool() {
         if boolean {
             "True".into()
@@ -825,13 +851,47 @@ const OPERATORS: &[(&str, &str, &str)] = &[
     ("divide", "/", "Divide values"),
     ("power", "^", "Raise to a power"),
     ("join", "&", "Join two values as text"),
-    ("equal", "=", "Equals"),
-    ("not_equal", "<>", "Does not equal"),
-    ("greater", ">", "Greater than"),
-    ("less", "<", "Less than"),
-    ("at_least", ">=", "At least"),
-    ("at_most", "<=", "At most"),
+    ("equal", "=", "Is equal to"),
+    ("not_equal", "<>", "Is not equal to"),
+    ("greater", ">", "Is greater than"),
+    ("less", "<", "Is less than"),
+    ("at_least", ">=", "Is at least"),
+    ("at_most", "<=", "Is at most"),
 ];
+/// Everyday calculations, grouped as the Calculation menu offers them. Other
+/// tasks, such as `[a] + [b]`, still show when a formula already uses them.
+const COMMON_TASKS: &[(&str, &[&str])] = &[
+    (
+        "Numbers",
+        &[
+            "SUM",
+            "subtract",
+            "multiply",
+            "divide",
+            "percentage",
+            "ROUND",
+            "power",
+        ],
+    ),
+    ("Text", &["TEXTJOIN"]),
+    (
+        "Compare and decide",
+        &[
+            "IF",
+            "equal",
+            "not_equal",
+            "greater",
+            "less",
+            "at_least",
+            "at_most",
+            "AND",
+            "OR",
+        ],
+    ),
+];
+fn comparison(task: &str) -> bool {
+    operator(task).is_some_and(|op| ["=", "<>", ">", "<", ">=", "<="].contains(&op))
+}
 fn operator(task: &str) -> Option<&'static str> {
     OPERATORS
         .iter()
@@ -911,6 +971,22 @@ impl Draft {
                 .collect(),
         }
     }
+    /// A new `task` that keeps the fields and nested calculations this draft
+    /// already chose, wherever they suit the new task's inputs.
+    fn switch_task(&self, task: &str, fields: &[FieldDef]) -> Self {
+        let mut next = Self::new(task);
+        let arguments = next.arguments();
+        for ((binding, argument), previous) in
+            next.inputs.iter_mut().zip(arguments).zip(&self.inputs)
+        {
+            let chosen = previous.source.starts_with("field:")
+                || ["calculation", "expression"].contains(&previous.source.as_str());
+            if chosen && previous.expression(&argument, fields).is_ok() {
+                *binding = previous.clone();
+            }
+        }
+        next
+    }
     fn can_add(&self) -> bool {
         operator(&self.task).is_none()
             && self.task != "percentage"
@@ -959,13 +1035,26 @@ impl Draft {
             .zip(self.arguments())
             .map(|(b, a)| b.expression(&a, fields))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(if let Some(op) = operator(&self.task) {
+        Ok(self.assemble(&values))
+    }
+    /// The formula as far as it is filled in, for unfinished drafts.
+    fn text(&self, fields: &[FieldDef]) -> String {
+        let values: Vec<_> = self
+            .inputs
+            .iter()
+            .zip(self.arguments())
+            .map(|(b, a)| b.text(&a, fields))
+            .collect();
+        self.assemble(&values)
+    }
+    fn assemble(&self, values: &[String]) -> String {
+        if let Some(op) = operator(&self.task) {
             format!("={} {op} {}", values[0], values[1])
         } else if self.task == "percentage" {
             format!("=({} / {}) * 100", values[0], values[1])
         } else {
             format!("={}({})", self.task, values.join(", "))
-        })
+        }
     }
     fn from_formula(formula: &str) -> Option<Self> {
         Self::from_expr(&vulse_model::inspect_formula(formula).ok()?)
@@ -1010,7 +1099,95 @@ fn task_title(task: &str) -> String {
         "TEXTJOIN" => "Combine text".into(),
         "IF" => "If / otherwise".into(),
         "ROUND" => "Round a number".into(),
-        _ => format!("{task} calculation"),
+        "AND" => "All conditions are true".into(),
+        "OR" => "Any condition is true".into(),
+        _ => format!("{task} · {}", help(task).description),
+    }
+}
+fn task_description(task: &str) -> String {
+    if let Some(op) = operator(task).filter(|_| comparison(task)) {
+        let relation = match op {
+            "=" => "equals",
+            "<>" => "does not equal",
+            ">" => "is greater than",
+            "<" => "is less than",
+            ">=" => "is at least",
+            _ => "is at most",
+        };
+        return format!(
+            "True when the left value {relation} the right value, otherwise false. Numbers and text holding a number compare by value; other text compares alphabetically, ignoring case."
+        );
+    }
+    match task {
+        "multiply" => "Multiply a field by another field, a fixed number, or a nested calculation.",
+        "subtract" => "Subtract one value or calculation from another.",
+        "divide" => "Divide one value or calculation by another.",
+        "add" => "Add one value or calculation to another.",
+        "power" => "Raise a number to a power, such as 2 to square it.",
+        "join" => "Join two values into one piece of text.",
+        "percentage" => "Divide the part by the total, then multiply by 100. A result of 25 means 25%.",
+        "lookup" => "Sum, count or look up values in another collection, using the records that match this record.",
+        "" => "",
+        name => help(name).description,
+    }
+    .into()
+}
+/// The Calculation menu. Nested calculations list every function, since they
+/// cannot open the function library; the top level offers it instead.
+fn task_options(current: &str, lookup: bool, nested: bool) -> Html {
+    let option = |task: &str, title: String| {
+        html! {<option value={task.to_string()} selected={current == task}>{title}</option>}
+    };
+    let common = |task: &str| COMMON_TASKS.iter().any(|(_, tasks)| tasks.contains(&task));
+    let listed = current.is_empty()
+        || common(current)
+        || (lookup && current == "lookup")
+        || (nested && operator(current).is_none() && current != "percentage");
+    html! {<>
+        {for COMMON_TASKS.iter().map(|(group, tasks)| html!{<optgroup label={*group}>{for tasks.iter().map(|task| option(task, task_title(task)))}</optgroup>})}
+        if lookup {<optgroup label="Other collections">{option("lookup", "From another collection".into())}</optgroup>}
+        if !listed {<optgroup label="In use">{option(current, task_title(current))}</optgroup>}
+        if nested {
+            {for ["Numbers", "Logic", "Text", "Dates", "Lists"].iter().map(|category| html!{<optgroup label={format!("All functions · {category}")}>{for vulse_model::FUNCTIONS.iter().filter(|(name, _)| help(name).category == *category && !common(name)).map(|(name, _)| option(name, format!("{name} · {}", help(name).description)))}</optgroup>})}
+        } else {
+            <optgroup label="More"><option value="more">{"Browse all functions…"}</option></optgroup>
+        }
+    </>}
+}
+/// A note when a comparison mixes a text field with a number field, which
+/// compares by value only when the text holds a number.
+fn comparison_hint(draft: &Draft, fields: &[FieldDef]) -> Option<String> {
+    if !comparison(&draft.task) {
+        return None;
+    }
+    let chosen: Vec<&FieldDef> = draft
+        .inputs
+        .iter()
+        .filter_map(|b| b.source.strip_prefix("field:"))
+        .filter_map(|name| fields.iter().find(|f| f.name == name))
+        .collect();
+    let text = chosen.iter().find(|f| f.kind == FieldType::String)?;
+    let number = chosen.iter().find(|f| f.kind == FieldType::Number)?;
+    Some(format!(
+        "{} is a text field and {} is a number field. Text holding a number, like \"2025\", compares by value; other text counts as greater than any number.",
+        text.display_label(),
+        number.display_label()
+    ))
+}
+/// A field as menus list it: its label, its name when that differs, and its type.
+fn field_option(f: &FieldDef) -> String {
+    if f.display_label() == f.name {
+        format!("{} · {}", f.name, type_label(f))
+    } else {
+        format!("{} [{}] · {}", f.display_label(), f.name, type_label(f))
+    }
+}
+/// `a`, `a or b`, `a, b or c`.
+fn either(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => (*only).into(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
     }
 }
 
@@ -1028,9 +1205,8 @@ fn guided_calculation(props: &GuidedProps) -> Html {
     let draft = &props.draft;
     html! {<div class="guided-calculation">
         if props.select_task {
-            <label>{"Calculation"}<select aria-label="Calculation" value={draft.task.clone()} onchange={Callback::from({let change=props.on_change.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();change.emit(Draft::new(&select.value()));}})}>
-                <optgroup label="Arithmetic and comparisons">{for OPERATORS.iter().map(|(task,_,title)|html!{<option value={*task} selected={draft.task==*task}>{*title}</option>})}<option value="percentage" selected={draft.task=="percentage"}>{"Calculate a percentage"}</option></optgroup>
-                {for ["Numbers", "Logic", "Text", "Dates", "Lists"].iter().map(|category|html!{<optgroup label={*category}>{for vulse_model::FUNCTIONS.iter().filter(|(name,_)|help(name).category==*category).map(|(name,_)|html!{<option value={*name} selected={draft.task==*name}>{format!("{} · {}",name,help(name).description)}</option>})}</optgroup>})}
+            <label>{"Calculation"}<select aria-label="Calculation" value={draft.task.clone()} onchange={Callback::from({let change=props.on_change.clone();let draft=draft.clone();let fields=props.fields.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();change.emit(draft.switch_task(&select.value(),&fields));}})}>
+                {task_options(&draft.task,false,true)}
             </select></label>
         }
         <div class="calculation-inputs">{for draft.inputs.iter().zip(draft.arguments()).enumerate().map(|(index,(binding,argument))| {
@@ -1088,7 +1264,7 @@ fn calculation_input(props: &InputProps) -> Html {
     };
     html! {<div class="calculation-input"><label>{props.argument.label.clone()}<select aria-label={format!("{label} source")} value={binding.source.clone()} onchange={Callback::from({let change=props.on_change.clone();let binding=binding.clone();let fields=props.fields.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let mut next=binding.clone();next.source=select.value();if next.source=="boolean"{next.value="true".into();}if next.source=="calculation" && next.calculation.is_none(){next.calculation=Some(Box::new(Draft::new(if kind==Kind::Condition{"AND"}else{"multiply"})));}if next.source=="expression"{next.value=binding.expression(&arg("Input",kind),&fields).unwrap_or_default();}
                 if let Some(f)=next.source.strip_prefix("field:").and_then(|n|fields.iter().find(|f|f.name==n)){next.comparison=if f.kind==FieldType::String{"="}else if f.kind==FieldType::Boolean{"truthy"}else{">"}.into();next.compare_value=if f.kind==FieldType::String{json!("Example").to_string()}else{"0".into()};}change.emit(next);}})}>
-        <option value="" selected={binding.source.is_empty()}>{"Choose a field or fixed value…"}</option><optgroup label="Collection fields">{for props.fields.iter().filter(|f|compatible(kind,f)).map(|f|html!{<option value={format!("field:{}",f.name)} selected={binding.source==format!("field:{}",f.name)}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</optgroup><optgroup label="Fixed values">{for fixed_sources.into_iter().map(|(value,text)|html!{<option {value} selected={binding.source==value}>{text}</option>})}</optgroup><optgroup label="Build an expression"><option value="calculation" selected={binding.source=="calculation"}>{"Nested calculation…"}</option><option value="expression" selected={binding.source=="expression"}>{"Custom formula…"}</option></optgroup></select></label>
+        <option value="" selected={binding.source.is_empty()}>{"Choose a field or fixed value…"}</option><optgroup label="Collection fields">{for props.fields.iter().filter(|f|compatible(kind,f)).map(|f|html!{<option value={format!("field:{}",f.name)} selected={binding.source==format!("field:{}",f.name)}>{field_option(f)}</option>})}</optgroup><optgroup label="Fixed values">{for fixed_sources.into_iter().map(|(value,text)|html!{<option {value} selected={binding.source==value}>{text}</option>})}</optgroup><optgroup label="Build an expression"><option value="calculation" selected={binding.source=="calculation"}>{"Nested calculation…"}</option><option value="expression" selected={binding.source=="expression"}>{"Custom formula…"}</option></optgroup></select></label>
         if binding.source=="calculation" {
             if let Some(draft)=&binding.calculation {<div class="nested-calculation" role="group" aria-label={format!("{label} nested calculation")}><GuidedCalculation draft={(**draft).clone()} fields={props.fields.clone()} select_task={true} on_change={Callback::from({let binding=binding.clone();let change=props.on_change.clone();move |draft:Draft|{let mut next=binding.clone();next.calculation=Some(Box::new(draft));change.emit(next);}})}/></div>}
         } else if binding.source=="expression" {<FormulaInput label={format!("{label} formula")} value={binding.value.clone()} suggestions={formula_suggestions(&props.fields,&[],"")} library={true} on_change={Callback::from({let binding=binding.clone();let change=props.on_change.clone();move |value:String|{let mut next=binding.clone();next.value=value;change.emit(next);}})}/>
@@ -1124,9 +1300,68 @@ enum Mode {
     Lookup(LookupDraft),
     Advanced,
 }
+thread_local! {
+    /// Unfinished builder drafts by field and the formula text they produced,
+    /// so collapsing a field or editing its formula text and coming back
+    /// restores the builder as it was left.
+    static UNFINISHED: RefCell<Vec<(String, String, Mode)>> = const { RefCell::new(Vec::new()) };
+}
+fn remember(field: &str, formula: &str, mode: &Mode) {
+    UNFINISHED.with_borrow_mut(|drafts| {
+        drafts.retain(|(name, _, _)| name != field);
+        drafts.push((field.into(), formula.into(), mode.clone()));
+        if drafts.len() > 32 {
+            drafts.remove(0);
+        }
+    });
+}
+fn forget(field: &str) {
+    UNFINISHED.with_borrow_mut(|drafts| drafts.retain(|(name, _, _)| name != field));
+}
+fn recall(field: &str, formula: &str) -> Option<Mode> {
+    UNFINISHED.with_borrow(|drafts| {
+        drafts
+            .iter()
+            .find(|(name, text, _)| name == field && text == formula)
+            .map(|(_, _, mode)| mode.clone())
+    })
+}
+/// What a guided draft saves: its formula, or while unfinished the formula
+/// as far as it goes, remembered so the draft can be restored from it.
+fn guided_formula(field: &str, draft: &Draft, inputs: &[FieldDef]) -> String {
+    match draft.formula(inputs) {
+        Ok(formula) => {
+            forget(field);
+            formula
+        }
+        Err(_) => {
+            let text = if *draft == Draft::new(&draft.task) {
+                String::new()
+            } else {
+                draft.text(inputs)
+            };
+            remember(field, &text, &Mode::Guided(draft.clone()));
+            text
+        }
+    }
+}
+fn lookup_formula(field: &str, draft: &LookupDraft) -> String {
+    match draft.formula() {
+        Ok(formula) => {
+            forget(field);
+            formula
+        }
+        Err(_) => {
+            remember(field, "", &Mode::Lookup(draft.clone()));
+            String::new()
+        }
+    }
+}
 /// The editing mode that shows `formula` best.
-fn mode_for(formula: &str, inputs: &[FieldDef], summary: bool) -> Mode {
-    if formula.is_empty() {
+fn mode_for(field: &str, formula: &str, inputs: &[FieldDef], summary: bool) -> Mode {
+    if let Some(mode) = recall(field, formula) {
+        mode
+    } else if formula.is_empty() {
         Mode::Guided(Draft::new("multiply"))
     } else if let Some(draft) = guided_draft(formula, inputs) {
         Mode::Guided(draft)
@@ -1155,7 +1390,7 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         if props.summary {
             Mode::Advanced
         } else {
-            mode_for(&formula, &inputs, props.summary)
+            mode_for(&props.field.name, &formula, &inputs, props.summary)
         }
     });
     let library = use_state(|| false);
@@ -1173,9 +1408,10 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         let summary = props.summary;
         let inputs = inputs.clone();
         let last_emitted = last_emitted.clone();
+        let name = props.field.name.clone();
         use_effect_with(formula.clone(), move |formula| {
             if *last_emitted.borrow() != *formula {
-                mode.set(mode_for(formula, &inputs, summary));
+                mode.set(mode_for(&name, formula, &inputs, summary));
                 *last_emitted.borrow_mut() = formula.clone();
             }
         });
@@ -1196,16 +1432,18 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         let mode = mode.clone();
         let emit = emit.clone();
         let fields = inputs.clone();
+        let name = props.field.name.clone();
         Callback::from(move |draft: Draft| {
-            emit.emit(draft.formula(&fields).unwrap_or_default());
+            emit.emit(guided_formula(&name, &draft, &fields));
             mode.set(Mode::Guided(draft));
         })
     };
     let set_lookup = {
         let mode = mode.clone();
         let emit = emit.clone();
+        let name = props.field.name.clone();
         Callback::from(move |draft: LookupDraft| {
-            emit.emit(draft.formula().unwrap_or_default());
+            emit.emit(lookup_formula(&name, &draft));
             mode.set(Mode::Lookup(draft));
         })
     };
@@ -1215,16 +1453,23 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         Mode::Lookup(draft) => draft.formula().err(),
         Mode::Advanced => None,
     };
-    let guided_available = !matches!(mode_for(&formula, &inputs, props.summary), Mode::Advanced);
+    let guided_available = !matches!(
+        mode_for(&props.field.name, &formula, &inputs, props.summary),
+        Mode::Advanced
+    );
     let task = match &*mode {
         Mode::Guided(draft) => draft.task.clone(),
         Mode::Lookup(_) => "lookup".to_string(),
         Mode::Advanced => String::new(),
     };
-    let task_select = html! {<div class="calculation-task"><label>{"Calculation"}<select aria-label="Calculation" value={task.clone()} onchange={Callback::from({let set_draft=set_draft.clone();let set_lookup=set_lookup.clone();let others=others.clone();let library=library.clone();let task=task.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let value=select.value();if value=="more"{library.set(true);select.set_value(&task);}else if value=="lookup"{if let Some(first)=others.first(){set_lookup.emit(LookupDraft::new(first));}library.set(false);}else{set_draft.emit(Draft::new(&value));library.set(false);}}})}>{for [("multiply","Multiply values"),("subtract","Subtract values"),("divide","Divide values"),("SUM","Add values"),("percentage","Calculate a percentage"),("TEXTJOIN","Combine text"),("IF","If / otherwise"),("ROUND","Round a number")].into_iter().map(|(value,label)|html!{<option {value} selected={task==value}>{label}</option>})}<optgroup label="More arithmetic and comparisons">{for OPERATORS.iter().filter(|(name,_,_)|!["multiply","subtract","divide"].contains(name)).map(|(name,_,title)|html!{<option value={*name} selected={task==*name}>{*title}</option>})}</optgroup>if !others.is_empty(){<option value="lookup" selected={task=="lookup"}>{"From another collection"}</option>}if operator(&task).is_none() && !["SUM","percentage","TEXTJOIN","IF","ROUND","lookup"].contains(&task.as_str()){<option value={task.clone()} selected={true}>{task_title(&task)}</option>}<option value="more">{"More calculations…"}</option></select></label>
-    <p class="muted">{match task.as_str(){"multiply"=>"Multiply a field by another field, a fixed number, or a nested calculation.","subtract"=>"Subtract one value or calculation from another.","divide"=>"Divide one value or calculation by another.","percentage"=>"Divide the part by the total, then multiply by 100. A result of 25 means 25%.","lookup"=>"Sum, count or look up values in another collection, using the records that match this record.","" => "",name if operator(name).is_some()=>"Combine values or nested calculations.",name=>help(name).description}}</p></div>};
+    let task_select = html! {<div class="calculation-task"><label>{"Calculation"}<select aria-label="Calculation" value={task.clone()} onchange={Callback::from({let set_draft=set_draft.clone();let set_lookup=set_lookup.clone();let others=others.clone();let library=library.clone();let task=task.clone();let mode=mode.clone();let inputs=inputs.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();let value=select.value();if value=="more"{library.set(true);select.set_value(&task);}else if value=="lookup"{if let Some(first)=others.first(){set_lookup.emit(LookupDraft::new(first));}library.set(false);}else{set_draft.emit(match &*mode{Mode::Guided(draft)=>draft.switch_task(&value,&inputs),_=>Draft::new(&value)});library.set(false);}}})}>{task_options(&task,!others.is_empty(),false)}</select></label>
+    <p class="muted">{task_description(&task)}</p></div>};
+    let hint = match &*mode {
+        Mode::Guided(draft) => comparison_hint(draft, &inputs),
+        _ => None,
+    };
     html! {<section class="formula-editor" aria-label={format!("{} calculation",props.field.name)}>
-        <div class="calculation-heading"><div><h3>{if props.summary {"How should this summary value be calculated?"}else{"How should this field be calculated?"}}</h3><p class="muted">{if props.summary {"Use other summary values by name. Results update automatically for each group."}else{"Read-only · Updates automatically when its input fields change."}}</p></div><button type="button" class="secondary" onclick={Callback::from({let mode=mode.clone();let formula=formula.clone();let set_draft=set_draft.clone();let inputs=inputs.clone();let summary=props.summary;move |_|{match &*mode{Mode::Guided(_)|Mode::Lookup(_)=>mode.set(Mode::Advanced),Mode::Advanced=>match mode_for(&formula,&inputs,summary){Mode::Advanced=>set_draft.emit(Draft::new("multiply")),next=>mode.set(next)}}}})}>{if !matches!(&*mode,Mode::Advanced){"Edit formula"}else if guided_available{"Use guided builder"}else{"Start a new guided calculation"}}</button></div>
+        <div class="calculation-heading"><div><h3>{if props.summary {"How should this summary value be calculated?"}else{"How should this field be calculated?"}}</h3><p class="muted">{if props.summary {"Use other summary values by name. Results update automatically for each group."}else{"Read-only · Updates automatically when its input fields change."}}</p></div><button type="button" class="secondary" onclick={Callback::from({let mode=mode.clone();let formula=formula.clone();let set_draft=set_draft.clone();let inputs=inputs.clone();let summary=props.summary;let name=props.field.name.clone();move |_|{match &*mode{Mode::Guided(_)|Mode::Lookup(_)=>mode.set(Mode::Advanced),Mode::Advanced=>match mode_for(&name,&formula,&inputs,summary){Mode::Advanced=>set_draft.emit(Draft::new("multiply")),next=>mode.set(next)}}}})}>{if !matches!(&*mode,Mode::Advanced){"Edit formula"}else if guided_available{"Use guided builder"}else{"Start a new guided calculation"}}</button></div>
         if let Mode::Lookup(draft)=&*mode {
             {task_select.clone()}
             <LookupBuilder draft={draft.clone()} collections={others.clone()} inputs={inputs.clone()} on_change={set_lookup.clone()}/>
@@ -1233,10 +1478,11 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         if let Mode::Guided(draft)=&*mode {
             {task_select}
             <GuidedCalculation draft={draft.clone()} fields={inputs.clone()} on_change={set_draft.clone()}/>
+            if let Some(hint)=hint {<p class="calculation-hint muted" role="note">{hint}</p>}
             <div class="calculation-formula"><span class="muted">{"Formula"}</span><code>{if formula.is_empty(){"Choose your inputs to build the formula"}else{&formula}}</code></div>
         }
         if matches!(&*mode,Mode::Advanced) {<AdvancedFormula summary={props.summary} label={props.formula_label.clone()} suggestions={formula_suggestions(&inputs,&props.collections,&props.current)} textarea={textarea.clone()} on_selection={Callback::from({let selection=selection.clone();move |next|selection.set(next)})} value={formula.clone()} fields={inputs.clone()} on_change={emit.clone()} on_library={Callback::from({let library=library.clone();move |_|library.set(!*library)})}/>}
-        if *library {<FunctionLibrary advanced={matches!(&*mode,Mode::Advanced)} on_use={Callback::from({let set_draft=set_draft.clone();let library=library.clone();move |name:String|{set_draft.emit(Draft::new(&name));library.set(false);}})} on_insert={Callback::from({let emit=emit.clone();let formula=formula.clone();let selection=selection.clone();let textarea=textarea.clone();move |name:String|{let (next,caret)=insert_function(&formula,*selection,&name);if let Some(area)=textarea.cast::<HtmlTextAreaElement>(){area.set_value(&next);area.focus().ok();area.set_selection_range(caret as u32,caret as u32).ok();}selection.set((caret,caret));emit.emit(next);}})}/>}
+        if *library {<FunctionLibrary advanced={matches!(&*mode,Mode::Advanced)} on_use={Callback::from({let set_draft=set_draft.clone();let library=library.clone();let mode=mode.clone();let inputs=inputs.clone();move |name:String|{set_draft.emit(match &*mode{Mode::Guided(draft)=>draft.switch_task(&name,&inputs),_=>Draft::new(&name)});library.set(false);}})} on_insert={Callback::from({let emit=emit.clone();let formula=formula.clone();let selection=selection.clone();let textarea=textarea.clone();move |name:String|{let (next,caret)=insert_function(&formula,*selection,&name);if let Some(area)=textarea.cast::<HtmlTextAreaElement>(){area.set_value(&next);area.focus().ok();area.set_selection_range(caret as u32,caret as u32).ok();}selection.set((caret,caret));emit.emit(next);}})}/>}
         if props.summary {
             if let Some(error)=draft_error {<p class="calculation-feedback" role="status">{error}</p>}
         } else {<CalculationPreview field={props.field.clone()} fields={props.fields.clone()} records={props.records.clone()} draft_error={draft_error}/>}
@@ -1353,7 +1599,7 @@ struct AdvancedProps {
 #[function_component(AdvancedFormula)]
 fn advanced_formula(props: &AdvancedProps) -> Html {
     html! {<div class="advanced-formula"><FormulaInput label={props.label.clone()} lookups={!props.summary} textarea={props.textarea.clone()} value={props.value.clone()} suggestions={props.suggestions.clone()} on_change={props.on_change.clone()} on_selection={props.on_selection.clone()} placeholder="=ROUND([price] * [quantity], 2)"/>
-        <p class="muted">{if props.summary {"Use [value_name] for another summary value, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions."}else{"Use [field_name] for a field, [collection.field] for a field of another collection, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions, then press Enter to insert. Select text to wrap it in a function."}}</p><div class="row"><button type="button" class="secondary" onclick={Callback::from({let change=props.on_library.clone();move |_|change.emit(())})}>{"Browse functions"}</button><label class="advanced-insert-field">{"Insert field"}<select aria-label="Insert input field" value="" onchange={Callback::from({let change=props.on_change.clone();let value=props.value.clone();let node=props.textarea.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();if select.value().is_empty(){return;}let name=select.value();let (start,end)=node.cast::<HtmlTextAreaElement>().map(|a|(a.selection_start().ok().flatten().unwrap_or(0) as usize,a.selection_end().ok().flatten().unwrap_or(0) as usize)).unwrap_or((value.encode_utf16().count(),value.encode_utf16().count()));let at=vulse_model::utf16_to_char_index(&value,start);let end=vulse_model::utf16_to_char_index(&value,end);let prefix=if value.is_empty(){"="}else{""};change.emit(replace_chars(&value,at,end,&format!("{prefix}[{name}]")));select.set_value("");}})}><option value="" selected={true}>{"Choose a field…"}</option>{for props.fields.iter().map(|f|html!{<option value={f.name.clone()}>{format!("{} [{}] · {}",f.display_label(),f.name,type_label(f))}</option>})}</select></label></div>
+        <p class="muted">{if props.summary {"Use [value_name] for another summary value, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions."}else{"Use [field_name] for a field, [collection.field] for a field of another collection, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions, then press Enter to insert. Select text to wrap it in a function."}}</p><div class="row"><button type="button" class="secondary" onclick={Callback::from({let change=props.on_library.clone();move |_|change.emit(())})}>{"Browse functions"}</button><label class="advanced-insert-field">{"Insert field"}<select aria-label="Insert input field" value="" onchange={Callback::from({let change=props.on_change.clone();let value=props.value.clone();let node=props.textarea.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();if select.value().is_empty(){return;}let name=select.value();let (start,end)=node.cast::<HtmlTextAreaElement>().map(|a|(a.selection_start().ok().flatten().unwrap_or(0) as usize,a.selection_end().ok().flatten().unwrap_or(0) as usize)).unwrap_or((value.encode_utf16().count(),value.encode_utf16().count()));let at=vulse_model::utf16_to_char_index(&value,start);let end=vulse_model::utf16_to_char_index(&value,end);let prefix=if value.is_empty(){"="}else{""};change.emit(replace_chars(&value,at,end,&format!("{prefix}[{name}]")));select.set_value("");}})}><option value="" selected={true}>{"Choose a field…"}</option>{for props.fields.iter().map(|f|html!{<option value={f.name.clone()}>{field_option(f)}</option>})}</select></label></div>
     </div>}
 }
 
@@ -1563,7 +1809,16 @@ fn calculation_preview(props: &PreviewProps) -> Html {
         .get(&props.field.name)
         .cloned()
         .unwrap_or(Value::Null);
-    html! {<div class="calculation-preview"><div class="preview-heading"><div><h4>{"Try your calculation"}</h4><p class="muted">{"Preview changes stay here. They never change a saved record."}</p></div><label>{"Preview values"}<select aria-label="Preview values" value={(*source).clone()} onchange={Callback::from({let source=source.clone();let overrides=overrides.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();source.set(select.value());overrides.set(BTreeMap::new());}})}><option value="" selected={source.is_empty()}>{"Sample values"}</option>{for props.records.iter().map(|r|html!{<option value={r.id.clone()} selected={*source==r.id}>{format!("Record {}{}",r.id.chars().take(8).collect::<String>(),r.body.get("title").or_else(||r.body.get("name")).and_then(Value::as_str).map(|s|format!(" · {s}")).unwrap_or_default())}</option>})}</select></label></div>
+    let result_text = match (&props.field.number_format, result.as_f64()) {
+        (Some(_), Some(_)) => crate::number_format::field_display(&props.field, &result),
+        _ => preview_text(&result),
+    };
+    let record_schema = Blueprint {
+        title_field: None,
+        fields: props.fields.clone(),
+    };
+    let watched: Vec<&str> = inputs.iter().map(|f| f.display_label()).collect();
+    html! {<div class="calculation-preview"><div class="preview-heading"><div><h4>{"Try your calculation"}</h4><p class="muted">{"Preview changes stay here. They never change a saved record."}</p></div><label>{"Preview values"}<select aria-label="Preview values" value={(*source).clone()} onchange={Callback::from({let source=source.clone();let overrides=overrides.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();source.set(select.value());overrides.set(BTreeMap::new());}})}><option value="" selected={source.is_empty()}>{"Sample values"}</option>{for props.records.iter().map(|r|html!{<option value={r.id.clone()} selected={*source==r.id}>{vulse_model::record_title(&record_schema,&r.body,&r.id)}</option>})}</select></label></div>
         <div class="preview-inputs">{for samples.iter().map(|(field,value)|{let change={let overrides=overrides.clone();let name=field.name.clone();Callback::from(move |value:String|{let mut next=(*overrides).clone();next.insert(name.clone(),value);overrides.set(next);})};html!{<label>{format!("{} · {}",field.display_label(),type_label(field))}
         if field.kind==FieldType::Boolean {<select aria-label={format!("Preview {}",field.name)} value={value.clone()} onchange={Callback::from(move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();change.emit(select.value());})}><option value="true" selected={value=="true"}>{"True"}</option><option value="false" selected={value=="false"}>{"False"}</option></select>}
         else {<input aria-label={format!("Preview {}",field.name)} type={match field.kind{FieldType::Number=>"number",FieldType::Date=>"date",_=>"text"}} step="any" value={value.clone()} oninput={Callback::from(move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();change.emit(input.value());})}/>}
@@ -1571,9 +1826,9 @@ fn calculation_preview(props: &PreviewProps) -> Html {
         if let Some(error)=preview_error {<p class="calculation-feedback incomplete" role="status">{error}</p>}
         else {<p class="syntax-status">{"✓ Formula syntax and field references are valid"}</p>
             if let Some(error)=runtime_error {<p class="error" role="status">{error}</p>}
-            else {<div class="preview-result"><span>{format!("{} · Preview result",if props.field.name.is_empty(){"Calculated field"}else{&props.field.name})}</span><output aria-label="Calculation preview result">{preview_text(&result)}</output>{if props.field.formula.as_deref().is_some_and(|f|Draft::from_formula(f).is_some_and(|d|d.task=="percentage")){html!{<span class="muted">{"Percent (25 means 25%)"}</span>}}else{html!{}}}</div>}
+            else {<div class="preview-result"><span>{format!("{} · Preview result",if props.field.name.is_empty(){"Calculated field"}else{&props.field.name})}</span><output aria-label="Calculation preview result">{result_text}</output>{if props.field.formula.as_deref().is_some_and(|f|Draft::from_formula(f).is_some_and(|d|d.task=="percentage")){html!{<span class="muted">{"Percent (25 means 25%)"}</span>}}else{html!{}}}</div>}
         }
-        if !inputs.is_empty(){<p class="preview-dependencies muted">{format!("Updates when {} changes.",inputs.iter().map(|f|f.name.clone()).collect::<Vec<_>>().join(", "))}</p>}
+        if !inputs.is_empty(){<p class="preview-dependencies muted">{format!("Updates when {} changes.",either(&watched))}</p>}
     </div>}
 }
 
@@ -1804,6 +2059,95 @@ mod tests {
         let (out, errors) = vulse_model::calculate_document(&bp, &json!({"price":100,"tax":999}));
         assert!(errors.is_empty());
         assert_eq!(out["total"], 120.0);
+    }
+    #[test]
+    fn switching_calculations_keeps_chosen_fields_that_still_fit() {
+        let fields = vec![
+            field("price", FieldType::Number, None),
+            field("quantity", FieldType::Number, None),
+            field("year", FieldType::String, None),
+        ];
+        let draft = Draft::from_formula("=[price] * [quantity]").unwrap();
+        assert_eq!(
+            draft
+                .switch_task("divide", &fields)
+                .formula(&fields)
+                .unwrap(),
+            "=[price] / [quantity]"
+        );
+        assert_eq!(
+            draft.switch_task("less", &fields).formula(&fields).unwrap(),
+            "=[price] < [quantity]"
+        );
+        // Fixed values are not carried: the new task's defaults fit it better.
+        let doubled = Draft::from_formula("=[price] * 2").unwrap();
+        assert_eq!(
+            doubled.switch_task("IF", &fields).formula(&fields).unwrap(),
+            "=IF([price], \"Yes\", \"No\")"
+        );
+        // A text field does not fit a number input, so that input starts empty.
+        let text = Draft::from_formula("=[year] & [price]").unwrap();
+        let next = text.switch_task("multiply", &fields);
+        assert!(next.inputs[0].source.is_empty());
+        assert_eq!(next.inputs[1].source, "field:price");
+    }
+    #[test]
+    fn comparisons_of_text_with_numbers_explain_how_they_compare() {
+        let mut year = field("aar", FieldType::String, None);
+        year.label = Some("år".into());
+        let fields = vec![year, field("orgnummer", FieldType::Number, None)];
+        let draft = Draft::from_formula("=[aar] < [orgnummer]").unwrap();
+        assert!(
+            comparison_hint(&draft, &fields)
+                .unwrap()
+                .starts_with("år is a text field and orgnummer")
+        );
+        let draft = Draft::from_formula("=[orgnummer] * [orgnummer]").unwrap();
+        assert!(comparison_hint(&draft, &fields).is_none());
+        assert_eq!(field_option(&fields[0]), "år [aar] · Text");
+        assert_eq!(field_option(&fields[1]), "orgnummer · Number");
+        assert_eq!(either(&["a"]), "a");
+        assert_eq!(either(&["a", "b", "c"]), "a, b or c");
+    }
+    #[test]
+    fn every_common_task_has_a_title_and_builds_a_draft() {
+        for (_, tasks) in COMMON_TASKS {
+            for task in *tasks {
+                assert!(!task_title(task).contains("calculation"), "{task}");
+                assert!(!task_description(task).is_empty(), "{task}");
+                assert_eq!(Draft::new(task).task, *task);
+            }
+        }
+    }
+    #[test]
+    fn unfinished_drafts_keep_their_formula_text_and_can_be_restored() {
+        let fields = vec![
+            field("price", FieldType::Number, None),
+            field("approved", FieldType::Boolean, None),
+        ];
+        // A missing input stays blank, nested calculations included.
+        let mut draft = Draft::new("multiply");
+        draft.inputs[0].source = "field:price".into();
+        draft.inputs[1] = Binding::empty();
+        assert_eq!(guided_formula("total", &draft, &fields), "=[price] * ");
+        let mut outer = Draft::new("IF");
+        outer.inputs[1] = Binding::nested(draft.clone());
+        assert_eq!(outer.text(&fields), "=IF(, ([price] * ), \"No\")");
+        // Reopening the field finds the draft from the text it saved.
+        match mode_for("total", "=[price] * ", &fields, false) {
+            Mode::Guided(restored) => assert_eq!(restored, draft),
+            _ => panic!("the unfinished draft was not restored"),
+        }
+        assert!(matches!(
+            mode_for("other", "=[price] * ", &fields, false),
+            Mode::Advanced
+        ));
+        // An untouched new calculation saves nothing yet.
+        assert_eq!(guided_formula("fresh", &Draft::new("IF"), &fields), "");
+        // Finishing the draft forgets it.
+        draft.inputs[1] = Binding::fixed(Kind::Number, "3");
+        assert_eq!(guided_formula("total", &draft, &fields), "=[price] * 3");
+        assert!(recall("total", "=[price] * ").is_none());
     }
     #[test]
     fn insertion_wraps_selection_and_preserves_unicode_and_surrounding_formula() {

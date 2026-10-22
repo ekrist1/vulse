@@ -3,6 +3,7 @@ use super::functions::function;
 use super::parser::Expr;
 use super::value::{compare, criterion, match_key, num, number, text_value, truth};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -17,7 +18,8 @@ pub struct Lookups {
 /// equality index so criteria such as `[orders.customer] = [id]` stay fast.
 pub struct LookupColumn {
     collection: String,
-    values: Vec<Value>,
+    /// Always a `Value::Array`, so functions can borrow the whole column.
+    values: Value,
     index: OnceLock<HashMap<String, Vec<usize>>>,
 }
 
@@ -25,15 +27,21 @@ impl LookupColumn {
     pub fn new(collection: &str, values: Vec<Value>) -> Self {
         Self {
             collection: collection.into(),
-            values,
+            values: Value::Array(values),
             index: OnceLock::new(),
         }
+    }
+    fn values(&self) -> &[Value] {
+        self.values
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
     fn rows(&self, key: &str) -> &[usize] {
         self.index
             .get_or_init(|| {
                 let mut index = HashMap::<String, Vec<usize>>::new();
-                for (row, value) in self.values.iter().enumerate() {
+                for (row, value) in self.values().iter().enumerate() {
                     index.entry(match_key(value)).or_default().push(row);
                 }
                 index
@@ -69,16 +77,14 @@ pub(super) fn resolve(n: &str, ctx: &Ctx, cache: &mut Cache) -> Result<Value, St
     let result = if let Some(e) = ctx.all.get(n) {
         eval(e, ctx, cache)
     } else if n.contains('.') {
-        ctx.lookups
-            .column(n)
-            .map(|column| Value::Array(column.values.clone()))
+        ctx.lookups.column(n).map(|column| column.values.clone())
     } else {
         Ok(ctx.body.get(n).cloned().unwrap_or(Value::Null))
     };
     cache.insert(n.into(), result.clone());
     result
 }
-pub(super) fn eval(e: &Expr, ctx: &Ctx, cache: &mut Cache) -> Result<Value, String> {
+pub(super) fn eval<'a>(e: &Expr, ctx: &Ctx<'a>, cache: &mut Cache) -> Result<Value, String> {
     match e {
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Field(n) => resolve(n, ctx, cache),
@@ -136,14 +142,24 @@ pub(super) fn eval(e: &Expr, ctx: &Ctx, cache: &mut Cache) -> Result<Value, Stri
             let mut values = Vec::new();
             let mut bytes = 0usize;
             for a in args {
+                // Another collection's column is borrowed rather than copied
+                // for every record, and its size is the collection's, so it
+                // does not count towards the limit on values built here.
+                if let Expr::Field(name) = a
+                    && name.contains('.')
+                    && !ctx.all.contains_key(name)
+                {
+                    values.push(Cow::Borrowed(&ctx.lookups.column(name)?.values));
+                    continue;
+                }
                 let value = eval(a, ctx, cache)?;
                 bytes = bytes.saturating_add(value.to_string().len());
                 if bytes > 1_000_000 {
                     return Err("#VALUE! function inputs exceed 1 MB".into());
                 }
-                values.push(value);
+                values.push(Cow::Owned(value));
             }
-            function(n, &values)
+            function(n, &values.iter().map(AsRef::as_ref).collect::<Vec<_>>())
         }
     }
 }
@@ -156,7 +172,7 @@ enum Range<'a> {
 impl Range<'_> {
     fn values(&self) -> &[Value] {
         match self {
-            Range::Column(column) => &column.values,
+            Range::Column(column) => column.values(),
             Range::List(values) => values,
         }
     }

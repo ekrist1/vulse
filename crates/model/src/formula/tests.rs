@@ -115,7 +115,11 @@ fn rejects_invalid_syntax_arity_and_limits() {
     assert!(
         function(
             "SUBSTITUTE",
-            &[json!("a".repeat(2000)), json!("a"), json!("b".repeat(2000))]
+            &[
+                &json!("a".repeat(2000)),
+                &json!("a"),
+                &json!("b".repeat(2000))
+            ]
         )
         .is_err()
     );
@@ -123,9 +127,9 @@ fn rejects_invalid_syntax_arity_and_limits() {
         function(
             "TEXTJOIN",
             &[
-                json!("x".repeat(600000)),
-                json!(true),
-                json!(["a", "b", "c"])
+                &json!("x".repeat(600000)),
+                &json!(true),
+                &json!(["a", "b", "c"])
             ]
         )
         .is_err()
@@ -286,4 +290,81 @@ fn dependencies_recalculate_and_bad_schemas_are_rejected() {
     let source = source_document(&bp, &body);
     assert!(source.get("net").is_none());
     assert!(source.get("total").is_none());
+}
+#[test]
+fn calculated_numbers_read_and_round_like_spreadsheet_cells() {
+    for (formula, expected) in [
+        ("ROUND(1.5*2,0) & \" kr\"", json!("3 kr")),
+        ("(0.1+0.2) & \"\"", json!("0.3")),
+        ("CONCAT(2.5*2, \"/\", -0.0)", json!("5/0")),
+        ("LEN(1.5*2)", json!(1)),
+        ("ROUND(1.005,2)", json!(1.01)),
+        ("ROUNDUP(0.1*3,1)", json!(0.3)),
+        ("ROUNDDOWN(0.7+0.1,1)", json!(0.8)),
+        ("FLOOR(0.3,0.1)", json!(0.3)),
+        ("CEILING(0.3,0.1)", json!(0.3)),
+        ("ROUND(1.5,308)", json!(1.5)),
+    ] {
+        assert_eq!(run(formula), Ok(expected), "{formula}");
+    }
+}
+#[test]
+fn comparisons_read_numeric_text_and_empty_values_as_numbers() {
+    let ctx = |body| {
+        let expr = parse("IF([year] < 2025, \"old\", \"new\")").unwrap();
+        eval(
+            &expr,
+            &Ctx {
+                all: &HashMap::new(),
+                body: &body,
+                lookups: &Lookups::default(),
+            },
+            &mut HashMap::new(),
+        )
+    };
+    assert_eq!(ctx(json!({"year": "999"})), Ok(json!("old")));
+    assert_eq!(ctx(json!({"year": "2026"})), Ok(json!("new")));
+    for (formula, expected) in [
+        ("\"9\" < 10", true),
+        ("\"10\" > \"9\"", true),
+        ("\" 7 \" = 7", true),
+        ("[missing] = 0", true),
+        ("[missing] > -5", true),
+        ("[missing] = \"\"", true),
+        ("\"apple\" < \"Banana\"", true),
+        ("\"Example\" < 10", false),
+        ("TRUE = TRUE", true),
+    ] {
+        assert_eq!(run(formula), Ok(json!(expected)), "{formula}");
+    }
+}
+#[test]
+fn functions_read_large_columns_of_other_collections() {
+    // Serialized, this column is well over the 1 MB limit on built values.
+    let mut lookups = Lookups::default();
+    let values: Vec<Value> = (0..200_000).map(|n| json!(n * 1001)).collect();
+    lookups.insert(
+        "orders",
+        "amount",
+        Arc::new(LookupColumn::new("orders", values)),
+    );
+    let ctx = Ctx {
+        all: &HashMap::new(),
+        body: &json!({}),
+        lookups: &lookups,
+    };
+    for (formula, expected) in [
+        ("SUM([orders.amount])", json!(20_019_899_900_000.0)),
+        ("COUNT([orders.amount])", json!(200_000)),
+        ("MAX([orders.amount])", json!(200_198_999.0)),
+        ("COUNTIF([orders.amount], \">100000000\")", json!(100_099)),
+        ("INDEX([orders.amount], 3)", json!(2002)),
+    ] {
+        let expr = parse(formula).unwrap();
+        assert_eq!(
+            eval(&expr, &ctx, &mut HashMap::new()),
+            Ok(expected),
+            "{formula}"
+        );
+    }
 }

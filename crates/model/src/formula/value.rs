@@ -54,21 +54,41 @@ pub fn text_value(v: &Value) -> String {
                 "FALSE".into()
             }
         }
+        // Calculated numbers read like a spreadsheet cell: 3 rather than 3.0,
+        // and 0.3 rather than 0.30000000000000004.
+        Value::Number(n) if n.is_f64() => {
+            let n = significant(n.as_f64().unwrap_or_default());
+            if n == 0.0 { 0.0 } else { n }.to_string()
+        }
         _ => v.to_string(),
     }
 }
-pub(super) fn flat(v: &Value, out: &mut Vec<Value>) {
+/// `x` to 15 significant digits, the precision spreadsheets calculate with,
+/// so binary noise such as 1.005 * 100 = 100.49999999999999 rounds as written.
+pub(super) fn significant(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    format!("{x:.14e}").parse().unwrap_or(x)
+}
+pub(super) fn flat<'v>(v: &'v Value, out: &mut Vec<&'v Value>) {
     if let Value::Array(a) = v {
         for v in a {
             flat(v, out);
         }
     } else {
-        out.push(v.clone());
+        out.push(v);
     }
 }
 pub(super) fn compare(a: &Value, b: &Value, op: &str) -> Result<bool, String> {
-    let ord = if a.is_number() && b.is_number() {
-        num(a)?.partial_cmp(&num(b)?).ok_or("#NUM!")?
+    // Numbers and numeric text compare by value, so a text field holding
+    // "9" is less than 10; an empty value counts as 0 against a number.
+    let numeric = |v: &Value, other: &Value| match v {
+        Value::Null if other.is_number() => Some(0.0),
+        _ => as_number(v),
+    };
+    let ord = if let (Some(x), Some(y)) = (numeric(a, b), numeric(b, a)) {
+        x.partial_cmp(&y).ok_or("#NUM!")?
     } else {
         text_value(a)
             .to_lowercase()

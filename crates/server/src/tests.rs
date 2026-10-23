@@ -887,6 +887,61 @@ async fn record_tables_sort_empty_values_last_and_follow_changes() {
 }
 
 #[tokio::test]
+async fn rebuilding_one_table_refreshes_formulas_that_read_it() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "readers@example.com", "readers").await;
+    let reports = create_collection(
+        &app,
+        &cookie,
+        "reports",
+        "private",
+        json!({"fields":[{"name":"fte","type":"number"}]}),
+    )
+    .await;
+    let orgs = create_collection(
+        &app,
+        &cookie,
+        "orgs",
+        "private",
+        json!({"fields":[{"name":"total","type":"calculated","formula":"=SUM([reports.fte])"}]}),
+    )
+    .await;
+    let edited = create_document(&app, &cookie, &reports.id, json!({"fte": 1})).await;
+    create_document(&app, &cookie, &reports.id, json!({"fte": 2})).await;
+    create_document(&app, &cookie, &orgs.id, json!({})).await;
+    let conn = app.db.connect().await.unwrap();
+    let total = async || {
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT {} FROM {}",
+                    crate::rows::column("total", 'n'),
+                    crate::rows::table(&orgs.id)
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        match rows[0][0] {
+            crate::db::SqlValue::Real(value) => value,
+            ref other => panic!("total is {other:?}"),
+        }
+    };
+    assert_eq!(total().await, 3.0);
+    // An edit made outside Vulse, then a repair of the edited collection.
+    conn.execute(
+        "UPDATE documents SET body='{\"fte\":10}' WHERE id=?1",
+        &[crate::db::SqlValue::Text(edited.id.clone())],
+    )
+    .await
+    .unwrap();
+    crate::records::rebuild_tables(&conn, Some("reports"))
+        .await
+        .unwrap();
+    assert_eq!(total().await, 12.0);
+}
+
+#[tokio::test]
 async fn saved_views_query_filter_sort_page_and_recalculate() {
     let app = TestApp::new().await;
     let (cookie, _) = register(&app, "views@example.com", "views").await;

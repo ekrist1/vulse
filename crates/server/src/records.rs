@@ -74,6 +74,12 @@ pub async fn rebuild_tables(conn: &Conn, only: Option<&str>) -> anyhow::Result<V
                 };
                 sync_collection_cells(conn, &id, &collection.blueprint).await?;
                 conn.changed(&id);
+                // Tables whose formulas read a repaired collection may hold
+                // values calculated from its old bodies. Rebuilding every
+                // collection covers them already.
+                if only.is_some() {
+                    refresh_readers(conn, &std::collections::BTreeSet::from([id.clone()])).await?;
+                }
                 Ok(Some(collection.name))
             })
             .await?;

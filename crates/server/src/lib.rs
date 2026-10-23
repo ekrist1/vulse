@@ -232,6 +232,10 @@ pub async fn rebuild_tables_command(args: &[String]) -> anyhow::Result<()> {
     for name in rebuilt {
         println!("  {name}");
     }
+    if config.turso_url.is_some() {
+        // Its lookup cache cannot tell that record bodies were edited outside Vulse.
+        println!("Restart Vulse so it drops formula values it calculated before");
+    }
     Ok(())
 }
 

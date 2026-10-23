@@ -237,7 +237,7 @@ sudo -u vulse VULSE_DB_PATH=/var/lib/vulse/vulse.db vulse rebuild-tables
 sudo systemctl start vulse
 ```
 
-`vulse rebuild-tables NAME` rebuilds one collection. The command also rebuilds the reference links between records. With Docker: `docker compose stop vulse`, `docker compose run --rm vulse vulse rebuild-tables`, `docker compose start vulse`. A local database cannot be rebuilt while Vulse is running, because the server holds its lock; a Turso database can.
+`vulse rebuild-tables NAME` rebuilds one collection. The command also rebuilds the reference links between records. With Docker: `docker compose stop vulse`, `docker compose run --rm vulse vulse rebuild-tables`, `docker compose start vulse`. Vulse must be stopped while the command runs on a local database, because the server holds its lock. A Turso database can be rebuilt while Vulse runs, but restart Vulse afterwards: a running server keeps formula values it read from other collections before the edit until it restarts.
 
 ### Publishing a release
 

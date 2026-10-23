@@ -20,6 +20,13 @@ use crate::db::{Conn, SqlValue, text_at};
 /// Parameters per `INSERT` while rebuilding a table.
 const BATCH_PARAMS: usize = 20_000;
 
+/// The version of how rows are derived from record bodies. Bump it with any
+/// change to the values a row holds for the same body: the columns, display
+/// text, numbers, sort keys, search text or formula results. Vulse rebuilds
+/// every table on start when the stored version differs (see
+/// `records::rebuild_outdated_tables`).
+pub(crate) const VERSION: i64 = 1;
+
 /// The quoted table name for a collection.
 pub(crate) fn table(collection_id: &str) -> String {
     let name: String = collection_id

@@ -38,16 +38,78 @@ pub async fn sync_collection_cells(
     let records = store::list_document_bodies(conn, id).await?;
     crate::relationships::insert_many(conn, id, blueprint, &records).await
 }
-/// Rebuilds every collection's record table from the record bodies.
-pub async fn rebuild_all_tables(conn: &Conn) -> anyhow::Result<()> {
-    for row in conn
-        .query("SELECT id,blueprint FROM collections", &[])
-        .await?
-    {
-        let blueprint = serde_json::from_str(&text_at(&row, 1)?)?;
-        let lookups = crate::lookups::load(conn, &blueprint).await?;
-        crate::rows::rebuild(conn, &text_at(&row, 0)?, &blueprint, &lookups).await?;
+/// The `workspace_settings` key holding the `rows::VERSION` the record
+/// tables were built with.
+const TABLES_VERSION: &str = "record_tables_version";
+
+/// Rebuilds the record tables and links of the collection with the given
+/// name or id, or of every collection, from the record bodies. Each
+/// collection is rebuilt in its own transaction, so other writes wait for one
+/// collection at a time. Returns the names of the rebuilt collections.
+pub async fn rebuild_tables(conn: &Conn, only: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let ids = match only {
+        Some(name) => {
+            let collection = match store::find_collection_by_name(conn, name).await? {
+                Some(collection) => collection,
+                None => store::find_collection(conn, name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("no collection named '{name}'"))?,
+            };
+            vec![collection.id]
+        }
+        None => conn
+            .query("SELECT id FROM collections ORDER BY name", &[])
+            .await?
+            .iter()
+            .map(|row| text_at(row, 0))
+            .collect::<anyhow::Result<_>>()?,
+    };
+    let mut rebuilt = Vec::with_capacity(ids.len());
+    for id in ids {
+        let name = conn
+            .with_tx(async |conn| {
+                // Deleted since it was listed.
+                let Some(collection) = store::find_collection(conn, &id).await? else {
+                    return Ok(None);
+                };
+                sync_collection_cells(conn, &id, &collection.blueprint).await?;
+                conn.changed(&id);
+                Ok(Some(collection.name))
+            })
+            .await?;
+        rebuilt.extend(name);
     }
+    Ok(rebuilt)
+}
+
+/// Rebuilds every record table when they were built by a version of Vulse
+/// that derived rows differently, so rows hold what this version derives.
+pub(crate) async fn rebuild_outdated_tables(conn: &Conn) -> anyhow::Result<()> {
+    let rows = conn
+        .query(
+            "SELECT value FROM workspace_settings WHERE key = ?1",
+            &[text(TABLES_VERSION)],
+        )
+        .await?;
+    let built = rows.first().map(|row| text_at(row, 0)).transpose()?;
+    let current = crate::rows::VERSION.to_string();
+    if built.as_deref() == Some(current.as_str()) {
+        return Ok(());
+    }
+    tracing::info!(
+        from = built.as_deref().unwrap_or("none"),
+        to = %current,
+        "rebuilding record tables"
+    );
+    let rebuilt = rebuild_tables(conn, None).await?;
+    // Stored last, so an interrupted rebuild starts over on the next start.
+    conn.execute(
+        "INSERT INTO workspace_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = ?2",
+        &[text(TABLES_VERSION), text(&current)],
+    )
+    .await?;
+    tracing::info!(collections = rebuilt.len(), "record tables rebuilt");
     Ok(())
 }
 /// Rewrites the record tables of collections whose formulas read one of the

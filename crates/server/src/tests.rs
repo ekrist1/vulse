@@ -818,10 +818,60 @@ async fn record_tables_sort_empty_values_last_and_follow_changes() {
     conn.execute(&format!("DROP TABLE {}", crate::rows::table(&c.id)), &[])
         .await
         .unwrap();
-    crate::records::rebuild_all_tables(&conn).await.unwrap();
+    assert_eq!(
+        crate::records::rebuild_tables(&conn, Some("scores"))
+            .await
+            .unwrap(),
+        vec!["scores".to_string()]
+    );
     assert_eq!(
         titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
         (4, "b".into())
+    );
+    assert!(
+        crate::records::rebuild_tables(&conn, Some("missing"))
+            .await
+            .is_err()
+    );
+    // Rows derived by another version of Vulse are rebuilt on start.
+    conn.execute(
+        &format!(
+            "UPDATE {} SET {}=100 WHERE {}='b'",
+            crate::rows::table(&c.id),
+            crate::rows::column("points", 'n'),
+            crate::rows::column("title", 't')
+        ),
+        &[],
+    )
+    .await
+    .unwrap();
+    crate::migrate::migrate(&conn).await.unwrap();
+    assert_eq!(
+        titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
+        (4, "c".into()),
+        "an unchanged version keeps the rows"
+    );
+    conn.execute(
+        "UPDATE workspace_settings SET value='0' WHERE key='record_tables_version'",
+        &[],
+    )
+    .await
+    .unwrap();
+    crate::migrate::migrate(&conn).await.unwrap();
+    assert_eq!(
+        titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
+        (4, "b".into())
+    );
+    let version = conn
+        .query(
+            "SELECT value FROM workspace_settings WHERE key='record_tables_version'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::db::text_at(&version[0], 0).unwrap(),
+        crate::rows::VERSION.to_string()
     );
     let response = app
         .call(

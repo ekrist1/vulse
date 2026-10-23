@@ -4,13 +4,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(arg) = args.first() {
         match arg.as_str() {
             "backup" => return vulse_server::backup_command(&args[1..]).await,
+            "rebuild-tables" => return vulse_server::rebuild_tables_command(&args[1..]).await,
             "--version" | "-V" => {
                 println!("vulse {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--help" | "-h" => {
                 println!(
-                    "vulse {}\n\nUsage:\n  vulse                          Run the server\n  vulse backup [DIR] [--keep N]  Write a backup of the database and uploads to DIR\n                                 (default: VULSE_BACKUP_DIR, then ./backups) and\n                                 keep only the newest N backups there\n\nSettings come from environment variables; see the README.",
+                    "vulse {}\n\nUsage:\n  vulse                          Run the server\n  vulse backup [DIR] [--keep N]  Write a backup of the database and uploads to DIR\n                                 (default: VULSE_BACKUP_DIR, then ./backups) and\n                                 keep only the newest N backups there\n  vulse rebuild-tables [NAME]    Rebuild the record tables of collection NAME, or of\n                                 every collection, from the record bodies; run it\n                                 while Vulse is stopped\n\nSettings come from environment variables; see the README.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());

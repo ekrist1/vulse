@@ -41,9 +41,7 @@ pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
         if existing.is_empty() {
             conn.with_tx(async |conn| {
                 conn.execute_batch(sql).await?;
-                if *version == 9 || *version == 10 {
-                    crate::records::rebuild_all_tables(conn).await?;
-                }
+                // Record tables (9, 10) are rebuilt by `rebuild_outdated_tables` below.
                 if *version == 14 {
                     share_revision_blueprints(conn).await?;
                 }
@@ -65,7 +63,7 @@ pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {
             .await?;
         }
     }
-    Ok(())
+    crate::records::rebuild_outdated_tables(conn).await
 }
 
 /// Replaces the blueprint copies in record revisions with ids of blueprints

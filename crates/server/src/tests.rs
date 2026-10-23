@@ -818,10 +818,60 @@ async fn record_tables_sort_empty_values_last_and_follow_changes() {
     conn.execute(&format!("DROP TABLE {}", crate::rows::table(&c.id)), &[])
         .await
         .unwrap();
-    crate::records::rebuild_all_tables(&conn).await.unwrap();
+    assert_eq!(
+        crate::records::rebuild_tables(&conn, Some("scores"))
+            .await
+            .unwrap(),
+        vec!["scores".to_string()]
+    );
     assert_eq!(
         titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
         (4, "b".into())
+    );
+    assert!(
+        crate::records::rebuild_tables(&conn, Some("missing"))
+            .await
+            .is_err()
+    );
+    // Rows derived by another version of Vulse are rebuilt on start.
+    conn.execute(
+        &format!(
+            "UPDATE {} SET {}=100 WHERE {}='b'",
+            crate::rows::table(&c.id),
+            crate::rows::column("points", 'n'),
+            crate::rows::column("title", 't')
+        ),
+        &[],
+    )
+    .await
+    .unwrap();
+    crate::migrate::migrate(&conn).await.unwrap();
+    assert_eq!(
+        titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
+        (4, "c".into()),
+        "an unchanged version keeps the rows"
+    );
+    conn.execute(
+        "UPDATE workspace_settings SET value='0' WHERE key='record_tables_version'",
+        &[],
+    )
+    .await
+    .unwrap();
+    crate::migrate::migrate(&conn).await.unwrap();
+    assert_eq!(
+        titles(json!({"sort_field":"points","descending":false,"limit":1})).await,
+        (4, "b".into())
+    );
+    let version = conn
+        .query(
+            "SELECT value FROM workspace_settings WHERE key='record_tables_version'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::db::text_at(&version[0], 0).unwrap(),
+        crate::rows::VERSION.to_string()
     );
     let response = app
         .call(
@@ -834,6 +884,61 @@ async fn record_tables_sort_empty_values_last_and_follow_changes() {
         .await;
     assert!(response.status().is_success());
     assert_eq!(tables().await, 0);
+}
+
+#[tokio::test]
+async fn rebuilding_one_table_refreshes_formulas_that_read_it() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "readers@example.com", "readers").await;
+    let reports = create_collection(
+        &app,
+        &cookie,
+        "reports",
+        "private",
+        json!({"fields":[{"name":"fte","type":"number"}]}),
+    )
+    .await;
+    let orgs = create_collection(
+        &app,
+        &cookie,
+        "orgs",
+        "private",
+        json!({"fields":[{"name":"total","type":"calculated","formula":"=SUM([reports.fte])"}]}),
+    )
+    .await;
+    let edited = create_document(&app, &cookie, &reports.id, json!({"fte": 1})).await;
+    create_document(&app, &cookie, &reports.id, json!({"fte": 2})).await;
+    create_document(&app, &cookie, &orgs.id, json!({})).await;
+    let conn = app.db.connect().await.unwrap();
+    let total = async || {
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT {} FROM {}",
+                    crate::rows::column("total", 'n'),
+                    crate::rows::table(&orgs.id)
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        match rows[0][0] {
+            crate::db::SqlValue::Real(value) => value,
+            ref other => panic!("total is {other:?}"),
+        }
+    };
+    assert_eq!(total().await, 3.0);
+    // An edit made outside Vulse, then a repair of the edited collection.
+    conn.execute(
+        "UPDATE documents SET body='{\"fte\":10}' WHERE id=?1",
+        &[crate::db::SqlValue::Text(edited.id.clone())],
+    )
+    .await
+    .unwrap();
+    crate::records::rebuild_tables(&conn, Some("reports"))
+        .await
+        .unwrap();
+    assert_eq!(total().await, 12.0);
 }
 
 #[tokio::test]

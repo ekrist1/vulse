@@ -198,6 +198,47 @@ pub async fn backup_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `vulse rebuild-tables [COLLECTION]`: rebuilds the record tables and links
+/// of one collection, or all, from the record bodies, and exits.
+pub async fn rebuild_tables_command(args: &[String]) -> anyhow::Result<()> {
+    let only = match args {
+        [] => None,
+        [flag, ..] if flag.starts_with('-') => anyhow::bail!("unknown option '{flag}'"),
+        [name] => Some(name.as_str()),
+        [_, extra, ..] => anyhow::bail!("unexpected argument '{extra}'"),
+    };
+    let config = Config::from_env()?;
+    if config.turso_url.is_none() && !config.db_path.is_file() {
+        anyhow::bail!(
+            "no database at {}; set VULSE_DB_PATH to the database Vulse uses",
+            config.db_path.display()
+        );
+    }
+    let locked = |e: anyhow::Error| {
+        if format!("{e:#}").contains("locked") {
+            anyhow::anyhow!(
+                "Vulse is running and holds the database lock; stop it and run vulse rebuild-tables again"
+            )
+        } else {
+            e
+        }
+    };
+    let db = config.open_db().await.map_err(locked)?;
+    let conn = db.connect().await.map_err(locked)?;
+    // Also rebuilds every table when they were built by an older version.
+    migrate::migrate(&conn).await.map_err(locked)?;
+    let rebuilt = records::rebuild_tables(&conn, only).await.map_err(locked)?;
+    println!("Rebuilt the record tables of {} collections", rebuilt.len());
+    for name in rebuilt {
+        println!("  {name}");
+    }
+    if config.turso_url.is_some() {
+        // Its lookup cache cannot tell that record bodies were edited outside Vulse.
+        println!("Restart Vulse so it drops formula values it calculated before");
+    }
+    Ok(())
+}
+
 fn print_backup(path: &std::path::Path, assets: usize, bytes: u64, removed: usize, keep: Option<usize>) {
     println!(
         "Backup written to {} ({assets} uploaded files, {:.1} MB)",

@@ -149,13 +149,19 @@ pub async fn update_collection(
                 renames: &renames,
             };
             crate::lookups::check(conn, Some(previous), &name, &blueprint).await?;
-            // Stored values of removed fields are only deleted on request.
+            // Stored values of removed fields are only deleted on request. A
+            // saved field whose name another saved field is renamed to is
+            // replaced, so it is removed too: its values must not survive
+            // under the renamed field's meaning.
             let removed: Vec<String> = current
                 .blueprint
                 .fields
                 .iter()
                 .filter(|old| old.kind != FieldType::Calculated)
-                .filter(|old| !blueprint.fields.iter().any(|new| new.name == old.name))
+                .filter(|old| {
+                    !blueprint.fields.iter().any(|new| new.name == old.name)
+                        || renames.values().any(|to| *to == old.name)
+                })
                 .filter(|old| !renames.contains_key(&old.name))
                 .map(|old| old.name.clone())
                 .collect();
@@ -186,6 +192,17 @@ pub async fn update_collection(
             let mut found = Found::default();
             for (doc, mut source) in store::list_document_bodies(conn, &id).await? {
                 if let Some(object) = source.as_object_mut() {
+                    // Removed before renaming, so a field renamed onto a
+                    // replaced field's name never inherits its values.
+                    let mut changed = false;
+                    for field in &removed {
+                        if let Some(value) = object.remove(field) {
+                            changed = true;
+                            if !value.is_null() {
+                                *holding.entry(field.clone()).or_default() += 1;
+                            }
+                        }
+                    }
                     let mut renamed = false;
                     for (old, new) in &renames {
                         if let Some(value) = object.remove(old) {
@@ -202,15 +219,6 @@ pub async fn update_collection(
                         if let Some(next) = next {
                             object.insert(field.clone(), serde_json::Value::String(next.clone()));
                             values_renamed = true;
-                        }
-                    }
-                    let mut changed = false;
-                    for field in &removed {
-                        if let Some(value) = object.remove(field) {
-                            changed = true;
-                            if !value.is_null() {
-                                *holding.entry(field.clone()).or_default() += 1;
-                            }
                         }
                     }
                     let mut converted = false;

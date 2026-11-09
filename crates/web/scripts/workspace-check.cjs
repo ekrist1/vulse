@@ -28,6 +28,30 @@ const { signInFreshAdmin, confirmModal } = require("./sign-in.cjs");
     await page.getByText("Changes saved",{exact:true}).waitFor();
     let schema=await (await page.request.get(base+`/api/v1/collections/${id}`)).json();
     assert.equal(schema.blueprint.title_field,"name");assert.equal(schema.blueprint.fields[1].label,"Product name");
+    // A new field whose name passes through a saved field's name stays a new field.
+    const pricedResponse=await page.request.post(base+"/api/v1/collections",{data:{name:"priced-"+run,visibility:"private",blueprint:{fields:["title","price","a","b","c","d"].map(name=>({name,type:name==="price"?"number":"string"}))}}});
+    assert.equal(pricedResponse.status(),201);const priced=await pricedResponse.json();
+    const pricedDoc=await(await page.request.post(base+`/api/v1/collections/${priced.id}/documents`,{data:{body:{title:"Saw",price:5}}})).json();
+    await page.goto(base+`/collections/${priced.id}`);await page.getByRole("button",{name:"Fields",exact:true}).click();
+    assert.equal(await page.locator(".field-row.collapsed").count(),6);
+    await page.getByRole("button",{name:"Add field",exact:true}).click();
+    const typed=page.locator(".field-row").nth(6).getByLabel("Name",{exact:true});
+    await typed.fill("");await typed.pressSequentially("price_total");
+    assert.equal(await typed.inputValue(),"price_total");
+    assert.equal(await page.locator(".field-row.collapsed").count(),6);
+    assert.equal(await page.locator(".field-row .badge").filter({hasText:/^Renamed$/}).count(),0);
+    // The saved field still asks before its data is removed.
+    await page.getByRole("button",{name:"Remove price",exact:true}).click();
+    await page.getByRole("dialog").getByRole("button",{name:"Cancel",exact:true}).click();await page.getByRole("dialog").waitFor({state:"detached"});
+    await page.getByRole("button",{name:"Save fields",exact:true}).click();await page.getByText("Changes saved",{exact:true}).waitFor();
+    // The row just saved stays open; the six saved rows stay collapsed.
+    assert.equal(await page.locator(".field-row.collapsed").count(),6);
+    assert.equal(await page.locator(".field-row").nth(6).getByLabel("Name",{exact:true}).inputValue(),"price_total");
+    const pricedSchema=await(await page.request.get(base+`/api/v1/collections/${priced.id}`)).json();
+    assert.deepEqual(pricedSchema.blueprint.fields.map(f=>f.name),["title","price","a","b","c","d","price_total"]);
+    const pricedRead=await(await page.request.get(base+`/api/v1/collections/${priced.id}/documents/${pricedDoc.id}`)).json();
+    assert.equal(pricedRead.body.price,5);assert(!("price_total" in pricedRead.body));
+    await page.goto(base+`/collections/${id}`);
     await page.getByRole("button",{name:"Records",exact:true}).click();
     await page.getByRole("columnheader",{name:"Product name",exact:true}).waitFor();
     await page.getByRole("link",{name:"Notebook →",exact:true}).click();

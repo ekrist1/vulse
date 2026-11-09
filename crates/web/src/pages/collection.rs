@@ -7,6 +7,7 @@ use crate::{
     formula_builder::FormulaEditor,
     import::ImportPanel,
 };
+use std::collections::BTreeSet;
 use vulse_model::{
     ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType, Role,
     UpdateCollection, Visibility,
@@ -50,6 +51,8 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             .unwrap_or("signedout"),
         props.id
     );
+    // The editor rows, with the saved field each one edits (see `mark_saved`).
+    // Drafts keep these markers.
     let edited = Blueprint {
         fields: (*fields).clone(),
         title_field: if title_field.is_empty() {
@@ -58,9 +61,17 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             Some((*title_field).clone())
         },
     };
+    // The blueprint as the server reads it.
+    let unmarked = Blueprint {
+        fields: strip_self_marks(&fields),
+        title_field: edited.title_field.clone(),
+    };
     let dirty = collection
         .as_ref()
-        .is_some_and(|c| c.name != *name || c.visibility != *visibility || c.blueprint != edited);
+        .is_some_and(|c| c.name != *name || c.visibility != *visibility || c.blueprint != unmarked);
+    // Collapsed field rows (see `BlueprintEditor`), kept here so each row
+    // stays open or collapsed across a save.
+    let collapsed = use_state(|| None::<BTreeSet<String>>);
     let latest = use_mut_ref(|| {
         (
             String::new(),
@@ -71,7 +82,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             },
         )
     });
-    *latest.borrow_mut() = ((*name).clone(), *visibility, edited.clone());
+    *latest.borrow_mut() = ((*name).clone(), *visibility, unmarked);
     // Formulas can read other collections, which may have been created or
     // changed since this page loaded.
     {
@@ -103,12 +114,14 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let draft_error = draft_error.clone();
         let key = draft_key.clone();
         let draft_version = draft_version.clone();
+        let collapsed = collapsed.clone();
         let authed = session.state.user.is_some();
         use_effect_with((id.clone(), authed, *refresh), move |(id, authed, _)| {
             if !*authed {
                 return;
             }
             collection.set(None);
+            collapsed.set(None);
             tab.set("data".into());
             error.set(String::new());
             let id = id.clone();
@@ -122,7 +135,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                         }
                         name.set(item.name.clone());
                         visibility.set(item.visibility);
-                        fields.set(item.blueprint.fields.clone());
+                        fields.set(mark_saved(&item.blueprint.fields));
                         title_field.set(item.blueprint.title_field.clone().unwrap_or_default());
                         collection.set(Some(item));
                     }
@@ -184,11 +197,16 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let fields = fields.clone();
         let title_field = title_field.clone();
         let draft_version = draft_version.clone();
+        let collection = collection.clone();
         move |_| {
             if let Some(d) = (*pending).clone() {
+                let saved: Vec<String> = collection
+                    .as_ref()
+                    .map(|c| c.blueprint.fields.iter().map(|f| f.name.clone()).collect())
+                    .unwrap_or_default();
                 name.set(d.name);
                 visibility.set(d.visibility);
-                fields.set(d.blueprint.fields);
+                fields.set(adopt_saved_rows(d.blueprint.fields, &saved));
                 title_field.set(d.blueprint.title_field.unwrap_or_default());
                 draft_version.set(Some(d.version));
                 pending.set(None);
@@ -262,27 +280,16 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let draft_error = draft_error.clone();
         let confirm = confirm.clone();
         let confirmed_removals = confirmed_removals.clone();
+        let collapsed = collapsed.clone();
         Callback::from(move |_| {
             if *busy {
                 return;
             }
-            // Saved fields missing from the draft lose their stored values.
+            // Saved fields missing from the draft, or replaced by a rename
+            // onto their name, lose their stored values.
             let removed: Vec<String> = collection
                 .as_ref()
-                .map(|c| {
-                    c.blueprint
-                        .fields
-                        .iter()
-                        .filter(|f| f.kind != FieldType::Calculated)
-                        .filter(|f| !fields.iter().any(|next| next.name == f.name))
-                        .filter(|f| {
-                            !fields
-                                .iter()
-                                .any(|next| next.renamed_from.as_deref() == Some(f.name.as_str()))
-                        })
-                        .map(|f| f.name.clone())
-                        .collect()
-                })
+                .map(|c| removed_fields(&c.blueprint.fields, &fields))
                 .unwrap_or_default();
             // Saved fields (followed through renames) whose type changes.
             let retyped: Vec<String> = collection
@@ -326,7 +333,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                     } else {
                         Some((*title_field).clone())
                     },
-                    fields: (*fields).clone(),
+                    fields: strip_self_marks(&fields),
                 }),
                 remove_field_data: !removed.is_empty(),
                 convert_field_values: !retyped.is_empty(),
@@ -355,6 +362,16 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             let documents = documents.clone();
             let confirm = confirm.clone();
             let confirmed_removals = confirmed_removals.clone();
+            // The rows and which are collapsed, which cannot change while the
+            // save is pending: the editor is disabled.
+            let (rows_before, collapsed) = ((*fields).clone(), collapsed.clone());
+            let saved_before: Vec<String> = collection
+                .as_ref()
+                .map(|c| c.blueprint.fields.iter().map(|f| f.name.clone()).collect())
+                .unwrap_or_default();
+            let was_collapsed = (*collapsed)
+                .clone()
+                .unwrap_or_else(|| default_collapsed(&saved_before));
             wasm_bindgen_futures::spawn_local(async move {
                 // Renamed fields count as removed: their values do not move.
                 if !unconfirmed.is_empty() {
@@ -392,7 +409,17 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                         if *latest.borrow() == submitted {
                             name.set(item.name.clone());
                             visibility.set(item.visibility);
-                            fields.set(item.blueprint.fields.clone());
+                            let rows = mark_saved(&item.blueprint.fields);
+                            let saved_after: Vec<String> =
+                                rows.iter().map(|f| f.name.clone()).collect();
+                            collapsed.set(Some(carry_collapsed(
+                                &was_collapsed,
+                                &rows_before,
+                                &saved_before,
+                                &rows,
+                                &saved_after,
+                            )));
+                            fields.set(rows);
                             title_field.set(item.blueprint.title_field.clone().unwrap_or_default());
                             if let Err(e) = crate::drafts::clear(&key) {
                                 draft_error.set(e);
@@ -479,7 +506,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 if *tab=="data" {<crate::records::RecordsPanel key={item.id.clone()} collection={item.clone()} collections={(*collections).clone()}/>}
                 if *tab=="fields" {<fieldset class="draft-fields" disabled={*busy||pending.is_some()}>
                     <div class="section-heading"><div><h2>{"Shape your collection"}</h2><p class="muted">{"Choose the fields each record contains. Calculated fields update automatically."}</p></div><button disabled={*busy} onclick={on_save.clone()}>{if *busy{"Saving…"}else{"Save fields"}}</button></div>
-                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor collection_id={item.id.clone()} records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} saved_options={item.blueprint.fields.iter().filter_map(|f|Some((f.name.clone(),f.options.clone()?))).collect::<std::collections::BTreeMap<_,_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})}/>
+                    <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor collection_id={item.id.clone()} records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} saved_options={item.blueprint.fields.iter().filter_map(|f|Some((f.name.clone(),f.options.clone()?))).collect::<std::collections::BTreeMap<_,_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})} collapsed={(*collapsed).clone()} on_collapse={Callback::from({let collapsed=collapsed.clone();move |next|collapsed.set(Some(next))})}/>
                 </fieldset>}
                 if *tab=="import" {<ImportPanel key={props.id.clone()} collection={item.clone()} on_import={Callback::from({let refresh=refresh.clone();move |_|refresh.set(*refresh+1)})}/>}
                 if *tab=="api" {<CollectionApi collection={item.clone()}/>}
@@ -508,6 +535,9 @@ struct BlueprintEditorProps {
     /// A field name was committed: (previous name, new name).
     on_renamed: Callback<(String, String)>,
     on_change: Callback<Vec<FieldDef>>,
+    /// Collapsed rows by `collapse_key`, once any row was toggled.
+    collapsed: Option<BTreeSet<String>>,
+    on_collapse: Callback<BTreeSet<String>>,
 }
 
 #[function_component(BlueprintEditor)]
@@ -548,36 +578,31 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
             on_change.emit(next);
         })
     };
-    // Names of collapsed fields; saved fields start collapsed in long lists.
-    // A collapsed field cannot be renamed, so its name keeps identifying it.
-    let collapsed = use_state(|| None::<std::collections::BTreeSet<String>>);
-    let collapsed_names = (*collapsed).clone().unwrap_or_else(|| {
-        if props.saved_fields.len() > 5 {
-            props.saved_fields.iter().cloned().collect()
-        } else {
-            Default::default()
-        }
-    });
+    // Collapsed rows by `collapse_key`; saved fields start collapsed in long
+    // lists. Typing a name never changes the key of a saved row, and unsaved
+    // rows have keys of their own, so a row never collapses while edited.
+    let collapsed_keys = props
+        .collapsed
+        .clone()
+        .unwrap_or_else(|| default_collapsed(&props.saved_fields));
+    let keys: Vec<String> = props
+        .fields
+        .iter()
+        .map(|f| collapse_key(f, &props.saved_fields))
+        .collect();
     let set_all = |collapse: bool| {
-        let collapsed = collapsed.clone();
-        let names: std::collections::BTreeSet<String> =
-            props.fields.iter().map(|f| f.name.clone()).collect();
+        let on_collapse = props.on_collapse.clone();
+        let keys: BTreeSet<String> = keys.iter().cloned().collect();
         Callback::from(move |_| {
-            collapsed.set(Some(if collapse {
-                names.clone()
+            on_collapse.emit(if collapse {
+                keys.clone()
             } else {
                 Default::default()
-            }))
+            })
         })
     };
-    let all_open = props
-        .fields
-        .iter()
-        .all(|f| !collapsed_names.contains(&f.name));
-    let all_closed = props
-        .fields
-        .iter()
-        .all(|f| collapsed_names.contains(&f.name));
+    let all_open = keys.iter().all(|k| !collapsed_keys.contains(k));
+    let all_closed = keys.iter().all(|k| collapsed_keys.contains(k));
     html! {
         <section class="card">
             <div class="fields-heading">
@@ -593,32 +618,28 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                 <p class="muted">{"Add your first field to start shaping your records."}</p>
             }
             { for props.fields.iter().enumerate().map(|(index, field)| {
-                let origin = field.renamed_from.clone().or_else(|| {
-                    // A saved name claimed by a renamed row belongs to that row.
-                    (props.saved_fields.contains(&field.name)
-                        && !props.fields.iter().any(|f| f.renamed_from.as_deref() == Some(field.name.as_str())))
-                    .then(|| field.name.clone())
-                });
+                let origin = row_origin(field, &props.saved_fields);
                 let saved_options = origin
                     .as_ref()
                     .and_then(|name| props.saved_options.get(name))
                     .cloned()
                     .unwrap_or_default();
+                let key = keys[index].clone();
+                let open = !collapsed_keys.contains(&key);
                 let on_toggle = {
-                    let collapsed = collapsed.clone();
-                    let names = collapsed_names.clone();
-                    let name = field.name.clone();
+                    let on_collapse = props.on_collapse.clone();
+                    let keys = collapsed_keys.clone();
                     Callback::from(move |_| {
-                        let mut next = names.clone();
-                        if !next.remove(&name) {
-                            next.insert(name.clone());
+                        let mut next = keys.clone();
+                        if !next.remove(&key) {
+                            next.insert(key.clone());
                         }
-                        collapsed.set(Some(next));
+                        on_collapse.emit(next);
                     })
                 };
                 html! {
                     <FieldRow
-                        open={!collapsed_names.contains(&field.name)}
+                        {open}
                         {on_toggle}
                         key={index}
                         records={props.records.clone()}
@@ -639,6 +660,147 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
             <div class="row"><button type="button" onclick={add}>{"Add field"}</button><FieldsFromFile collection_id={props.collection_id.clone()} fields={props.fields.clone()} on_add={add_many}/></div>
         </section>
     }
+}
+
+// Fields have no id; the server knows a field by its name, and `renamed_from`
+// in an update moves a saved field's values to a new name. In the editor every
+// row edited from a saved field keeps that field's saved name in
+// `renamed_from`, even while the name is unchanged (a self-marker), and rows
+// added in the editor have none. A row's identity therefore never follows the
+// name it currently holds, so typing a new field's name through a saved name
+// cannot turn it into that field. Self-markers are removed before comparing
+// with or sending to the server.
+
+/// Saved fields as editor rows, each marked as editing itself.
+fn mark_saved(fields: &[FieldDef]) -> Vec<FieldDef> {
+    fields
+        .iter()
+        .cloned()
+        .map(|mut field| {
+            field.renamed_from = Some(field.name.clone());
+            field
+        })
+        .collect()
+}
+
+/// Editor rows as the server reads them: self-markers removed.
+fn strip_self_marks(fields: &[FieldDef]) -> Vec<FieldDef> {
+    fields
+        .iter()
+        .cloned()
+        .map(|mut field| {
+            if field.renamed_from.as_deref() == Some(field.name.as_str()) {
+                field.renamed_from = None;
+            }
+            field
+        })
+        .collect()
+}
+
+/// Rows of a restored draft. Drafts from before self-markers mark only
+/// renamed rows, so an unmarked row named like a saved field that no other
+/// row edits is taken to be that field. Only done once, on restore; while
+/// editing, a row's name never decides what it is.
+fn adopt_saved_rows(fields: Vec<FieldDef>, saved: &[String]) -> Vec<FieldDef> {
+    let mut claimed: std::collections::BTreeSet<String> = fields
+        .iter()
+        .filter_map(|f| f.renamed_from.clone())
+        .collect();
+    fields
+        .into_iter()
+        .map(|mut field| {
+            if field.renamed_from.is_none()
+                && saved.contains(&field.name)
+                && claimed.insert(field.name.clone())
+            {
+                field.renamed_from = Some(field.name.clone());
+            }
+            field
+        })
+        .collect()
+}
+
+/// The saved field a row edits, under its saved name. A marker naming a field
+/// the collection no longer has (a draft saved against an older version)
+/// edits nothing.
+fn row_origin(field: &FieldDef, saved: &[String]) -> Option<String> {
+    field
+        .renamed_from
+        .clone()
+        .filter(|origin| saved.contains(origin))
+}
+
+/// The saved name a row is renamed from, if its name changed.
+fn renamed_from(field: &FieldDef) -> Option<&str> {
+    field
+        .renamed_from
+        .as_deref()
+        .filter(|from| *from != field.name)
+}
+
+fn saved_key(name: &str) -> String {
+    format!("saved:{name}")
+}
+
+/// Identifies a row's collapsed state: saved rows by the field they edit,
+/// unsaved rows by name in a separate namespace. A collapsed row hides its
+/// name input, so its name, and key, stay put until it is expanded. Only two
+/// unsaved rows with the same (invalid, duplicate) name share a state.
+fn collapse_key(field: &FieldDef, saved: &[String]) -> String {
+    match row_origin(field, saved) {
+        Some(origin) => saved_key(&origin),
+        None => format!("new:{}", field.name),
+    }
+}
+
+/// Saved stored fields whose values are deleted when `fields` is saved, as the
+/// server decides: those no row keeps by name or renames, and those whose name
+/// another saved field is renamed to.
+fn removed_fields(saved: &[FieldDef], fields: &[FieldDef]) -> Vec<String> {
+    let fields = strip_self_marks(fields);
+    let renamed = |name: &str| {
+        fields
+            .iter()
+            .any(|f| f.renamed_from.as_deref() == Some(name))
+    };
+    let kept = |name: &str| {
+        fields
+            .iter()
+            .any(|f| f.name == name && f.renamed_from.is_none())
+    };
+    saved
+        .iter()
+        .filter(|f| f.kind != FieldType::Calculated)
+        .filter(|f| !renamed(&f.name) && !kept(&f.name))
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// Collapsed rows before any are toggled: saved fields, in long lists.
+fn default_collapsed(saved: &[String]) -> BTreeSet<String> {
+    if saved.len() > 5 {
+        saved.iter().map(|name| saved_key(name)).collect()
+    } else {
+        Default::default()
+    }
+}
+
+/// The collapsed keys for `after`, the rows `before` as reloaded after a save
+/// (in the same order), so each row stays collapsed or open as it was. A row
+/// the save created changes key from `new:{name}` to `saved:{name}`.
+fn carry_collapsed(
+    collapsed: &BTreeSet<String>,
+    before: &[FieldDef],
+    saved_before: &[String],
+    after: &[FieldDef],
+    saved_after: &[String],
+) -> BTreeSet<String> {
+    before
+        .iter()
+        .zip(after)
+        .filter(|(row, _)| collapsed.contains(&collapse_key(row, saved_before)))
+        .map(|(_, row)| collapse_key(row, saved_after))
+        .collect()
 }
 
 #[derive(Properties, PartialEq)]
@@ -800,7 +962,7 @@ fn field_row(props: &FieldRowProps) -> Html {
                 }
                 <span class="badge">{type_label}</span>
                 if field.required {<span class="badge">{"Required"}</span>}
-                if field.renamed_from.is_some() {<span class="badge">{"Renamed"}</span>}
+                if renamed_from(&field).is_some() {<span class="badge">{"Renamed"}</span>}
             </button>
             <div class="row field-actions">
                 <button class="secondary" type="button" aria-label={format!("Move {title} up")} disabled={props.index == 0} onclick={Callback::from({
@@ -829,17 +991,16 @@ fn field_row(props: &FieldRowProps) -> Html {
                 })} oninput={Callback::from({
                     let patch = patch.clone();
                     let field = field.clone();
-                    let origin = props.origin.clone();
                     move |event: InputEvent| {
                         let element: HtmlInputElement = event.target_unchecked_into();
                         let mut next = field.clone();
+                        // `renamed_from` keeps naming the saved field this row
+                        // edits, so its data moves to the new name on save.
                         next.name = element.value().to_ascii_lowercase();
-                        // Renaming a saved field moves its data on save.
-                        next.renamed_from = origin.clone().filter(|o| *o != next.name);
                         patch.emit(next);
                     }
                 })} onchange={commit_name} />
-                if let Some(from) = &field.renamed_from {
+                if let Some(from) = renamed_from(&field) {
                     <span class="field-help">{format!("Renamed from “{from}”. Values, formulas and saved views follow the new name when you save.")}</span>
                 }
             </label>
@@ -1277,4 +1438,179 @@ fn type_label(kind: FieldType) -> &'static str {
         .find(|(value, _)| *value == type_value(kind))
         .map(|(_, label)| *label)
         .unwrap_or("value")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(name: &str, kind: FieldType) -> FieldDef {
+        FieldDef {
+            label: None,
+            description: None,
+            example: None,
+            name: name.into(),
+            required: false,
+            kind,
+            collection: None,
+            items: None,
+            formula: None,
+            renamed_from: None,
+            number_format: None,
+            options: None,
+            renamed_options: None,
+        }
+    }
+
+    fn names(fields: &[FieldDef]) -> Vec<String> {
+        fields.iter().map(|f| f.name.clone()).collect()
+    }
+
+    #[test]
+    fn typing_a_new_fields_name_through_a_saved_name_keeps_both_identities() {
+        let saved = vec![field("price", FieldType::Number)];
+        let saved_names = names(&saved);
+        let mut rows = mark_saved(&saved);
+        rows.push(field("field_2", FieldType::String));
+        // The Name input only sets the name, one keystroke at a time.
+        for typed in ["", "p", "pr", "price", "price_", "price_total"] {
+            rows[1].name = typed.into();
+            assert_eq!(rows[1].renamed_from, None, "{typed}");
+            assert_eq!(row_origin(&rows[1], &saved_names), None, "{typed}");
+            assert_eq!(row_origin(&rows[0], &saved_names).as_deref(), Some("price"));
+            assert_eq!(renamed_from(&rows[0]), None);
+            assert_eq!(renamed_from(&rows[1]), None);
+            // A collapsed saved row never collapses the row being typed in.
+            assert_ne!(
+                collapse_key(&rows[1], &saved_names),
+                collapse_key(&rows[0], &saved_names)
+            );
+        }
+        assert!(removed_fields(&saved, &rows).is_empty());
+        let sent = strip_self_marks(&rows);
+        assert!(sent.iter().all(|f| f.renamed_from.is_none()));
+        assert_eq!(names(&sent), ["price", "price_total"]);
+    }
+
+    #[test]
+    fn renaming_a_saved_field_keeps_its_origin_and_key() {
+        let saved = vec![field("price", FieldType::Number)];
+        let saved_names = names(&saved);
+        let mut rows = mark_saved(&saved);
+        let key = collapse_key(&rows[0], &saved_names);
+        rows[0].name = "cost".into();
+        assert_eq!(row_origin(&rows[0], &saved_names).as_deref(), Some("price"));
+        assert_eq!(renamed_from(&rows[0]), Some("price"));
+        assert_eq!(collapse_key(&rows[0], &saved_names), key);
+        assert_eq!(
+            strip_self_marks(&rows)[0].renamed_from.as_deref(),
+            Some("price")
+        );
+        assert!(removed_fields(&saved, &rows).is_empty());
+        // Back to its saved name, it is no longer a rename.
+        rows[0].name = "price".into();
+        assert_eq!(renamed_from(&rows[0]), None);
+        assert_eq!(strip_self_marks(&rows), saved);
+    }
+
+    #[test]
+    fn legacy_drafts_adopt_unclaimed_saved_names_once() {
+        let saved = names(&[
+            field("title", FieldType::String),
+            field("price", FieldType::Number),
+            field("memo", FieldType::String),
+        ]);
+        let mut renamed = field("cost", FieldType::Number);
+        renamed.renamed_from = Some("price".into());
+        // Written before self-markers: only the rename is marked. The new
+        // `price` row is not the saved `price`, which `cost` edits; of two
+        // rows named `title` only the first is the saved one.
+        let draft = vec![
+            field("title", FieldType::String),
+            renamed,
+            field("price", FieldType::String),
+            field("title", FieldType::String),
+            field("extra", FieldType::String),
+        ];
+        let rows = adopt_saved_rows(draft, &saved);
+        let origins: Vec<Option<String>> = rows.iter().map(|f| row_origin(f, &saved)).collect();
+        assert_eq!(
+            origins,
+            [Some("title".into()), Some("price".into()), None, None, None]
+        );
+        // A draft with self-markers is restored as written.
+        let marked = mark_saved(&[field("title", FieldType::String)]);
+        assert_eq!(adopt_saved_rows(marked.clone(), &saved), marked);
+    }
+
+    #[test]
+    fn stale_markers_edit_nothing() {
+        let rows = mark_saved(&[field("gone", FieldType::String)]);
+        assert_eq!(row_origin(&rows[0], &["other".into()]), None);
+        assert_eq!(collapse_key(&rows[0], &["other".into()]), "new:gone");
+        assert_eq!(strip_self_marks(&rows)[0].renamed_from, None);
+    }
+
+    #[test]
+    fn renaming_onto_a_saved_name_removes_the_replaced_field() {
+        let saved = vec![
+            field("a", FieldType::Number),
+            field("b", FieldType::String),
+            field("c", FieldType::Calculated),
+        ];
+        let mut rows = mark_saved(&saved[..1]);
+        rows[0].name = "b".into();
+        assert_eq!(removed_fields(&saved, &rows), ["b"]);
+        // Plain removals still count, calculated fields never do.
+        assert_eq!(removed_fields(&saved, &[]), ["a", "b"]);
+        assert_eq!(
+            removed_fields(&saved, &mark_saved(&saved)),
+            Vec::<String>::new()
+        );
+    }
+
+    fn keys(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn rows_stay_open_or_collapsed_across_a_save() {
+        // Five saved fields start open; a sixth, added and saved, would make
+        // them all start collapsed, the new row included. Nothing was
+        // toggled, so every row stays open.
+        let saved: Vec<FieldDef> = ["a", "b", "c", "d", "e"]
+            .map(|name| field(name, FieldType::String))
+            .to_vec();
+        let mut rows = mark_saved(&saved);
+        rows.push(field("f", FieldType::String));
+        // The server returns the fields as sent, in order; reloading marks them.
+        let after = mark_saved(&rows);
+        let before_names = names(&saved);
+        let after_names = names(&after);
+        assert!(default_collapsed(&after_names).contains("saved:f"));
+        let was = default_collapsed(&before_names);
+        assert!(was.is_empty());
+        assert!(carry_collapsed(&was, &rows, &before_names, &after, &after_names).is_empty());
+
+        // In a long list: a renamed saved row the user opened stays open, a
+        // collapsed new row stays collapsed, an open new row stays open.
+        let saved: Vec<FieldDef> = ["a", "b", "c", "d", "e", "f"]
+            .map(|name| field(name, FieldType::String))
+            .to_vec();
+        let mut rows = mark_saved(&saved);
+        rows[0].name = "a2".into();
+        rows.push(field("g", FieldType::String));
+        rows.push(field("h", FieldType::String));
+        let collapsed = keys(&[
+            "saved:b", "saved:c", "saved:d", "saved:e", "saved:f", "new:g",
+        ]);
+        let after = mark_saved(&rows);
+        assert_eq!(names(&after), ["a2", "b", "c", "d", "e", "f", "g", "h"]);
+        assert_eq!(
+            carry_collapsed(&collapsed, &rows, &names(&saved), &after, &names(&after)),
+            keys(&[
+                "saved:b", "saved:c", "saved:d", "saved:e", "saved:f", "saved:g"
+            ])
+        );
+    }
 }

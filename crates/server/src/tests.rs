@@ -3773,6 +3773,97 @@ async fn renaming_fields_moves_values_formulas_titles_and_views() {
 }
 
 #[tokio::test]
+async fn renaming_onto_a_saved_fields_name_removes_that_fields_data() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "replace@example.com", "replace").await;
+    let items = create_collection(
+        &app,
+        &cookie,
+        "items",
+        "private",
+        json!({"fields":[
+            {"name":"title","type":"string"},
+            {"name":"a","type":"number"},
+            {"name":"b","type":"string"}
+        ]}),
+    )
+    .await;
+    let collection = format!("/api/v1/collections/{}", items.id);
+    let both = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"both","a":1,"b":"old b"}),
+    )
+    .await;
+    let only_b = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"only b","b":"stale"}),
+    )
+    .await;
+    // `a` takes over the name `b`; the saved `b` is replaced. The new `b` has
+    // `a`'s type, so nothing is converted: only `b`'s values are deleted.
+    let replaced = json!({"fields":[
+        {"name":"title","type":"string"},
+        {"name":"b","type":"number","renamed_from":"a"}
+    ]});
+    let (status, body) = json_of::<Value>(
+        app.call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":replaced})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("remove_field_data") && message.contains("'b' (2 records)"),
+        "{message}"
+    );
+    let read = |id: String| {
+        let app = &app;
+        let cookie = cookie.clone();
+        let path = format!("{collection}/documents/{id}");
+        async move {
+            json_of::<DocumentView>(app.call("GET", &path, Some(&cookie), None, None).await)
+                .await
+                .1
+        }
+    };
+    // Refused before anything changed.
+    assert_eq!(read(both.id.clone()).await.body["b"], "old b");
+    assert_eq!(read(only_b.id.clone()).await.body["b"], "stale");
+
+    let (status, saved) = json_of::<CollectionView>(
+        app.call(
+            "PATCH",
+            &collection,
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":replaced,"remove_field_data":true})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = saved.blueprint.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["title", "b"]);
+    let moved = read(both.id.clone()).await;
+    assert_eq!(moved.body["b"], 1);
+    assert!(moved.body.get("a").is_none());
+    let lacking = read(only_b.id.clone()).await;
+    assert!(lacking.body.get("b").is_none(), "{:?}", lacking.body);
+    assert!(lacking.body.get("a").is_none());
+    assert_eq!(lacking.body["title"], "only b");
+}
+
+#[tokio::test]
 async fn exports_include_columns_from_related_records() {
     let app = TestApp::new().await;
     let (cookie, _) = register(&app, "related@example.com", "related").await;

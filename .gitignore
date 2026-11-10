@@ -7,3 +7,4 @@ crates/web/node_modules
 crates/web/editor-assets
 /release
 .env
+/.claude/worktrees

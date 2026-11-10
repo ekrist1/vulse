@@ -316,4 +316,28 @@ async fn bench_large_collection() {
         "\nadd a field (rebuilds the table)      {:>9}",
         ms(started.elapsed())
     );
+    // Renaming a field moves its value in every record that has one.
+    let city = fields["fields"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|f| f["name"] == "city")
+        .unwrap();
+    city["name"] = json!("town");
+    city["renamed_from"] = json!("city");
+    let started = Instant::now();
+    let response = app
+        .call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", main.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint": fields})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    println!(
+        "rename a field (rewrites the records)  {:>9}",
+        ms(started.elapsed())
+    );
 }

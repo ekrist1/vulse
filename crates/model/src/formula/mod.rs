@@ -193,33 +193,53 @@ pub fn calculate_document_with(
     body: &Value,
     lookups: &Lookups,
 ) -> (Value, BTreeMap<String, String>) {
-    let mut out = body.as_object().cloned().unwrap_or_default();
-    let mut errors = BTreeMap::new();
-    let expressions = match compile(bp) {
-        Ok(e) => e,
-        Err(e) => {
-            errors.insert("blueprint".into(), e);
-            return (Value::Object(out), errors);
-        }
-    };
-    let ctx = Ctx {
-        all: &expressions,
-        body,
-        lookups,
-    };
-    let mut cache = HashMap::new();
-    for n in expressions.keys() {
-        match resolve(n, &ctx, &mut cache) {
-            Ok(v) => {
-                out.insert(n.clone(), v);
-            }
-            Err(e) => {
-                out.insert(n.clone(), Value::Null);
-                errors.insert(n.clone(), e);
-            }
+    CompiledFormulas::new(bp).calculate(body, lookups)
+}
+
+/// A blueprint's formulas, parsed and checked once, for calculating many
+/// records with the same blueprint.
+#[derive(Clone, Debug)]
+pub struct CompiledFormulas {
+    expressions: Result<HashMap<String, Expr>, String>,
+}
+
+impl CompiledFormulas {
+    pub fn new(bp: &Blueprint) -> Self {
+        Self {
+            expressions: compile(bp),
         }
     }
-    (Value::Object(out), errors)
+
+    /// What `calculate_document_with` returns for the compiled blueprint.
+    pub fn calculate(&self, body: &Value, lookups: &Lookups) -> (Value, BTreeMap<String, String>) {
+        let mut out = body.as_object().cloned().unwrap_or_default();
+        let mut errors = BTreeMap::new();
+        let expressions = match &self.expressions {
+            Ok(e) => e,
+            Err(e) => {
+                errors.insert("blueprint".into(), e.clone());
+                return (Value::Object(out), errors);
+            }
+        };
+        let ctx = Ctx {
+            all: expressions,
+            body,
+            lookups,
+        };
+        let mut cache = HashMap::new();
+        for n in expressions.keys() {
+            match resolve(n, &ctx, &mut cache) {
+                Ok(v) => {
+                    out.insert(n.clone(), v);
+                }
+                Err(e) => {
+                    out.insert(n.clone(), Value::Null);
+                    errors.insert(n.clone(), e);
+                }
+            }
+        }
+        (Value::Object(out), errors)
+    }
 }
 pub fn source_document(bp: &Blueprint, body: &Value) -> Value {
     let mut out = body.clone();

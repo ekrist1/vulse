@@ -1,6 +1,6 @@
 use crate::{
     auth::{AuthUser, Editor},
-    content::{materialize, workspace_collection},
+    content::{materialize_with, workspace_collection},
     db::{Conn, SqlValue, int_at, text_at},
     error::{AppError, unique_message},
     state::AppState,
@@ -19,13 +19,24 @@ fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.into())
 }
 
+/// Rebuilds a collection's record table and links from `records`, every
+/// record of the collection, or from the stored records when not given.
 pub async fn sync_collection_cells(
     conn: &Conn,
     id: &str,
     blueprint: &Blueprint,
+    records: Option<&[crate::rows::Record]>,
 ) -> anyhow::Result<()> {
+    let stored;
+    let records = match records {
+        Some(records) => records,
+        None => {
+            stored = store::list_records(conn, id).await?;
+            &stored
+        }
+    };
     let lookups = crate::lookups::load(conn, blueprint).await?;
-    crate::rows::rebuild(conn, id, blueprint, &lookups).await?;
+    crate::rows::rebuild(conn, id, blueprint, &lookups, records).await?;
     // Links are rewritten, which also drops those of removed fields.
     conn.execute(
         "DELETE FROM document_links WHERE source_id IN (SELECT id FROM documents WHERE collection_id=?1)",
@@ -35,8 +46,11 @@ pub async fn sync_collection_cells(
     if !crate::relationships::has_links(blueprint) {
         return Ok(());
     }
-    let records = store::list_document_bodies(conn, id).await?;
-    crate::relationships::insert_many(conn, id, blueprint, &records).await
+    let links: Vec<_> = records
+        .iter()
+        .map(|(doc, _, _, body)| (doc.as_str(), body))
+        .collect();
+    crate::relationships::insert_many(conn, id, blueprint, &links).await
 }
 /// The `workspace_settings` key holding the `rows::VERSION` the record
 /// tables were built with.
@@ -72,7 +86,7 @@ pub async fn rebuild_tables(conn: &Conn, only: Option<&str>) -> anyhow::Result<V
                 let Some(collection) = store::find_collection(conn, &id).await? else {
                     return Ok(None);
                 };
-                sync_collection_cells(conn, &id, &collection.blueprint).await?;
+                sync_collection_cells(conn, &id, &collection.blueprint, None).await?;
                 conn.changed(&id);
                 // Tables whose formulas read a repaired collection may hold
                 // values calculated from its old bodies. Rebuilding every
@@ -169,19 +183,21 @@ pub async fn sync_stored_document(
     id: &str,
     body: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    let rows = conn
-        .query(
-            "SELECT blueprint FROM collections WHERE id=?1",
-            &[text(collection)],
-        )
-        .await?;
-    let row = rows
-        .first()
+    let stored = store::stored_collection(conn, collection)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
-    let blueprint = serde_json::from_str(&text_at(row, 0)?)?;
-    let lookups = crate::lookups::load(conn, &blueprint).await?;
-    crate::rows::sync(conn, collection, &blueprint, &lookups, id, body).await?;
-    crate::relationships::sync(conn, collection, id, &blueprint, body).await
+    let lookups = crate::lookups::load(conn, &stored.blueprint).await?;
+    crate::rows::sync(
+        conn,
+        collection,
+        &stored.blueprint,
+        &stored.formulas,
+        &lookups,
+        id,
+        body,
+    )
+    .await?;
+    crate::relationships::sync(conn, collection, &stored.name, id, &stored.blueprint, body).await
 }
 
 fn parameter(params: &mut Vec<SqlValue>, value: SqlValue) -> String {
@@ -370,8 +386,9 @@ pub(crate) async fn run_query(
         }
     }
     let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+    let formulas = vulse_model::CompiledFormulas::new(&collection.blueprint);
     for doc in &mut items {
-        materialize(&collection.blueprint, &lookups, doc);
+        materialize_with(&formulas, &lookups, doc);
     }
     Ok(RecordPage {
         items,

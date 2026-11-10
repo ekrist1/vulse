@@ -73,7 +73,7 @@ cms.example.com {
 }
 ```
 
-Then run `sudo systemctl reload caddy`. With any proxy, set these variables for Vulse:
+Then run `sudo systemctl reload caddy`. Vulse compresses its own responses (gzip or brotli for the admin's files and JSON), so the proxy does not need an `encode` directive. With any proxy, set these variables for Vulse:
 
 ```bash
 VULSE_PUBLIC_URL=https://cms.example.com

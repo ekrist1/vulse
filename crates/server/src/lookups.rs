@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use vulse_model::{
-    Blueprint, CollectionView, FieldType, LookupColumn, Lookups, formula_lookups, lookup_references,
+    Blueprint, CollectionView, CompiledFormulas, FieldType, LookupColumn, Lookups, formula_lookups,
+    lookup_references,
 };
 
 use crate::db::{Conn, SqlValue, int_at, text_at};
@@ -113,12 +114,13 @@ async fn columns(
             .iter()
             .any(|d| d.name == **f && d.kind == FieldType::Calculated)
     });
+    let formulas = calculated.then(|| CompiledFormulas::new(&collection.blueprint));
     let mut values: Vec<Vec<serde_json::Value>> =
         vec![Vec::with_capacity(rows.len()); fields.len()];
     for row in &rows {
         let mut body: serde_json::Value = serde_json::from_str(&text_at(row, 0)?)?;
-        if calculated {
-            body = vulse_model::calculate_document(&collection.blueprint, &body).0;
+        if let Some(formulas) = &formulas {
+            body = formulas.calculate(&body, &Lookups::default()).0;
         }
         for (index, field) in fields.iter().enumerate() {
             values[index].push(body.get(*field).cloned().unwrap_or_default());

@@ -37,7 +37,10 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{Extensions, HeaderMap, StatusCode, Version, header};
 use axum::routing::{delete, get, patch, post};
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
@@ -46,6 +49,9 @@ use crate::security::Throttle;
 use crate::state::{AppState, AuthSettings};
 
 const JSON_BODY_LIMIT: usize = 1024 * 1024;
+/// Smaller responses fit in a packet or two either way, so compressing
+/// them costs more than it saves.
+const COMPRESS_MIN_BYTES: u16 = 1024;
 
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -263,9 +269,6 @@ pub fn app(state: AppState) -> Router {
         security::same_origin_writes,
     ));
     let mut router = Router::new().nest("/api/v1", api);
-    if state.mcp {
-        router = router.merge(mcp::router(&state)).merge(oauth::routes());
-    }
     if web_dist.join("index.html").is_file() {
         let index = web_dist.join("index.html");
         let serve = ServeDir::new(&web_dist).fallback(ServeFile::new(index));
@@ -276,9 +279,50 @@ pub fn app(state: AppState) -> Router {
             router = router.fallback(web::serve);
         }
     }
+    // Covers the API and the admin's files, but not MCP and its OAuth
+    // routes merged below: rmcp may answer as a stream, which must reach
+    // the client unbuffered.
+    router = router.layer(compression());
+    if state.mcp {
+        router = router.merge(mcp::router(&state)).merge(oauth::routes());
+    }
     router
         .layer(axum::middleware::from_fn(security::page_headers))
         .with_state(state)
+}
+
+/// gzip or brotli, as the client's `Accept-Encoding` prefers. The default
+/// levels (brotli 4, gzip 6) are the ones nginx uses on the fly: cheap per
+/// request, and the admin's files mostly revalidate with a 304 anyway.
+fn compression() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new().compress_when(SizeAbove::new(COMPRESS_MIN_BYTES).and(compressible))
+}
+
+/// Text formats only. Uploads (images, video, audio, PDF) and backups (zip)
+/// are already compressed, and Server-Sent Events must go out as each event
+/// is written. The layer itself never compresses range responses.
+fn compressible(_: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match essence.as_str() {
+        "text/event-stream" => false,
+        "application/json"
+        | "application/javascript"
+        | "application/wasm"
+        | "application/xml"
+        | "image/svg+xml" => true,
+        other => other.starts_with("text/") || other.ends_with("+json") || other.ends_with("+xml"),
+    }
 }
 
 fn api() -> Router<AppState> {

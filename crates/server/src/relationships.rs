@@ -25,19 +25,27 @@ pub async fn all_collections(conn: &Conn) -> anyhow::Result<Vec<CollectionView>>
         }
     }
 }
+/// Rewrites a record's links. `name` is the name of its collection.
 pub async fn sync(
     conn: &Conn,
     collection: &str,
+    name: &str,
     document: &str,
     blueprint: &Blueprint,
     body: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    // Records without link fields have no links to remove: deleting a record
+    // deletes its links, and changing a collection's link fields rewrites the
+    // links of all its records (`records::sync_collection_cells`).
+    if !has_links(blueprint) {
+        return Ok(());
+    }
     conn.execute(
         "DELETE FROM document_links WHERE source_id=?1",
         &[text(document)],
     )
     .await?;
-    let mut targets = Targets::new(conn, collection).await?;
+    let mut targets = Targets::new(name);
     for (field, kind, target_collection, target) in
         record_links(conn, collection, blueprint, body, &mut targets).await?
     {
@@ -52,15 +60,20 @@ pub(crate) async fn insert_many(
     conn: &Conn,
     collection: &str,
     blueprint: &Blueprint,
-    records: &[(String, serde_json::Value)],
+    records: &[(&str, &serde_json::Value)],
 ) -> anyhow::Result<()> {
     if !has_links(blueprint) {
         return Ok(());
     }
-    let mut targets = Targets::new(conn, collection).await?;
+    let name = store::stored_collection(conn, collection)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing collection"))?
+        .name
+        .clone();
+    let mut targets = Targets::new(&name);
     let mut params = Vec::new();
     let mut tuples = Vec::new();
-    for (document, body) in records {
+    for &(document, body) in records {
         for (field, kind, target_collection, target) in
             record_links(conn, collection, blueprint, body, &mut targets).await?
         {
@@ -116,20 +129,12 @@ struct Targets {
 }
 
 impl Targets {
-    async fn new(conn: &Conn, collection: &str) -> anyhow::Result<Self> {
-        let rows = conn
-            .query(
-                "SELECT name FROM collections WHERE id=?1",
-                &[text(collection)],
-            )
-            .await?;
-        let row = rows
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
-        Ok(Self {
-            name: text_at(row, 0)?,
+    /// `name` is the name of the linking records' collection.
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
             ids: Default::default(),
-        })
+        }
     }
 }
 
@@ -212,13 +217,14 @@ async fn insert_link(
 }
 pub async fn rebuild(conn: &Conn) -> anyhow::Result<()> {
     for row in conn
-        .query("SELECT id,blueprint FROM collections", &[])
+        .query("SELECT id,name,blueprint FROM collections", &[])
         .await?
     {
         let id = text_at(&row, 0)?;
-        let blueprint = serde_json::from_str(&text_at(&row, 1)?)?;
+        let name = text_at(&row, 1)?;
+        let blueprint = serde_json::from_str(&text_at(&row, 2)?)?;
         for (doc, body) in store::list_document_bodies(conn, &id).await? {
-            sync(conn, &id, &doc, &blueprint, &body).await?;
+            sync(conn, &id, &name, &doc, &blueprint, &body).await?;
         }
     }
     Ok(())

@@ -148,6 +148,7 @@ async fn merge_collection_namespaces(conn: &Conn) -> anyhow::Result<()> {
                 ],
             )
             .await?;
+            conn.collections_changed();
         }
     }
     conn.execute(

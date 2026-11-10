@@ -21,6 +21,9 @@ struct Snapshot {
 fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.into())
 }
+/// How long an undo stays available. Older snapshots are deleted by
+/// `store::purge_expired`.
+pub(crate) const UNDO_HOURS: i64 = 24;
 pub(crate) fn check_version(
     document: &DocumentView,
     expected: Option<&str>,
@@ -246,7 +249,7 @@ pub(crate) async fn run_undo(
         let collection=workspace_collection(conn,principal,id).await?;
         let rows=conn.query("SELECT snapshot,created_at FROM record_actions WHERE id=?1 AND collection_id=?2",&[text(action_id),text(id)]).await?;let row=rows.first().ok_or(AppError::NotFound)?;
         let time=chrono::DateTime::parse_from_rfc3339(&text_at(row,1)?).map_err(anyhow::Error::from)?;
-        if chrono::Utc::now().signed_duration_since(time).num_hours()>=24{return Err(AppError::conflict("This undo action has expired."));}
+        if chrono::Utc::now().signed_duration_since(time).num_hours()>=UNDO_HOURS{return Err(AppError::conflict("This undo action has expired."));}
         let snapshot:Snapshot=serde_json::from_str(&text_at(row,0)?).map_err(anyhow::Error::from)?;
         for doc in &snapshot.after {let current=store::find_document(conn,id,&doc.id).await?.ok_or_else(||AppError::conflict("An affected record has since been deleted."))?;if current.updated_at!=doc.updated_at||current.body!=doc.body{return Err(AppError::conflict("An affected record changed after this action. Use revision history to recover earlier content."));}}
         for doc in &snapshot.before {if !snapshot.after.iter().any(|after|after.id==doc.id)&&store::document_exists(conn,id,&doc.id).await?{return Err(AppError::conflict("A deleted record has already been restored."));}}

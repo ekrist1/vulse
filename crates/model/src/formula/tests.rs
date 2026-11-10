@@ -368,3 +368,59 @@ fn functions_read_large_columns_of_other_collections() {
         );
     }
 }
+#[test]
+fn compiled_formulas_calculate_like_each_call_compiling() {
+    let good: Blueprint = serde_json::from_value(json!({"fields":[
+        {"name":"price","type":"number"},
+        {"name":"quantity","type":"number"},
+        {"name":"total","type":"calculated","formula":"=[price] * [quantity]"},
+        {"name":"label","type":"calculated","formula":"=IF([total] > 10, \"big\", 1/0)"},
+        {"name":"customer","type":"calculated","formula":"=XLOOKUP([price],[people.id],[people.name])"}
+    ]}))
+    .unwrap();
+    let mut circular = good.clone();
+    circular.fields[2].formula = Some("=[label]".into());
+    circular.fields[3].formula = Some("=[total]".into());
+    let mut lookups = Lookups::default();
+    lookups.insert(
+        "people",
+        "id",
+        Arc::new(LookupColumn::new("people", vec![json!(5), json!(2)])),
+    );
+    lookups.insert(
+        "people",
+        "name",
+        Arc::new(LookupColumn::new("people", vec![json!("Ann"), json!("Bo")])),
+    );
+    let bodies = [
+        json!({"price":5,"quantity":3}),
+        json!({"price":2,"quantity":1,"total":999}),
+        json!({"quantity":"x"}),
+        json!("not an object"),
+    ];
+    for bp in [&good, &circular] {
+        let compiled = CompiledFormulas::new(bp);
+        for body in &bodies {
+            for lookups in [&lookups, &Lookups::default()] {
+                let (out, errors) = compiled.calculate(body, lookups);
+                let (expected_out, expected) = calculate_document_with(bp, body, lookups);
+                assert_eq!(out, expected_out);
+                // Which field a cycle is reported at depends on hash order,
+                // in each call as before.
+                assert_eq!(
+                    errors.keys().collect::<Vec<_>>(),
+                    expected.keys().collect::<Vec<_>>()
+                );
+                if !errors.contains_key("blueprint") {
+                    assert_eq!(errors, expected);
+                }
+            }
+        }
+    }
+    let (_, errors) = CompiledFormulas::new(&circular).calculate(&bodies[0], &lookups);
+    assert!(errors["blueprint"].contains("circular"), "{errors:?}");
+    let (body, errors) = CompiledFormulas::new(&good).calculate(&bodies[0], &lookups);
+    assert_eq!(body["customer"], "Ann");
+    assert_eq!(body["label"], "big");
+    assert!(errors.is_empty(), "{errors:?}");
+}

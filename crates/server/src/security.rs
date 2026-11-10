@@ -187,7 +187,10 @@ pub fn spawn_cleanup(db: crate::db::Db) {
             .await;
             match result {
                 Ok(0) => {}
-                Ok(removed) => tracing::info!(removed, "removed expired sessions and links"),
+                Ok(removed) => tracing::info!(
+                    removed,
+                    "removed expired sessions, links and undo snapshots"
+                ),
                 Err(err) => tracing::warn!(error = %err, "session cleanup failed"),
             }
         }

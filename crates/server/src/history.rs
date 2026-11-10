@@ -19,16 +19,10 @@ pub async fn snapshot(
     action: &str,
 ) -> anyhow::Result<()> {
     let source = conn.source().map_or(crate::db::SqlValue::Null, text);
-    let rows = conn
-        .query(
-            "SELECT blueprint FROM collections WHERE id=?1",
-            &[text(collection)],
-        )
-        .await?;
-    let Some(row) = rows.first() else {
+    let Some(stored) = store::stored_collection(conn, collection).await? else {
         return Ok(());
     };
-    let blueprint = store_blueprint(conn, &text_at(row, 0)?).await?;
+    let blueprint = revision_blueprint(conn, &stored).await?;
     conn.execute("INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) SELECT ?1,d.collection_id,d.id,?2,d.body,?7,d.created_at,?3,?6 FROM documents d WHERE d.collection_id=?4 AND d.id=?5",&[text(&crate::auth::new_id()),text(action),text(&timeutil::now_rfc3339()),text(collection),text(document),source,text(&blueprint)]).await?;
     Ok(())
 }
@@ -43,6 +37,66 @@ pub(crate) async fn store_blueprint(conn: &Conn, blueprint: &str) -> anyhow::Res
         &[text(&id), text(blueprint)],
     )
     .await?;
+    Ok(id)
+}
+/// Inserts the revisions `snapshot` would copy from records, given as
+/// (record id, action, stored body, record created_at), in batches.
+pub(crate) async fn insert_revisions(
+    conn: &Conn,
+    collection: &str,
+    blueprint: &str,
+    revisions: &[(&str, &str, &str, &str)],
+) -> anyhow::Result<()> {
+    let source = conn.source().map_or(crate::db::SqlValue::Null, text);
+    let revised_at = timeutil::now_rfc3339();
+    // Parameters per statement, as for record table rows.
+    for chunk in revisions.chunks(2000) {
+        let mut params = Vec::with_capacity(chunk.len() * 9);
+        let mut tuples = Vec::with_capacity(chunk.len());
+        for (document, action, body, record_created_at) in chunk {
+            let n = params.len();
+            tuples.push(format!(
+                "({})",
+                (n + 1..=n + 9)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            params.extend([
+                text(&crate::auth::new_id()),
+                text(collection),
+                text(document),
+                text(action),
+                text(body),
+                text(blueprint),
+                text(record_created_at),
+                text(&revised_at),
+                source.clone(),
+            ]);
+        }
+        conn.execute(
+            &format!(
+                "INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) VALUES {}",
+                tuples.join(",")
+            ),
+            &params,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `store_blueprint` for a collection's current blueprint, stored once per
+/// transaction.
+pub(crate) async fn revision_blueprint(
+    conn: &Conn,
+    collection: &store::StoredCollection,
+) -> anyhow::Result<String> {
+    if let Some(id) = collection.revision_blueprint.get() {
+        return Ok(id.clone());
+    }
+    let id = store_blueprint(conn, &collection.blueprint_text).await?;
+    let _ = collection.revision_blueprint.set(id.clone());
     Ok(id)
 }
 fn decode(row: &crate::db::SqlRow) -> anyhow::Result<DocumentRevision> {

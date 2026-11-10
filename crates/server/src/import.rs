@@ -130,6 +130,7 @@ pub async fn import_file(
         .with_app_transaction(commit, async |conn| {
             let collection = workspace_collection(conn, &principal, &id).await?;
             let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+            let formulas = vulse_model::CompiledFormulas::new(&collection.blueprint);
             let mapping = match mapping {
                 Some(m) => m,
                 None => {
@@ -245,7 +246,7 @@ pub async fn import_file(
                         Err(e) => return Err(e),
                     }
                     let (computed, errors) =
-                        vulse_model::calculate_document_with(&collection.blueprint, &body, &lookups);
+                        formulas.calculate(&body, &lookups);
                     for (field, message) in errors {
                         failed = true;
                         result.errors.push(ImportIssue {

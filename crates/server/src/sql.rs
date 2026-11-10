@@ -16,7 +16,7 @@ use vulse_model::{
 };
 
 use crate::auth::{AuthUser, Principal, require_collection, require_role};
-use crate::content::{check_body, materialize};
+use crate::content::{check_body, materialize_with};
 use crate::db::{Conn, SqlValue, opt_text_at, text_at};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -258,10 +258,11 @@ async fn documents(
         )
         .await?;
     let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+    let formulas = vulse_model::CompiledFormulas::new(&collection.blueprint);
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut doc = store::document_from_row(row)?;
-        materialize(&collection.blueprint, &lookups, &mut doc);
+        materialize_with(&formulas, &lookups, &mut doc);
         out.push(doc);
     }
     Ok(out)

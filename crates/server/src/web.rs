@@ -28,11 +28,15 @@ pub async fn serve(method: Method, uri: Uri, headers: HeaderMap) -> Response {
             None => return StatusCode::NOT_FOUND.into_response(),
         },
     };
-    let etag = format!("\"{}\"", hex::encode(file.metadata.sha256_hash()));
+    let hash = format!("\"{}\"", hex::encode(file.metadata.sha256_hash()));
+    // Weak, because the compression layer sends the same file as gzip,
+    // brotli or plain bytes under this one tag.
+    let etag = format!("W/{hash}");
     // Every response revalidates; unchanged files cost a 304 without a body.
     let mut response = if headers
         .get(header::IF_NONE_MATCH)
-        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| none_match(value, &hash))
     {
         StatusCode::NOT_MODIFIED.into_response()
     } else if method == Method::HEAD {
@@ -50,4 +54,13 @@ pub async fn serve(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     response
+}
+
+/// Weak comparison of `If-None-Match`: browsers that cached the old strong
+/// tag, or the new weak one, both get a 304.
+fn none_match(value: &str, hash: &str) -> bool {
+    value
+        .split(',')
+        .map(|tag| tag.trim())
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == hash)
 }

@@ -23,7 +23,7 @@ axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "compression-gzip", "compression-br"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"
@@ -51,3 +51,6 @@ rmcp = { version = "3.5", default-features = false, features = ["server", "macro
 tempfile = "3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+# Decode compressed responses in tests.
+flate2 = "1"
+brotli-decompressor = "6"

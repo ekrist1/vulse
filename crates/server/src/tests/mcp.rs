@@ -1,7 +1,7 @@
 //! The MCP endpoint: bearer-only access and the read tools.
 use super::*;
 
-const MCP_HEADERS: [(&str, &str); 3] = [
+pub(super) const MCP_HEADERS: [(&str, &str); 3] = [
     ("host", "localhost"),
     ("accept", "application/json, text/event-stream"),
     ("mcp-protocol-version", "2025-06-18"),
@@ -50,7 +50,7 @@ pub(super) async fn tool(
     (value, error)
 }
 
-async fn api_key(app: &TestApp, cookie: &str, body: Value) -> String {
+pub(super) async fn api_key(app: &TestApp, cookie: &str, body: Value) -> String {
     let response = app
         .call("POST", "/api/v1/api-keys", Some(cookie), None, Some(body))
         .await;

@@ -5,8 +5,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use vulse_model::{
-    Blueprint, CollectionView, CreateCollection, DocumentView, DocumentWrite, FieldType, Page,
-    UpdateCollection, check_collection_name, page_bounds, reference_collections,
+    Blueprint, CollectionView, CompiledFormulas, CreateCollection, DocumentView, DocumentWrite,
+    FieldType, Page, UpdateCollection, check_collection_name, page_bounds, reference_collections,
     take_field_renames, take_option_renames, validate_blueprint, validate_document,
 };
 
@@ -190,7 +190,14 @@ pub async fn update_collection(
             let mut failing = Vec::new();
             let mut first_error = None;
             let mut found = Found::default();
-            for (doc, mut source) in store::list_document_bodies(conn, &id).await? {
+            // Kept with their new bodies, to build the record table from.
+            let mut records = store::list_records(conn, &id).await?;
+            let rewriting = !removed.is_empty()
+                || !renames.is_empty()
+                || !value_renames.is_empty()
+                || (body.convert_field_values && !retyped.is_empty());
+            for (index, (doc, _, _, source)) in records.iter_mut().enumerate() {
+                let original = rewriting.then(|| source.clone());
                 if let Some(object) = source.as_object_mut() {
                     // Removed before renaming, so a field renamed onto a
                     // replaced field's name never inherits its values.
@@ -261,14 +268,18 @@ pub async fn update_collection(
                         } else {
                             "fields removed"
                         };
-                        stripped.push((doc.clone(), source.clone(), action));
+                        stripped.push(store::Rewrite {
+                            index,
+                            action,
+                            revise: original.as_ref() != Some(&*source),
+                        });
                     }
                 }
-                match check_body_with(conn, &id, &name, &blueprint, &source, &mut found).await {
+                match check_body_with(conn, &id, &name, &blueprint, source, &mut found).await {
                     Ok(()) => {}
                     Err(AppError::BadRequest(message)) => {
                         first_error.get_or_insert(message);
-                        failing.push(doc);
+                        failing.push(doc.clone());
                     }
                     Err(err) => return Err(err),
                 }
@@ -329,21 +340,24 @@ pub async fn update_collection(
                     failing,
                 ));
             }
-            store::update_collection(
+            let updated_at = timeutil::now_rfc3339();
+            // The previous revision of each record keeps the old values.
+            let now = timeutil::now_rfc3339();
+            for rewrite in &stripped {
+                records[rewrite.index].2 = now.clone();
+            }
+            store::update_collection_records(
                 conn,
                 &id,
                 &name,
                 visibility,
                 &blueprint,
-                &timeutil::now_rfc3339(),
+                &updated_at,
+                &records,
+                &stripped,
             )
             .await
             .map_err(|err| unique_message(err, "a collection with that name already exists"))?;
-            // The previous revision of each record keeps the old values.
-            let now = timeutil::now_rfc3339();
-            for (doc, source, action) in &stripped {
-                store::update_document_as(conn, &id, doc, source, &now, action).await?;
-            }
             if !renames.is_empty() {
                 crate::records::rename_view_fields(conn, &id, &renames).await?;
             }
@@ -417,8 +431,9 @@ pub async fn list_documents(
     let collection = workspace_collection(&conn, &principal, &id).await?;
     let mut items = store::list_documents(&conn, &id, limit, offset).await?;
     let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
+    let formulas = CompiledFormulas::new(&collection.blueprint);
     for document in &mut items {
-        materialize(&collection.blueprint, &lookups, document);
+        materialize_with(&formulas, &lookups, document);
     }
     Ok(Json(Page {
         items,
@@ -653,7 +668,16 @@ pub(crate) fn materialize(
     lookups: &vulse_model::Lookups,
     document: &mut DocumentView,
 ) {
-    let (body, errors) = vulse_model::calculate_document_with(blueprint, &document.body, lookups);
+    materialize_with(&CompiledFormulas::new(blueprint), lookups, document);
+}
+
+/// Like `materialize`, with formulas compiled once for many records.
+pub(crate) fn materialize_with(
+    formulas: &CompiledFormulas,
+    lookups: &vulse_model::Lookups,
+    document: &mut DocumentView,
+) {
+    let (body, errors) = formulas.calculate(&document.body, lookups);
     document.body = body;
     document.calculation_errors = errors;
 }

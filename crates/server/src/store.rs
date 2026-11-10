@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use vulse_model::{
-    ApiKeyView, AssetView, Blueprint, CollectionView, DocumentView, InviteView, LinkPurpose,
-    ManagedUser, Role, Visibility,
+    ApiKeyView, AssetView, Blueprint, CollectionView, CompiledFormulas, DocumentView, InviteView,
+    LinkPurpose, ManagedUser, Role, Visibility,
 };
 
 use crate::db::{Conn, SqlRow, SqlValue, int_at, opt_text_at, text_at};
@@ -227,10 +230,23 @@ pub async fn delete_user_sessions(
     crate::oauth::revoke_user(conn, user_id).await
 }
 
-/// Removes expired sessions, account links and OAuth codes and tokens.
-/// Timestamps share one fixed-width UTC format, so text comparison orders
-/// them correctly.
+/// Removes expired sessions, account links, OAuth codes and tokens and undo
+/// snapshots. Timestamps share one fixed-width UTC format, so text
+/// comparison orders them correctly.
 pub async fn purge_expired(conn: &Conn, now: &str) -> anyhow::Result<u64> {
+    // Undo snapshots hold whole records before and after a change. They are
+    // stamped by `timeutil::now_rfc3339`, with nanoseconds, so the cutoff is
+    // written the same way.
+    let cutoff = chrono::DateTime::parse_from_rfc3339(now)?.with_timezone(&chrono::Utc)
+        - chrono::Duration::hours(crate::mutations::UNDO_HOURS);
+    let actions = conn
+        .execute(
+            "DELETE FROM record_actions WHERE created_at < ?1",
+            &[text(
+                &cutoff.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            )],
+        )
+        .await?;
     let sessions = conn
         .execute(
             "DELETE FROM auth_sessions WHERE expires_at < ?1",
@@ -244,7 +260,7 @@ pub async fn purge_expired(conn: &Conn, now: &str) -> anyhow::Result<u64> {
         )
         .await?;
     let oauth = crate::oauth::purge(conn, now).await?;
-    Ok(sessions + links + oauth)
+    Ok(sessions + links + oauth + actions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,6 +468,7 @@ pub async fn insert_collection(
         ],
     )
     .await?;
+    conn.collections_changed();
     crate::rows::create(conn, id, blueprint).await?;
     Ok(())
 }
@@ -464,6 +481,130 @@ pub async fn update_collection(
     blueprint: &Blueprint,
     updated_at: &str,
 ) -> anyhow::Result<()> {
+    if write_collection(conn, id, name, visibility, blueprint, updated_at).await? {
+        crate::records::sync_collection_cells(conn, id, blueprint, None).await?;
+    }
+    Ok(())
+}
+
+/// A record whose body `update_collection_records` writes, by its index in
+/// the collection's records.
+pub(crate) struct Rewrite {
+    pub index: usize,
+    /// Recorded in the record's history.
+    pub action: &'static str,
+    /// Whether the body differs from the stored one. As with
+    /// `update_document_as`, only a changed body gets a revision.
+    pub revise: bool,
+}
+
+/// Like `update_collection` followed by `update_document_as` for each of
+/// `rewrites`, with the bodies and their revisions written in batches and the
+/// record table and links built once. `records` holds every record of the
+/// collection as it is to be stored, with the new bodies and update times.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_collection_records(
+    conn: &Conn,
+    id: &str,
+    name: &str,
+    visibility: Visibility,
+    blueprint: &Blueprint,
+    updated_at: &str,
+    records: &[crate::rows::Record],
+    rewrites: &[Rewrite],
+) -> anyhow::Result<()> {
+    let encoded = rewrites
+        .iter()
+        .map(|rewrite| serde_json::to_string(&records[rewrite.index].3))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Written before the collection, so a rebuilt table and links hold the
+    // new bodies.
+    for (chunk, encoded) in rewrites.chunks(2000).zip(encoded.chunks(2000)) {
+        let mut params = vec![text(id)];
+        let mut tuples = Vec::with_capacity(chunk.len());
+        for (rewrite, body) in chunk.iter().zip(encoded) {
+            let (doc, _, record_updated_at, _) = &records[rewrite.index];
+            let n = params.len();
+            tuples.push(format!("(?{},?{},?{})", n + 1, n + 2, n + 3));
+            params.extend([text(doc), text(body), text(record_updated_at)]);
+        }
+        conn.execute(
+            &format!(
+                "UPDATE documents SET body = v.column2, updated_at = v.column3
+                 FROM (VALUES {}) AS v
+                 WHERE documents.id = v.column1 AND documents.collection_id = ?1",
+                tuples.join(",")
+            ),
+            &params,
+        )
+        .await?;
+    }
+    if write_collection(conn, id, name, visibility, blueprint, updated_at).await? {
+        crate::records::sync_collection_cells(conn, id, blueprint, Some(records)).await?;
+    } else if !rewrites.is_empty() {
+        // The table stays; only the rewritten records' rows and links change.
+        let rewritten: Vec<&crate::rows::Record> =
+            rewrites.iter().map(|r| &records[r.index]).collect();
+        let lookups = crate::lookups::load(conn, blueprint).await?;
+        crate::rows::write(
+            conn,
+            id,
+            blueprint,
+            &lookups,
+            "INSERT OR REPLACE",
+            &rewritten,
+        )
+        .await?;
+        if crate::relationships::has_links(blueprint) {
+            for chunk in rewritten.chunks(2000) {
+                let slots: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+                conn.execute(
+                    &format!(
+                        "DELETE FROM document_links WHERE source_id IN ({})",
+                        slots.join(",")
+                    ),
+                    &chunk.iter().map(|(doc, ..)| text(doc)).collect::<Vec<_>>(),
+                )
+                .await?;
+            }
+            let links: Vec<_> = rewritten
+                .iter()
+                .map(|(doc, _, _, body)| (doc.as_str(), body))
+                .collect();
+            crate::relationships::insert_many(conn, id, blueprint, &links).await?;
+        }
+    }
+    let stored = stored_collection(conn, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
+    let blueprint_id = crate::history::revision_blueprint(conn, &stored).await?;
+    let revisions: Vec<_> = rewrites
+        .iter()
+        .zip(&encoded)
+        .filter(|(rewrite, _)| rewrite.revise)
+        .map(|(rewrite, body)| {
+            let (doc, created_at, ..) = &records[rewrite.index];
+            (
+                doc.as_str(),
+                rewrite.action,
+                body.as_str(),
+                created_at.as_str(),
+            )
+        })
+        .collect();
+    crate::history::insert_revisions(conn, id, &blueprint_id, &revisions).await
+}
+
+/// Writes the collection row. Returns whether its record table and links
+/// need rebuilding.
+async fn write_collection(
+    conn: &Conn,
+    id: &str,
+    name: &str,
+    visibility: Visibility,
+    blueprint: &Blueprint,
+    updated_at: &str,
+) -> anyhow::Result<bool> {
     let previous = find_collection(conn, id).await?;
     conn.execute(
         "UPDATE collections
@@ -478,17 +619,16 @@ pub async fn update_collection(
         ],
     )
     .await?;
+    conn.collections_changed();
     conn.changed(id);
     // Labels, help texts and collection settings don't change stored values.
-    if previous.is_none_or(|old| crate::rows::shape_changed(&old.blueprint, blueprint)) {
-        crate::records::sync_collection_cells(conn, id, blueprint).await?;
-    }
-    Ok(())
+    Ok(previous.is_none_or(|old| crate::rows::shape_changed(&old.blueprint, blueprint)))
 }
 
 pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM collections WHERE id = ?1", &[text(id)])
         .await?;
+    conn.collections_changed();
     // Blueprints only revisions of the deleted collection used.
     conn.execute(
         "DELETE FROM revision_blueprints WHERE id NOT IN (SELECT blueprint FROM record_revisions)",
@@ -498,6 +638,65 @@ pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
     crate::rows::drop(conn, id).await?;
     conn.changed(id);
     Ok(())
+}
+
+/// What writing a record needs from its collection.
+pub(crate) struct StoredCollection {
+    pub name: String,
+    pub blueprint: Blueprint,
+    pub formulas: CompiledFormulas,
+    /// The stored blueprint text, as record revisions keep it.
+    pub blueprint_text: String,
+    /// The `revision_blueprints` id of `blueprint_text`, once stored.
+    pub revision_blueprint: OnceLock<String>,
+}
+
+/// Collections by id, read in the open transaction.
+pub(crate) type CollectionCache = Mutex<HashMap<String, Arc<StoredCollection>>>;
+
+/// The collection's name and blueprint. Inside a transaction it is read once
+/// and kept until a collection is written (`Conn::collections_changed`), so
+/// writing many records parses and compiles the blueprint once. Outside one
+/// it is read every time, as other requests may change it in between.
+pub(crate) async fn stored_collection(
+    conn: &Conn,
+    id: &str,
+) -> anyhow::Result<Option<Arc<StoredCollection>>> {
+    let cached = conn.in_transaction();
+    if cached
+        && let Some(found) = conn
+            .collection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+    {
+        return Ok(Some(found.clone()));
+    }
+    let rows = conn
+        .query(
+            "SELECT name, blueprint FROM collections WHERE id = ?1",
+            &[text(id)],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let blueprint_text = text_at(row, 1)?;
+    let blueprint: Blueprint = serde_json::from_str(&blueprint_text)?;
+    let stored = Arc::new(StoredCollection {
+        name: text_at(row, 0)?,
+        formulas: CompiledFormulas::new(&blueprint),
+        blueprint,
+        blueprint_text,
+        revision_blueprint: OnceLock::new(),
+    });
+    if cached {
+        conn.collection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), stored.clone());
+    }
+    Ok(Some(stored))
 }
 
 pub async fn list_collections(
@@ -593,6 +792,25 @@ pub async fn list_document_bodies(
         .collect()
 }
 
+/// Every record of a collection, as its record table row is written from.
+pub(crate) async fn list_records(
+    conn: &Conn,
+    collection_id: &str,
+) -> anyhow::Result<Vec<crate::rows::Record>> {
+    let rows = conn
+        .query(
+            "SELECT id, created_at, updated_at, body FROM documents WHERE collection_id = ?1",
+            &[text(collection_id)],
+        )
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let body = serde_json::from_str(&text_at(row, 3)?)?;
+            Ok((text_at(row, 0)?, text_at(row, 1)?, text_at(row, 2)?, body))
+        })
+        .collect()
+}
+
 pub async fn find_document(
     conn: &Conn,
     collection_id: &str,
@@ -654,19 +872,11 @@ pub async fn insert_documents(
     if bodies.is_empty() {
         return Ok(());
     }
-    let rows = conn
-        .query(
-            "SELECT blueprint FROM collections WHERE id=?1",
-            &[text(collection_id)],
-        )
-        .await?;
-    let stored_blueprint = text_at(
-        rows.first()
-            .ok_or_else(|| anyhow::anyhow!("missing collection"))?,
-        0,
-    )?;
-    let blueprint: Blueprint = serde_json::from_str(&stored_blueprint)?;
-    let blueprint_id = crate::history::store_blueprint(conn, &stored_blueprint).await?;
+    let stored = stored_collection(conn, collection_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing collection"))?;
+    let blueprint = &stored.blueprint;
+    let blueprint_id = crate::history::revision_blueprint(conn, &stored).await?;
     let existing = int_at(
         &conn
             .query(
@@ -680,8 +890,6 @@ pub async fn insert_documents(
         .iter()
         .map(|(_, body)| serde_json::to_string(body))
         .collect::<Result<Vec<_>, _>>()?;
-    let source = conn.source().map_or(SqlValue::Null, text);
-    let revised_at = crate::timeutil::now_rfc3339();
     // Parameters per statement, as for record table rows.
     for (chunk, encoded) in bodies.chunks(2000).zip(encoded.chunks(2000)) {
         let mut params = Vec::with_capacity(chunk.len() * 5);
@@ -712,44 +920,19 @@ pub async fn insert_documents(
             &params,
         )
         .await?;
-        // The history rows `history::snapshot` would copy from the records.
-        let mut params = Vec::with_capacity(chunk.len() * 9);
-        let mut tuples = Vec::with_capacity(chunk.len());
-        for ((id, _), body) in chunk.iter().zip(encoded) {
-            let n = params.len();
-            tuples.push(format!(
-                "({})",
-                (n + 1..=n + 9)
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ));
-            params.extend([
-                text(&crate::auth::new_id()),
-                text(collection_id),
-                text(id),
-                text("create"),
-                text(body),
-                text(&blueprint_id),
-                text(created_at),
-                text(&revised_at),
-                source.clone(),
-            ]);
-        }
-        conn.execute(
-            &format!(
-                "INSERT INTO record_revisions(id,collection_id,document_id,action,body,blueprint,record_created_at,created_at,source) VALUES {}",
-                tuples.join(",")
-            ),
-            &params,
-        )
-        .await?;
     }
+    let revisions: Vec<_> = bodies
+        .iter()
+        .zip(&encoded)
+        .map(|((id, _), body)| (id.as_str(), "create", body.as_str(), created_at))
+        .collect();
+    crate::history::insert_revisions(conn, collection_id, &blueprint_id, &revisions).await?;
     conn.changed(collection_id);
-    let lookups = crate::lookups::load(conn, &blueprint).await?;
+    let lookups = crate::lookups::load(conn, blueprint).await?;
     if bodies.len() as i64 > existing {
         // Building the indexes once is faster than updating them per row.
-        crate::rows::rebuild(conn, collection_id, &blueprint, &lookups).await?;
+        let records = list_records(conn, collection_id).await?;
+        crate::rows::rebuild(conn, collection_id, blueprint, &lookups, &records).await?;
     } else {
         let records: Vec<_> = bodies
             .iter()
@@ -765,14 +948,18 @@ pub async fn insert_documents(
         crate::rows::write(
             conn,
             collection_id,
-            &blueprint,
+            blueprint,
             &lookups,
             "INSERT",
-            &records,
+            &records.iter().collect::<Vec<_>>(),
         )
         .await?;
     }
-    crate::relationships::insert_many(conn, collection_id, &blueprint, bodies).await
+    let links: Vec<_> = bodies
+        .iter()
+        .map(|(id, body)| (id.as_str(), body))
+        .collect();
+    crate::relationships::insert_many(conn, collection_id, blueprint, &links).await
 }
 
 pub async fn update_document(

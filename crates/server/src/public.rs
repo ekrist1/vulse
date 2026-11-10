@@ -104,8 +104,9 @@ async fn list_documents_inner(
     let collection = public_collection(&conn, &path.collection).await?;
     let mut items = store::list_documents(&conn, &collection.id, limit, offset).await?;
     let lookups = crate::lookups::load(&conn, &collection.blueprint).await?;
+    let formulas = vulse_model::CompiledFormulas::new(&collection.blueprint);
     for document in &mut items {
-        crate::content::materialize(&collection.blueprint, &lookups, document);
+        crate::content::materialize_with(&formulas, &lookups, document);
     }
     Ok(Json(Page {
         items,

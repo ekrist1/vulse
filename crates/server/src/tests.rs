@@ -18,6 +18,8 @@ mod bench;
 mod bench_write;
 #[path = "tests/beta.rs"]
 mod beta;
+#[path = "tests/compression.rs"]
+mod compression;
 #[path = "tests/mcp.rs"]
 mod mcp;
 #[path = "tests/oauth.rs"]
@@ -939,6 +941,232 @@ async fn rebuilding_one_table_refreshes_formulas_that_read_it() {
         .await
         .unwrap();
     assert_eq!(total().await, 12.0);
+}
+
+#[tokio::test]
+async fn refreshing_readers_writes_only_changed_rows_and_matches_a_rebuild() {
+    use crate::db::SqlValue;
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "changed@example.com", "changed").await;
+    let reports = create_collection(
+        &app,
+        &cookie,
+        "reports",
+        "private",
+        json!({"fields":[
+            {"name":"org","type":"string"},
+            {"name":"fte","type":"number"},
+            {"name":"note","type":"string"},
+            {"name":"extra","type":"string"}
+        ]}),
+    )
+    .await;
+    // Values read from reports, directly or through other calculated fields,
+    // that turn from numbers to text and to errors, next to a local one.
+    let orgs = create_collection(
+        &app,
+        &cookie,
+        "orgs",
+        "private",
+        json!({"fields":[
+            {"name":"org","type":"string"},
+            {"name":"fte","type":"calculated","formula":"=SUMIFS([reports.fte],[reports.org],[org])"},
+            {"name":"size","type":"calculated","formula":"=IF([fte]>5,\"big\",[fte])"},
+            {"name":"inverse","type":"calculated","formula":"=1/[fte]"},
+            {"name":"note","type":"calculated","formula":"=XLOOKUP([org],[reports.org],[reports.note])"},
+            {"name":"code","type":"calculated","formula":"=UPPER([org])"}
+        ]}),
+    )
+    .await;
+    let first = create_document(
+        &app,
+        &cookie,
+        &reports.id,
+        json!({"org":"a","fte":3,"note":"Alpha","extra":"x"}),
+    )
+    .await;
+    let mut org_ids = std::collections::BTreeMap::new();
+    for org in ["a", "b", "c"] {
+        let doc = create_document(&app, &cookie, &orgs.id, json!({"org":org})).await;
+        org_ids.insert(org, doc.id);
+    }
+    let conn = app.db.connect().await.unwrap();
+    let table = crate::rows::table(&orgs.id);
+    // Every column of every row, in a form that tells storage classes and
+    // numbers bit for bit apart.
+    let contents = async || {
+        conn.query(&format!("SELECT * FROM {table} ORDER BY id"), &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    let rowids = async || {
+        conn.query(&format!("SELECT id, rowid FROM {table}"), &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    crate::db::text_at(&row, 0).unwrap(),
+                    format!("{:?}", row[1]),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let cell = async |org: &str, column: String| {
+        conn.query(
+            &format!("SELECT {column} FROM {table} WHERE id=?1"),
+            &[SqlValue::Text(org_ids[org].clone())],
+        )
+        .await
+        .unwrap()[0][0]
+            .clone()
+    };
+    let send = async |method: &str, uri: String, body: Option<Value>| {
+        let response = app.call(method, &uri, Some(&cookie), None, body).await;
+        assert!(response.status().is_success(), "{method} {uri}");
+    };
+    let report = |id: &str| format!("/api/v1/collections/{}/documents/{id}", reports.id);
+    // After a change to reports, checks that exactly the rows of the
+    // `expected` orgs were written, as a row written again gets a new rowid,
+    // and that the table holds what a rebuild from the record bodies
+    // derives. `previous` holds the rowids from before the change.
+    let written = async |previous: &mut std::collections::BTreeMap<String, String>,
+                         expected: &[&str]| {
+        let now = rowids().await;
+        let rewritten: Vec<&str> = org_ids
+            .iter()
+            .filter(|(_, id)| previous.get(*id) != now.get(*id))
+            .map(|(org, _)| *org)
+            .collect();
+        assert_eq!(rewritten, expected, "the rows written");
+        let refreshed = contents().await;
+        crate::records::rebuild_tables(&conn, Some("orgs"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed, contents().await, "the refresh matches a rebuild");
+        *previous = rowids().await;
+    };
+    let mut previous = rowids().await;
+
+    // A new report: b's total turns from 0 to text and its inverse from an
+    // error to a number. Neither a nor c changes.
+    let second = create_document(
+        &app,
+        &cookie,
+        &reports.id,
+        json!({"org":"b","fte":6,"note":"Beta","extra":"x"}),
+    )
+    .await;
+    written(&mut previous, &["b"]).await;
+    assert_eq!(
+        format!("{:?}", cell("b", crate::rows::column("size", 's')).await),
+        "Text(\"big\")"
+    );
+    assert_eq!(
+        format!("{:?}", cell("b", crate::rows::column("size", 'r')).await),
+        "Text(\"\\\"big\\\"\")"
+    );
+    assert!(matches!(
+        cell("b", crate::rows::column("inverse", 'n')).await,
+        SqlValue::Real(v) if (v - 1.0 / 6.0).abs() < 1e-12
+    ));
+
+    // Back to a number, and the inverse to an error, which is stored empty.
+    send(
+        "PUT",
+        report(&second.id),
+        Some(json!({"body":{"org":"b","fte":0,"note":"Beta","extra":"x"}})),
+    )
+    .await;
+    written(&mut previous, &["b"]).await;
+    assert!(matches!(
+        cell("b", crate::rows::column("size", 's')).await,
+        SqlValue::Real(v) if v == 0.0
+    ));
+    for part in ['t', 'n', 'r', 's'] {
+        assert!(matches!(
+            cell("b", crate::rows::column("inverse", part)).await,
+            SqlValue::Null
+        ));
+    }
+
+    // A looked-up text changes a's search text.
+    send(
+        "PUT",
+        report(&first.id),
+        Some(json!({"body":{"org":"a","fte":3,"note":"Gamma","extra":"x"}})),
+    )
+    .await;
+    written(&mut previous, &["a"]).await;
+    let search = cell("a", "search".into()).await;
+    assert!(
+        matches!(&search, SqlValue::Text(s) if s.contains("gamma") && !s.contains("alpha")),
+        "{search:?}"
+    );
+    let (_, page) = json_of::<vulse_model::RecordPage>(
+        app.call(
+            "POST",
+            &format!("/api/v1/collections/{}/query", orgs.id),
+            Some(&cookie),
+            None,
+            Some(json!({"search":"gamma"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(page.total, 1);
+
+    // A field no formula reads changes no row. A report without hours moving
+    // from b to a changes b's note, while a's total is summed anew but stays
+    // 3, so a is not written.
+    send(
+        "PUT",
+        report(&first.id),
+        Some(json!({"body":{"org":"a","fte":3,"note":"Gamma","extra":"y"}})),
+    )
+    .await;
+    written(&mut previous, &[]).await;
+    send(
+        "PUT",
+        report(&second.id),
+        Some(json!({"body":{"org":"a","fte":0,"note":"Beta","extra":"x"}})),
+    )
+    .await;
+    written(&mut previous, &["b"]).await;
+
+    // A deleted report: a's total drops and its note comes from the report
+    // that moved to it.
+    send("DELETE", report(&first.id), None).await;
+    written(&mut previous, &["a"]).await;
+    assert!(matches!(
+        cell("a", crate::rows::column("fte", 'n')).await,
+        SqlValue::Real(v) if v == 0.0
+    ));
+    assert_eq!(
+        format!("{:?}", cell("a", crate::rows::column("note", 't')).await),
+        "Text(\"beta\")"
+    );
+
+    // A record missing from the table is added back, as rewriting every row
+    // did.
+    conn.execute(
+        &format!("DELETE FROM {table} WHERE id=?1"),
+        &[SqlValue::Text(org_ids["c"].clone())],
+    )
+    .await
+    .unwrap();
+    previous.remove(&org_ids["c"]);
+    create_document(
+        &app,
+        &cookie,
+        &reports.id,
+        json!({"org":"d","fte":1,"note":"Delta","extra":"x"}),
+    )
+    .await;
+    written(&mut previous, &["c"]).await;
 }
 
 #[tokio::test]
@@ -5460,4 +5688,450 @@ async fn admins_make_download_and_delete_backups() {
     assert_eq!(app.call("DELETE", &path, Some(&editor), None, None).await.status(), StatusCode::FORBIDDEN);
     assert_eq!(app.call("DELETE", &path, Some(&admin), None, None).await.status(), StatusCode::NO_CONTENT);
     assert_eq!(app.call("DELETE", &path, Some(&admin), None, None).await.status(), StatusCode::NOT_FOUND);
+}
+
+/// Records whose bodies a schema change rewrites get a revision with the new
+/// body and blueprint, and their rows and links follow, as when each record
+/// is saved on its own. Records the change leaves alone keep their history
+/// and update time.
+#[tokio::test]
+async fn schema_changes_rewrite_records_with_history_rows_and_links() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "rewrite@example.com", "rewrite").await;
+    let targets = create_collection(
+        &app,
+        &cookie,
+        "owners",
+        "private",
+        json!({"fields":[{"name":"name","type":"string"}]}),
+    )
+    .await;
+    let first = create_document(&app, &cookie, &targets.id, json!({"name":"First"})).await;
+    let second = create_document(&app, &cookie, &targets.id, json!({"name":"Second"})).await;
+    let fields = |owner: Value, status: Value| {
+        json!({"fields":[
+            {"name":"title","type":"string"},
+            owner,
+            status,
+            {"name":"size","type":"calculated","formula":"=LEN([title])"}
+        ]})
+    };
+    let items = create_collection(
+        &app,
+        &cookie,
+        "items",
+        "private",
+        fields(
+            json!({"name":"owner","type":"reference","collection":"owners"}),
+            json!({"name":"status","type":"string","options":["open","done"]}),
+        ),
+    )
+    .await;
+    let a = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"a","owner":first.id,"status":"open"}),
+    )
+    .await;
+    let b = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"title":"bb","owner":second.id,"status":"done"}),
+    )
+    .await;
+    let c = create_document(&app, &cookie, &items.id, json!({"title":"ccc"})).await;
+    let conn = app.db.connect().await.unwrap();
+    let id = |v: &str| crate::db::SqlValue::Text(v.to_string());
+    let links = async || {
+        let mut found: Vec<(String, String, String)> = conn
+            .query(
+                "SELECT l.source_id,l.field,l.target_id FROM document_links l JOIN documents d ON d.id=l.source_id WHERE d.collection_id=?1",
+                &[id(&items.id)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    crate::db::text_at(row, 0).unwrap(),
+                    crate::db::text_at(row, 1).unwrap(),
+                    crate::db::text_at(row, 2).unwrap(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    // (action, body, whether its blueprint is the collection's current one)
+    // of each record's revisions, oldest first.
+    let history = async |doc: &str| -> Vec<(String, Value, bool)> {
+        conn.query(
+            "SELECT r.action,r.body,b.blueprint=c.blueprint FROM record_revisions r JOIN revision_blueprints b ON b.id=r.blueprint JOIN collections c ON c.id=r.collection_id WHERE r.document_id=?1 ORDER BY r.created_at,r.id",
+            &[id(doc)],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                crate::db::text_at(row, 0).unwrap(),
+                serde_json::from_str(&crate::db::text_at(row, 1).unwrap()).unwrap(),
+                crate::db::int_at(row, 2).unwrap() == 1,
+            )
+        })
+        .collect()
+    };
+    let stored = async |doc: &str| -> (Value, String) {
+        let rows = conn
+            .query(
+                "SELECT body,updated_at FROM documents WHERE id=?1",
+                &[id(doc)],
+            )
+            .await
+            .unwrap();
+        (
+            serde_json::from_str(&crate::db::text_at(&rows[0], 0).unwrap()).unwrap(),
+            crate::db::text_at(&rows[0], 1).unwrap(),
+        )
+    };
+    let matching = async |filter: Value| -> Vec<String> {
+        let (status, page) = json_of::<Value>(
+            app.call(
+                "POST",
+                &format!("/api/v1/collections/{}/query", items.id),
+                Some(&cookie),
+                None,
+                Some(json!({"filters":[filter],"sort_field":"size","descending":false,"limit":10})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|doc| doc["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let patch = async |blueprint: Value| {
+        let (status, body) = json_of::<Value>(
+            app.call(
+                "PATCH",
+                &format!("/api/v1/collections/{}", items.id),
+                Some(&cookie),
+                None,
+                Some(json!({"blueprint": blueprint})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    assert_eq!(
+        links().await,
+        vec![
+            (a.id.clone(), "owner".into(), first.id.clone()),
+            (b.id.clone(), "owner".into(), second.id.clone())
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+    );
+
+    // Renaming a link field rebuilds the table and links from the new bodies.
+    patch(fields(
+        json!({"name":"holder","type":"reference","collection":"owners","renamed_from":"owner"}),
+        json!({"name":"status","type":"string","options":["open","done"]}),
+    ))
+    .await;
+    let mut expected = vec![
+        (a.id.clone(), "holder".to_string(), first.id.clone()),
+        (b.id.clone(), "holder".to_string(), second.id.clone()),
+    ];
+    expected.sort();
+    assert_eq!(links().await, expected);
+    for (doc, owner) in [(&a, &first), (&b, &second)] {
+        let (body, updated_at) = stored(&doc.id).await;
+        assert_eq!(body["holder"], json!(owner.id));
+        assert!(body.get("owner").is_none());
+        assert!(updated_at > doc.updated_at);
+        let revisions = history(&doc.id).await;
+        assert_eq!(revisions.len(), 2, "{revisions:?}");
+        assert_eq!(revisions[0].0, "create");
+        assert!(!revisions[0].2);
+        assert_eq!(revisions[1], ("fields renamed".to_string(), body, true));
+    }
+    // Without a value to move, a record is not rewritten.
+    assert_eq!(stored(&c.id).await.1, c.updated_at);
+    assert_eq!(history(&c.id).await.len(), 1);
+    assert_eq!(
+        matching(json!({"field":"holder","op":"not_empty"})).await,
+        vec![a.id.clone(), b.id.clone()]
+    );
+    assert_eq!(
+        matching(json!({"field":"size","op":"gt","value":1})).await,
+        vec![b.id.clone(), c.id.clone()]
+    );
+
+    // Renaming an allowed value keeps the table and rewrites only the rows
+    // and links of the records holding it.
+    let (_, before_b) = stored(&b.id).await;
+    patch(fields(
+        json!({"name":"holder","type":"reference","collection":"owners"}),
+        json!({"name":"status","type":"string","options":["active","done"],"renamed_options":{"open":"active"}}),
+    ))
+    .await;
+    let (body, updated_at) = stored(&a.id).await;
+    assert_eq!(body["status"], "active");
+    assert!(updated_at > a.updated_at);
+    let revisions = history(&a.id).await;
+    assert_eq!(revisions.len(), 3, "{revisions:?}");
+    assert_eq!(revisions[2], ("values renamed".to_string(), body, true));
+    assert_eq!(stored(&b.id).await.1, before_b);
+    assert_eq!(history(&b.id).await.len(), 2);
+    assert_eq!(links().await, expected);
+    assert_eq!(
+        matching(json!({"field":"status","op":"eq","value":"active"})).await,
+        vec![a.id.clone()]
+    );
+    assert!(
+        matching(json!({"field":"status","op":"eq","value":"open"}))
+            .await
+            .is_empty()
+    );
+}
+
+/// Records written in a transaction after their collection changed in it use
+/// the new blueprint for their rows, links and history.
+#[tokio::test]
+async fn writes_after_a_blueprint_change_in_the_same_transaction_use_it() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "same-tx@example.com", "sametx").await;
+    let targets = create_collection(
+        &app,
+        &cookie,
+        "places",
+        "private",
+        json!({"fields":[{"name":"name","type":"string"}]}),
+    )
+    .await;
+    let place = create_document(&app, &cookie, &targets.id, json!({"name":"Here"})).await;
+    let items = create_collection(
+        &app,
+        &cookie,
+        "things",
+        "private",
+        json!({"fields":[{"name":"n","type":"number"}]}),
+    )
+    .await;
+    let first = crate::auth::new_id();
+    let second = crate::auth::new_id();
+    let conn = app.db.connect().await.unwrap();
+    conn.with_tx(async |conn| {
+        let now = crate::timeutil::now_rfc3339();
+        crate::store::insert_document(conn, &first, &items.id, &json!({"n":2}), &now).await?;
+        let mut blueprint = crate::store::find_collection(conn, &items.id)
+            .await?
+            .unwrap()
+            .blueprint;
+        blueprint.fields.extend(
+            serde_json::from_value::<Vec<vulse_model::FieldDef>>(json!([
+                {"name":"double","type":"calculated","formula":"=[n]*2"},
+                {"name":"place","type":"reference","collection":"places"}
+            ]))
+            .unwrap(),
+        );
+        crate::store::update_collection(
+            conn,
+            &items.id,
+            &items.name,
+            items.visibility,
+            &blueprint,
+            &now,
+        )
+        .await?;
+        crate::store::insert_document(
+            conn,
+            &second,
+            &items.id,
+            &json!({"n":3,"place":place.id}),
+            &now,
+        )
+        .await?;
+        crate::store::update_document(
+            conn,
+            &items.id,
+            &first,
+            &json!({"n":5,"place":place.id}),
+            &now,
+        )
+        .await?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT id,{} FROM {} ORDER BY {}",
+                crate::rows::column("double", 'n'),
+                crate::rows::table(&items.id),
+                crate::rows::column("double", 'n'),
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let doubles: Vec<(String, Option<f64>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                crate::db::text_at(row, 0).unwrap(),
+                crate::db::opt_number_at(row, 1).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        doubles,
+        vec![(second.clone(), Some(6.0)), (first.clone(), Some(10.0))]
+    );
+    let mut links: Vec<String> = conn
+        .query(
+            "SELECT source_id FROM document_links WHERE target_id=?1",
+            &[crate::db::SqlValue::Text(place.id.clone())],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| crate::db::text_at(row, 0).unwrap())
+        .collect();
+    links.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(links, expected);
+    // The first record's creation used the old blueprint; later revisions
+    // the new one.
+    let revisions: Vec<(String, String, usize)> = conn
+        .query(
+            "SELECT r.document_id,r.action,b.blueprint FROM record_revisions r JOIN revision_blueprints b ON b.id=r.blueprint WHERE r.collection_id=?1 ORDER BY r.created_at,r.id",
+            &[crate::db::SqlValue::Text(items.id.clone())],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let blueprint: vulse_model::Blueprint =
+                serde_json::from_str(&crate::db::text_at(row, 2).unwrap()).unwrap();
+            (
+                crate::db::text_at(row, 0).unwrap(),
+                crate::db::text_at(row, 1).unwrap(),
+                blueprint.fields.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        revisions,
+        vec![
+            (first.clone(), "create".into(), 1),
+            (second.clone(), "create".into(), 3),
+            (first.clone(), "update".into(), 3),
+        ]
+    );
+}
+
+/// Undo snapshots expire after a day and are then deleted by the cleanup.
+#[tokio::test]
+async fn cleanup_deletes_expired_undo_snapshots() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "undo-expiry@example.com", "undoexpiry").await;
+    let collection = create_collection(
+        &app,
+        &cookie,
+        "notes",
+        "private",
+        json!({"fields":[{"name":"title","type":"string"}]}),
+    )
+    .await;
+    let doc = create_document(&app, &cookie, &collection.id, json!({"title":"a"})).await;
+    let mut undo_ids = vec![];
+    for title in ["b", "c", "d"] {
+        let (status, result) = json_of::<vulse_model::MutationResult>(
+            app.call(
+                "PATCH",
+                &format!("/api/v1/collections/{}/documents/{}", collection.id, doc.id),
+                Some(&cookie),
+                None,
+                Some(json!({"patch":{"title":title}})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        undo_ids.push(result.undo_id);
+    }
+    let conn = app.db.connect().await.unwrap();
+    let text = |v: &str| crate::db::SqlValue::Text(v.to_string());
+    let stamp = crate::db::text_at(
+        &conn
+            .query(
+                "SELECT created_at FROM record_actions WHERE id=?1",
+                &[text(&undo_ids[2])],
+            )
+            .await
+            .unwrap()[0],
+        0,
+    )
+    .unwrap();
+    // The cutoff below is written in the same fixed-width format.
+    assert_eq!(
+        stamp.len(),
+        "2026-11-09T12:00:00.000000000Z".len(),
+        "{stamp}"
+    );
+    assert!(stamp.ends_with('Z'));
+    // A day before noon, half a second either side; with whole seconds the
+    // later one would compare as older than the cutoff.
+    for (id, created_at) in [
+        (&undo_ids[0], "2026-11-09T11:59:59.500000000Z"),
+        (&undo_ids[1], "2026-11-09T12:00:00.500000000Z"),
+    ] {
+        conn.execute(
+            "UPDATE record_actions SET created_at=?1 WHERE id=?2",
+            &[text(created_at), text(id)],
+        )
+        .await
+        .unwrap();
+    }
+    let removed = crate::store::purge_expired(&conn, "2026-11-10T12:00:00Z")
+        .await
+        .unwrap();
+    assert!(removed >= 1);
+    let mut kept: Vec<String> = conn
+        .query("SELECT id FROM record_actions", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| crate::db::text_at(row, 0).unwrap())
+        .collect();
+    kept.sort();
+    let mut expected = vec![undo_ids[1].clone(), undo_ids[2].clone()];
+    expected.sort();
+    assert_eq!(kept, expected);
+    let undo = |id: &str| format!("/api/v1/collections/{}/actions/{id}/undo", collection.id);
+    assert_eq!(
+        app.call("POST", &undo(&undo_ids[0]), Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.call("POST", &undo(&undo_ids[2]), Some(&cookie), None, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
 }

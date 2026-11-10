@@ -29,6 +29,8 @@ pub struct Conn {
     /// Collections changed in the open transaction, published on commit.
     changes: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub(crate) lookup_cache: crate::lookups::Cache,
+    /// Collections read in the open transaction; see `store::stored_collection`.
+    pub(crate) collection_cache: crate::store::CollectionCache,
     /// Recorded in the history of records this connection changes.
     source: std::sync::OnceLock<&'static str>,
 }
@@ -63,12 +65,14 @@ impl Db {
                 inner: ConnInner::Local(database.connect()?),
                 changes: Default::default(),
                 lookup_cache: Default::default(),
+                collection_cache: Default::default(),
                 source: Default::default(),
             },
             DbInner::Remote(database) => Conn {
                 inner: ConnInner::Remote(database.connect()?),
                 changes: Default::default(),
                 lookup_cache: Default::default(),
+                collection_cache: Default::default(),
                 source: Default::default(),
             },
         };
@@ -111,11 +115,20 @@ impl Conn {
             }
         }
     }
+    /// Forgets the collections read in the open transaction, after one was
+    /// created, changed or deleted.
+    pub(crate) fn collections_changed(&self) {
+        self.collection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
     fn begin_changes(&self) {
         self.lookup_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.collections_changed();
         *self.changes.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
     }
     pub(crate) fn in_transaction(&self) -> bool {
@@ -141,6 +154,7 @@ impl Conn {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.collections_changed();
     }
     pub async fn with_app_tx<T, F>(&self, f: F) -> Result<T, crate::error::AppError>
     where

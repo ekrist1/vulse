@@ -12,10 +12,12 @@
 //! values and `_r` the stored JSON. Calculated fields add `_s`, a sort key
 //! that is the number when there is one and the text otherwise.
 
-use serde_json::Value;
-use vulse_model::{Blueprint, FieldDef, FieldType, Lookups};
+use std::collections::HashMap;
 
-use crate::db::{Conn, SqlValue, text_at};
+use serde_json::Value;
+use vulse_model::{Blueprint, CompiledFormulas, FieldDef, FieldType, Lookups};
+
+use crate::db::{Conn, SqlRow, SqlValue};
 
 /// Parameters per `INSERT` while rebuilding a table.
 const BATCH_PARAMS: usize = 20_000;
@@ -26,6 +28,9 @@ const BATCH_PARAMS: usize = 20_000;
 /// every table on start when the stored version differs (see
 /// `records::rebuild_outdated_tables`).
 pub(crate) const VERSION: i64 = 1;
+
+/// A record as its row is written from: id, created_at, updated_at, body.
+pub(crate) type Record = (String, String, String, Value);
 
 /// The quoted table name for a collection.
 pub(crate) fn table(collection_id: &str) -> String {
@@ -77,8 +82,13 @@ fn columns(blueprint: &Blueprint) -> Vec<String> {
 }
 
 /// Column values for one record, after `columns`' first three.
-fn values(blueprint: &Blueprint, lookups: &Lookups, body: &Value) -> Vec<SqlValue> {
-    let (body, _) = vulse_model::calculate_document_with(blueprint, body, lookups);
+fn values(
+    blueprint: &Blueprint,
+    formulas: &CompiledFormulas,
+    lookups: &Lookups,
+    body: &Value,
+) -> Vec<SqlValue> {
+    let (body, _) = formulas.calculate(body, lookups);
     let mut search = Vec::new();
     let mut out = vec![SqlValue::Null];
     for field in &blueprint.fields {
@@ -214,13 +224,14 @@ pub(crate) async fn sync(
     conn: &Conn,
     collection_id: &str,
     blueprint: &Blueprint,
+    formulas: &CompiledFormulas,
     lookups: &Lookups,
     id: &str,
     body: &Value,
 ) -> anyhow::Result<()> {
     let names = columns(blueprint);
     let mut params = vec![SqlValue::Text(id.into())];
-    params.extend(values(blueprint, lookups, body));
+    params.extend(values(blueprint, formulas, lookups, body));
     let slots: Vec<String> = (2..=params.len()).map(|i| format!("?{i}")).collect();
     conn.execute(
         &format!(
@@ -244,75 +255,140 @@ pub(crate) async fn remove(conn: &Conn, collection_id: &str, id: &str) -> anyhow
     Ok(())
 }
 
-/// Recreates the table and fills it from every record body.
+/// Recreates the table and fills it from `records`, every record of the
+/// collection.
 pub(crate) async fn rebuild(
     conn: &Conn,
     collection_id: &str,
     blueprint: &Blueprint,
     lookups: &Lookups,
+    records: &[Record],
 ) -> anyhow::Result<()> {
     create_table(conn, collection_id, blueprint).await?;
-    fill(conn, collection_id, blueprint, lookups, "INSERT").await?;
+    let records: Vec<&Record> = records.iter().collect();
+    write(conn, collection_id, blueprint, lookups, "INSERT", &records).await?;
     // Building indexes over a full table is faster than updating them per row.
     create_indexes(conn, collection_id, blueprint).await
 }
 
-/// Rewrites every row from the record bodies, keeping the table and its
-/// indexes, for values calculated from other collections that changed.
+/// Brings every row up to date with the record bodies, keeping the table and
+/// its indexes, for values calculated from other collections that changed.
+/// Only rows whose values differ from the stored ones are written, so the
+/// table ends as rewriting every row would leave it, without the cost of
+/// rewriting rows and index entries that stay the same. As with rewriting
+/// every row, records missing from the table are added and rows without a
+/// record are left alone.
 pub(crate) async fn refresh(
     conn: &Conn,
     collection_id: &str,
     blueprint: &Blueprint,
     lookups: &Lookups,
 ) -> anyhow::Result<()> {
-    fill(conn, collection_id, blueprint, lookups, "INSERT OR REPLACE").await
-}
-
-/// Writes a row per record with `insert`, in batches.
-async fn fill(
-    conn: &Conn,
-    collection_id: &str,
-    blueprint: &Blueprint,
-    lookups: &Lookups,
-    insert: &str,
-) -> anyhow::Result<()> {
-    let rows = conn
+    let names = columns(blueprint);
+    let mut stored: HashMap<String, SqlRow> = conn
         .query(
-            "SELECT id, body, created_at, updated_at FROM documents WHERE collection_id=?1",
-            &[SqlValue::Text(collection_id.into())],
+            &format!("SELECT {} FROM {}", names.join(", "), table(collection_id)),
+            &[],
         )
-        .await?;
-    let mut records = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let body: Value = serde_json::from_str(&text_at(row, 1)?)?;
-        records.push((text_at(row, 0)?, text_at(row, 2)?, text_at(row, 3)?, body));
-    }
-    write(conn, collection_id, blueprint, lookups, insert, &records).await
+        .await?
+        .into_iter()
+        .map(|row| Ok((crate::db::text_at(&row, 0)?, row)))
+        .collect::<anyhow::Result<_>>()?;
+    let records = crate::store::list_records(conn, collection_id).await?;
+    let formulas = CompiledFormulas::new(blueprint);
+    let changed: Vec<SqlRow> = records
+        .iter()
+        .filter_map(|record| {
+            let row = row(blueprint, &formulas, lookups, record);
+            let old = stored.remove(&record.0);
+            old.is_none_or(|old| !same_row(&old, &row)).then_some(row)
+        })
+        .collect();
+    insert_rows(conn, collection_id, &names, "INSERT OR REPLACE", changed).await
 }
 
-/// Writes the rows of the given records (id, created_at, updated_at, body).
+/// Whether a stored row holds exactly the values of a derived one. Values
+/// match only with the same storage class, and numbers bit for bit, so a
+/// row judged unchanged reads back exactly as writing it again would leave
+/// it. The table's declared types keep what is written: `_n` is `REAL` and
+/// only ever given reals or `NULL`, `_s` has no type, so text stays text and
+/// numbers stay reals.
+fn same_row(stored: &[SqlValue], derived: &[SqlValue]) -> bool {
+    stored.len() == derived.len()
+        && stored.iter().zip(derived).all(|pair| match pair {
+            (SqlValue::Null, SqlValue::Null) => true,
+            (SqlValue::Integer(a), SqlValue::Integer(b)) => a == b,
+            (SqlValue::Real(a), SqlValue::Real(b)) => a.to_bits() == b.to_bits(),
+            (SqlValue::Text(a), SqlValue::Text(b)) => a == b,
+            _ => false,
+        })
+}
+
+/// A record's row, with a value per `columns`.
+fn row(
+    blueprint: &Blueprint,
+    formulas: &CompiledFormulas,
+    lookups: &Lookups,
+    (id, created_at, updated_at, body): &Record,
+) -> SqlRow {
+    let mut row = vec![
+        SqlValue::Text(id.clone()),
+        SqlValue::Text(created_at.clone()),
+        SqlValue::Text(updated_at.clone()),
+    ];
+    row.extend(values(blueprint, formulas, lookups, body));
+    row
+}
+
+/// Writes the rows of the given records with `insert`, in batches.
 pub(crate) async fn write(
     conn: &Conn,
     collection_id: &str,
     blueprint: &Blueprint,
     lookups: &Lookups,
     insert: &str,
-    records: &[(String, String, String, Value)],
+    records: &[&Record],
 ) -> anyhow::Result<()> {
     let names = columns(blueprint);
-    for chunk in records.chunks((BATCH_PARAMS / names.len()).max(1)) {
+    let formulas = CompiledFormulas::new(blueprint);
+    // Derived a batch at a time, so a large table is never held in full.
+    for chunk in records.chunks(per_statement(&names)) {
+        let rows = chunk
+            .iter()
+            .map(|record| row(blueprint, &formulas, lookups, record))
+            .collect();
+        insert_rows(conn, collection_id, &names, insert, rows).await?;
+    }
+    Ok(())
+}
+
+fn per_statement(names: &[String]) -> usize {
+    (BATCH_PARAMS / names.len()).max(1)
+}
+
+/// Writes rows holding a value per column of `names` with `insert`, in
+/// batches.
+async fn insert_rows(
+    conn: &Conn,
+    collection_id: &str,
+    names: &[String],
+    insert: &str,
+    rows: Vec<SqlRow>,
+) -> anyhow::Result<()> {
+    let mut rows = rows.into_iter();
+    loop {
         let mut params = Vec::new();
         let mut tuples = Vec::new();
-        for (id, created_at, updated_at, body) in chunk {
+        for row in rows.by_ref().take(per_statement(names)) {
             let start = params.len();
-            params.push(SqlValue::Text(id.clone()));
-            params.push(SqlValue::Text(created_at.clone()));
-            params.push(SqlValue::Text(updated_at.clone()));
-            params.extend(values(blueprint, lookups, body));
+            params.extend(row);
             let slots: Vec<String> = (start + 1..=params.len())
                 .map(|i| format!("?{i}"))
                 .collect();
             tuples.push(format!("({})", slots.join(", ")));
+        }
+        if tuples.is_empty() {
+            return Ok(());
         }
         conn.execute(
             &format!(
@@ -325,5 +401,4 @@ pub(crate) async fn write(
         )
         .await?;
     }
-    Ok(())
 }

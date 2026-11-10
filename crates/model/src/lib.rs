@@ -6,10 +6,10 @@ pub use query::{
 };
 mod formula;
 pub use formula::{
-    Expr as FormulaExpression, FUNCTIONS, call_function, LookupColumn, Lookups, calculate_document,
-    calculate_document_with, formula_dependencies, formula_lookups, inspect_formula,
-    lookup_references, rename_formula_fields, rename_formula_references, source_document,
-    text_value, validate_formulas,
+    CompiledFormulas, Expr as FormulaExpression, FUNCTIONS, call_function, LookupColumn, Lookups,
+    calculate_document, calculate_document_with, formula_dependencies, formula_lookups,
+    inspect_formula, lookup_references, rename_formula_fields, rename_formula_references,
+    source_document, text_value, validate_formulas,
 };
 mod identity;
 mod portable_text;

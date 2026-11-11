@@ -246,16 +246,25 @@ pub(super) fn function(n: &str, a: &[&Value]) -> Result<Value, String> {
                 let p = tail.find(&needle).ok_or("#VALUE! text not found")?;
                 return Ok(json!(start + tail[..p].chars().count() + 1));
             }
-            let needle = needle.to_lowercase();
+            // Lowercase per character, as the text is below: whole-string
+            // lowercasing treats a word-final sigma differently.
+            let needle: String = needle.chars().flat_map(char::to_lowercase).collect();
             if needle.contains(['*', '?', '~']) {
                 if tail_chars.len() > 32767 {
                     return Err("#VALUE! SEARCH text exceeds 32767 characters".into());
                 }
+                // Lowercasing can change the character count, so keep where
+                // each original character starts in the lowercased text.
+                let mut lower = Vec::with_capacity(tail_chars.len());
+                let mut starts = Vec::with_capacity(tail_chars.len() + 1);
+                for ch in &tail_chars {
+                    starts.push(lower.len());
+                    lower.extend(ch.to_lowercase());
+                }
+                starts.push(lower.len());
                 let mut budget = 1_000_000usize;
-                for i in 0..=tail_chars.len() {
-                    let sub_lower: Vec<char> =
-                        tail_chars[i..].iter().flat_map(|c| c.to_lowercase()).collect();
-                    if wildcard_chars(&sub_lower, &needle, true, &mut budget)? {
+                for (i, &at) in starts.iter().enumerate() {
+                    if wildcard_chars(&lower[at..], &needle, true, &mut budget)? {
                         return Ok(json!(start + i + 1));
                     }
                 }

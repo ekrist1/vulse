@@ -55,7 +55,8 @@ pub async fn create(db: &Db, asset_dir: &Path, out_dir: &Path) -> anyhow::Result
     }
     // Only one backup runs at a time, so leftovers are from an interrupted one.
     remove_partials(&out_dir).await?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let started = chrono::Utc::now();
+    let stamp = started.format("%Y%m%dT%H%M%SZ").to_string();
     let snapshot = out_dir.join(format!(".{PREFIX}{stamp}-{}.db", uuid::Uuid::new_v4()));
     let snapshot_sql = snapshot
         .to_str()
@@ -67,10 +68,15 @@ pub async fn create(db: &Db, asset_dir: &Path, out_dir: &Path) -> anyhow::Result
             .await
             .context("could not copy the database")?;
         let mut final_path = out_dir.join(format!("{PREFIX}{stamp}{SUFFIX}"));
-        let mut suffix_n = 2u32;
+        // A name taken within the same second moves to the next free one, so
+        // names stay timestamps: they sort by time and list with a date.
+        let mut named_at = started;
         while tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            final_path = out_dir.join(format!("{PREFIX}{stamp}-{suffix_n}{SUFFIX}"));
-            suffix_n += 1;
+            named_at += chrono::Duration::seconds(1);
+            final_path = out_dir.join(format!(
+                "{PREFIX}{}{SUFFIX}",
+                named_at.format("%Y%m%dT%H%M%SZ")
+            ));
         }
         let partial = out_dir.join(format!(
             ".{PREFIX}{stamp}-{}{SUFFIX}.partial",

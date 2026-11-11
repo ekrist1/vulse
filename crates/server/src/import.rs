@@ -259,15 +259,16 @@ pub async fn import_file(
                 .filter(|field| !crate::lookups::reads_collections(&collection.blueprint, field))
                 .collect();
             if !self_fields.is_empty() && result.errors.is_empty() {
+                let updated: std::collections::HashMap<&str, &Value> = staged
+                    .iter()
+                    .filter_map(|(_, target, body, _)| Some((target.as_deref()?, body)))
+                    .collect();
                 let mut post_bodies: Vec<Value> = store::list_document_bodies(conn, &id)
                     .await?
                     .into_iter()
-                    .map(|(doc_id, old_body)| {
-                        staged
-                            .iter()
-                            .find(|(_, t, _, _)| t.as_deref() == Some(doc_id.as_str()))
-                            .map(|(_, _, new_body, _)| new_body.clone())
-                            .unwrap_or(old_body)
+                    .map(|(doc_id, old_body)| match updated.get(doc_id.as_str()) {
+                        Some(new_body) => (*new_body).clone(),
+                        None => old_body,
                     })
                     .collect();
                 for (_, target, body, _) in &staged {

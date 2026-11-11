@@ -430,6 +430,8 @@ fn edge_cases_in_round_search_match_and_lookup_precision() {
     assert_eq!(run("ROUND(100, 307)"), Ok(json!(100.0)));
     assert_eq!(run("ROUND(1e295, 20)"), Ok(json!(1e295)));
     assert_eq!(run("SEARCH(\"x\", \"İx\")"), Ok(json!(2)));
+    assert_eq!(run("SEARCH(\"ΟΔΟΣ\", \"η ΟΔΟΣ\")"), Ok(json!(3)));
+    assert_eq!(run("SEARCH(\"?x\", \"İax\")"), Ok(json!(2)));
     assert_eq!(run("YEAR(2958465.5)"), Ok(json!(9999)));
 
     let bp: Blueprint = serde_json::from_value(json!({

@@ -1304,24 +1304,35 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
     let seq = use_mut_ref(|| 0u64);
     let slots = use_mut_ref(Vec::<OptionSlot>::new);
     let saved_snapshot = use_mut_ref(Vec::<String>::new);
+    // The options and renames this editor last showed or sent to its parent.
+    let expected =
+        use_mut_ref(|| None::<(Vec<String>, std::collections::BTreeMap<String, String>)>);
     {
         let mut s = slots.borrow_mut();
         let mut saved_prev = saved_snapshot.borrow_mut();
         if field.options.is_none() {
             s.clear();
             *saved_prev = props.saved.clone();
-        } else if s.len() != options.len() || *saved_prev != props.saved {
+        } else if s.len() != options.len()
+            || *saved_prev != props.saved
+            || expected.borrow().as_ref() != Some(&(options.clone(), renames.clone()))
+        {
+            // Also when the options were replaced from outside this editor
+            // (a restored or discarded draft), which leaves the slots stale.
             let mut next_seq = *seq.borrow();
             *s = derive_option_slots(&props.saved, &options, &renames, &mut next_seq);
             *seq.borrow_mut() = next_seq;
             *saved_prev = props.saved.clone();
+            *expected.borrow_mut() = Some((options.clone(), renames.clone()));
         }
     }
     let current_slots = slots.borrow().clone();
     let emit = {
         let field = field.clone();
         let on_change = props.on_change.clone();
+        let expected = expected.clone();
         move |options: Option<Vec<String>>, renames: std::collections::BTreeMap<String, String>| {
+            *expected.borrow_mut() = Some((options.clone().unwrap_or_default(), renames.clone()));
             let mut next = field.clone();
             next.options = options;
             next.renamed_options = (!renames.is_empty()).then_some(renames);

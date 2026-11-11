@@ -452,37 +452,52 @@ struct AssetControlProps {
 #[function_component(AssetControl)]
 fn asset_control(props: &AssetControlProps) -> Html {
     let error = use_state(String::new);
+    let epoch = use_mut_ref(|| 0u64);
     let on_file = {
         let collection_id = props.collection_id.clone();
         let on_change = props.on_change.clone();
         let error = error.clone();
+        let epoch = epoch.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let Some(file) = input.files().and_then(|files| files.get(0)) else {
                 return;
             };
+            input.set_value("");
+            let current = {
+                let mut e = epoch.borrow_mut();
+                *e += 1;
+                *e
+            };
             let collection_id = collection_id.clone();
             let on_change = on_change.clone();
             let error = error.clone();
+            let epoch = epoch.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match api::upload_asset(&collection_id, &file).await {
-                    Ok(asset) => {
+                    Ok(asset) if *epoch.borrow() == current => {
                         error.set(String::new());
                         on_change.emit(ValueInput::Asset(asset.id));
                     }
-                    Err(err) => error.set(err),
+                    Err(err) if *epoch.borrow() == current => error.set(err),
+                    _ => {}
                 }
             });
         })
     };
     let clear = {
         let on_change = props.on_change.clone();
-        Callback::from(move |_| on_change.emit(ValueInput::Asset(String::new())))
+        let epoch = epoch.clone();
+        Callback::from(move |_| {
+            *epoch.borrow_mut() += 1;
+            on_change.emit(ValueInput::Asset(String::new()));
+        })
     };
     html! {
         <div class="stack">
             if !props.value.is_empty() {
                 <img src={api::asset_content_url(&props.collection_id, &props.value)} alt="" />
+                <a href={api::asset_content_url(&props.collection_id, &props.value)} target="_blank" rel="noopener">{format!("Open file ({})", props.value.chars().take(8).collect::<String>())}</a>
                 <button type="button" onclick={clear}>{"Clear"}</button>
             }
             <input type="file" onchange={on_file} />
@@ -578,23 +593,34 @@ fn ref_select(props: &RefSelectProps) -> Html {
             },
         );
     }
+    let selected_epoch = use_mut_ref(|| 0u64);
     {
         let selected = selected.clone();
         let error = error.clone();
+        let selected_epoch = selected_epoch.clone();
         use_effect_with(
             (target.clone(), props.value.clone()),
             move |(target, value)| {
                 if selected.as_ref().map(|d| &d.id) != Some(value) {
+                    let current = {
+                        let mut e = selected_epoch.borrow_mut();
+                        *e += 1;
+                        *e
+                    };
                     selected.set(None);
                     let (target, value) = (target.clone(), value.clone());
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Some(target) = target
-                            && !value.is_empty() {
-                                match api::document(&target.id, &value).await {
-                                    Ok(d) => selected.set(Some(d)),
-                                    Err(e) => error.set(e),
+                            && !value.is_empty()
+                        {
+                            match api::document(&target.id, &value).await {
+                                Ok(d) if *selected_epoch.borrow() == current => {
+                                    selected.set(Some(d));
                                 }
+                                Err(e) if *selected_epoch.borrow() == current => error.set(e),
+                                _ => {}
                             }
+                        }
                     });
                 }
             },
@@ -645,11 +671,13 @@ fn ref_select(props: &RefSelectProps) -> Html {
         })
     };
     let close = {
-        let (open, active, changing) = (open.clone(), active.clone(), changing.clone());
+        let (open, active, changing, offset) =
+            (open.clone(), active.clone(), changing.clone(), offset.clone());
         Callback::from(move |_: ()| {
             open.set(false);
             active.set(None);
             changing.set(false);
+            offset.set(0);
         })
     };
     let name = props.collection_name.clone();

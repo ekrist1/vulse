@@ -626,6 +626,13 @@ async fn write_collection(
 }
 
 pub async fn delete_collection(conn: &Conn, id: &str) -> anyhow::Result<()> {
+    for sql in [
+        "DELETE FROM oauth_tokens WHERE grant_id IN (SELECT id FROM oauth_grants WHERE collection_id = ?1)",
+        "DELETE FROM oauth_codes WHERE grant_id IN (SELECT id FROM oauth_grants WHERE collection_id = ?1)",
+        "DELETE FROM oauth_grants WHERE collection_id = ?1",
+    ] {
+        conn.execute(sql, &[text(id)]).await?;
+    }
     conn.execute("DELETE FROM collections WHERE id = ?1", &[text(id)])
         .await?;
     conn.collections_changed();
@@ -843,6 +850,27 @@ pub async fn insert_document(
     body: &serde_json::Value,
     created_at: &str,
 ) -> anyhow::Result<()> {
+    insert_document_as(
+        conn,
+        id,
+        collection_id,
+        body,
+        created_at,
+        created_at,
+        "create",
+    )
+    .await
+}
+
+pub async fn insert_document_as(
+    conn: &Conn,
+    id: &str,
+    collection_id: &str,
+    body: &serde_json::Value,
+    created_at: &str,
+    updated_at: &str,
+    action: &str,
+) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO documents (id, collection_id, body, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -851,13 +879,13 @@ pub async fn insert_document(
             text(collection_id),
             text(&serde_json::to_string(body)?),
             text(created_at),
-            text(created_at),
+            text(updated_at),
         ],
     )
     .await?;
     conn.changed(collection_id);
     crate::records::sync_stored_document(conn, collection_id, id, body).await?;
-    crate::history::snapshot(conn, collection_id, id, "create").await?;
+    crate::history::snapshot(conn, collection_id, id, action).await?;
     Ok(())
 }
 

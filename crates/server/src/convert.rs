@@ -29,9 +29,10 @@ pub fn convert_value(
             (Value::String(_) | Value::Number(_) | Value::Bool(_), _) => {
                 Ok(text().map(Value::String))
             }
-            // Rich text keeps its words.
+            // Rich text keeps its words; empty rich text becomes unset.
             (_, FieldType::PortableText) => {
-                Ok(Some(Value::String(vulse_model::display_value(value))))
+                let words = vulse_model::display_value(value);
+                Ok((!words.trim().is_empty()).then_some(Value::String(words)))
             }
             _ => Err("only single values can become text".into()),
         },

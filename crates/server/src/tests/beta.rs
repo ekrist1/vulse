@@ -472,3 +472,160 @@ async fn indirect_lookup_chains_are_rejected_on_create_update_and_legacy_reads()
     assert!(doc.body["result"].is_null());
     assert!(doc.calculation_errors.contains_key("result"));
 }
+
+#[tokio::test]
+async fn sql_confirmation_detects_lookup_changes_and_restore_validates_before_links() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "review-fixes@example.com", "reviewfixes").await;
+    let rates = create_collection(
+        &app,
+        &cookie,
+        "rates",
+        "private",
+        json!({"fields":[{"name":"code","type":"string"},{"name":"factor","type":"number"}]}),
+    )
+    .await;
+    let rate_doc =
+        create_document(&app, &cookie, &rates.id, json!({"code":"STD","factor":2})).await;
+    let items = create_collection(
+        &app,
+        &cookie,
+        "items",
+        "private",
+        json!({"fields":[
+            {"name":"code","type":"string"},
+            {"name":"cached","type":"number"},
+            {"name":"ref_field","type":"string"},
+            {"name":"live","type":"calculated","formula":"=XLOOKUP([code],[rates.code],[rates.factor],0)"}
+        ]}),
+    )
+    .await;
+    let item = create_document(
+        &app,
+        &cookie,
+        &items.id,
+        json!({"code":"STD","cached":0,"ref_field":"not-a-uuid"}),
+    )
+    .await;
+
+    // Preview an UPDATE reading a cross-collection lookup, then mutate the lookup collection.
+    let sql = "UPDATE items SET cached = live WHERE code = 'STD'";
+    let (status, preview) = json_of::<vulse_model::SqlResult>(
+        app.call(
+            "POST",
+            "/api/v1/sql",
+            Some(&cookie),
+            None,
+            Some(json!({"sql": sql})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let confirm = preview.confirmation.expect("confirmation token");
+    assert_eq!(
+        app.call(
+            "PUT",
+            &format!("/api/v1/collections/{}/documents/{}", rates.id, rate_doc.id),
+            Some(&cookie),
+            None,
+            Some(json!({"body":{"code":"STD","factor":99}})),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (status, _) = json_of::<Value>(
+        app.call(
+            "POST",
+            "/api/v1/sql",
+            Some(&cookie),
+            None,
+            Some(json!({"sql": sql, "confirm": confirm})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Delete `item`, change `ref_field` to a Reference, and verify Trash restore returns 400 (not 500).
+    let (status, deleted_res) = json_of::<vulse_model::MutationResult>(
+        app.call(
+            "POST",
+            &format!("/api/v1/collections/{}/bulk", items.id),
+            Some(&cookie),
+            None,
+            Some(json!({"action":"delete","ids":[item.id]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        app.call(
+            "PATCH",
+            &format!("/api/v1/collections/{}", items.id),
+            Some(&cookie),
+            None,
+            Some(json!({"blueprint":{"fields":[
+                {"name":"code","type":"string"},
+                {"name":"cached","type":"number"},
+                {"name":"ref_field","type":"reference","collection":"rates"},
+                {"name":"live","type":"calculated","formula":"=XLOOKUP([code],[rates.code],[rates.factor],0)"}
+            ]}})),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let (_, trash) = json_of::<Page<vulse_model::DocumentRevision>>(
+        app.call(
+            "GET",
+            &format!("/api/v1/collections/{}/deleted", items.id),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(trash.items.len(), 1);
+    assert_eq!(
+        app.call(
+            "POST",
+            &format!(
+                "/api/v1/collections/{}/documents/{}/revisions/{}/restore",
+                items.id, item.id, trash.items[0].id
+            ),
+            Some(&cookie),
+            None,
+            Some(json!({})),
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.call(
+            "POST",
+            &format!(
+                "/api/v1/collections/{}/actions/{}/undo",
+                items.id, deleted_res.undo_id
+            ),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Backup directory inside upload directory is refused.
+    let nested_backup_dir = app.asset_dir.join("nested-backups");
+    assert!(
+        crate::backup::create(&app.db, &app.asset_dir, &nested_backup_dir)
+            .await
+            .is_err()
+    );
+}

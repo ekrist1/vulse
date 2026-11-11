@@ -27,7 +27,7 @@ const BATCH_PARAMS: usize = 20_000;
 /// text, numbers, sort keys, search text or formula results. Vulse rebuilds
 /// every table on start when the stored version differs (see
 /// `records::rebuild_outdated_tables`).
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 
 /// A record as its row is written from: id, created_at, updated_at, body.
 pub(crate) type Record = (String, String, String, Value);
@@ -101,7 +101,15 @@ fn values(
             continue;
         }
         let text = vulse_model::display_value(value).to_lowercase();
-        let number = value.as_f64().map_or(SqlValue::Null, SqlValue::Real);
+        let number = value.as_f64().map_or(SqlValue::Null, |n| {
+            let n = if field.kind == FieldType::Calculated && value.is_f64() {
+                let n = vulse_model::significant(n);
+                if n == 0.0 { 0.0 } else { n }
+            } else {
+                n
+            };
+            SqlValue::Real(n)
+        });
         if !text.is_empty() {
             search.push(text.clone());
         }
@@ -304,6 +312,9 @@ pub(crate) async fn refresh(
             old.is_none_or(|old| !same_row(&old, &row)).then_some(row)
         })
         .collect();
+    for ghost_id in stored.keys() {
+        remove(conn, collection_id, ghost_id).await?;
+    }
     insert_rows(conn, collection_id, &names, "INSERT OR REPLACE", changed).await
 }
 

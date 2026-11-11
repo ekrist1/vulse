@@ -95,11 +95,11 @@ pub fn app() -> Html {
     };
     html! {
         <ContextProvider<SessionCtx> context={ctx}>
-            <ConfirmProvider>
-                <BrowserRouter>
+            <BrowserRouter>
+                <ConfirmProvider>
                     <Switch<Route> render={switch} />
-                </BrowserRouter>
-            </ConfirmProvider>
+                </ConfirmProvider>
+            </BrowserRouter>
         </ContextProvider<SessionCtx>>
     }
 }

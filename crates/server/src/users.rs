@@ -42,6 +42,7 @@ pub async fn update_user(
             if disabled && !user.disabled {
                 store::set_user_disabled(conn, &id, Some(&timeutil::now_rfc3339())).await?;
                 store::delete_user_sessions(conn, &id, None).await?;
+                store::delete_links_for_email(conn, &user.email, LinkPurpose::Reset).await?;
             } else if !disabled && user.disabled {
                 store::set_user_disabled(conn, &id, None).await?;
             }

@@ -82,12 +82,18 @@ function mount(element, collectionId, label, json, onChange) {
       Code.extend({ excludes: "" }),
       Portable,
       ...customBlockExtensions((attrs, save) => openEmbedDialog(shell, attrs, save, () => editor.view.focus())),
-      Image.extend({ parseHTML() {
+      Image.extend({ addInputRules() {
+        return [];
+      }, parseHTML() {
         return [{ tag: "img[src]", getAttrs: (element2) => {
-          const prefix = `/api/v1/collections/${collectionId}/assets/`;
-          const url = new URL(element2.getAttribute("src"), window.location.origin);
-          const id = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length).replace(/\/content$/, "") : null;
-          return url.origin === window.location.origin && /^[0-9a-f-]{36}$/i.test(id || "") && url.pathname.endsWith("/content") ? { assetId: id } : false;
+          try {
+            const prefix = `/api/v1/collections/${collectionId}/assets/`;
+            const url = new URL(element2.getAttribute("src"), window.location.origin);
+            const id = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length).replace(/\/content$/, "") : null;
+            return url.origin === window.location.origin && /^[0-9a-f-]{36}$/i.test(id || "") && url.pathname.endsWith("/content") ? { assetId: id } : false;
+          } catch {
+            return false;
+          }
         } }];
       } }).configure({ allowBase64: false }),
       Placeholder.configure({ placeholder: "Start writing\u2026" })
@@ -117,6 +123,8 @@ function mount(element, collectionId, label, json, onChange) {
         const file = [...event.dataTransfer?.files || []].find((f) => f.type.startsWith("image/"));
         if (file) {
           event.preventDefault();
+          const hit = view.posAtCoords({ left: event.clientX, top: event.clientY });
+          if (hit) view.dispatch(view.state.tr.setSelection(TextSelection.near(view.state.doc.resolve(hit.pos))));
           upload(file);
           return true;
         }

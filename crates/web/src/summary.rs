@@ -66,6 +66,8 @@ pub struct SummaryPanelProps {
     pub collection: CollectionView,
     pub query: RecordQuery,
     pub spec: SummarySpec,
+    #[prop_or_default]
+    pub reload: usize,
     pub on_change: Callback<SummarySpec>,
     /// Shows the records of one group in the table.
     pub on_drill: Callback<Vec<RecordFilter>>,
@@ -92,7 +94,7 @@ pub fn summary_panel(props: &SummaryPanelProps) -> Html {
             summary: props.spec.clone(),
         };
         let valid = invalid.is_none();
-        use_effect_with((id, request, valid), move |(id, request, valid)| {
+        use_effect_with((id, request, valid, props.reload), move |(id, request, valid, _)| {
             *epoch.borrow_mut() += 1;
             let generation = *epoch.borrow();
             let (id, request) = (id.clone(), request.clone());
@@ -652,18 +654,23 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
         let name = format!("value_{n}");
         let number = fields
             .iter()
-            .find(|f| f.kind == FieldType::Number)
+            .find(|f| matches!(f.kind, FieldType::Number | FieldType::Calculated))
             .map(|f| f.name.clone());
+        let actual_op = if op == SummaryOp::Sum && number.is_none() {
+            SummaryOp::Count
+        } else {
+            op
+        };
         let run = update(Box::new(move |next: &mut SummarySpec| {
             next.measures.push(SummaryMeasure {
                 name: name.clone(),
-                op,
-                field: if op == SummaryOp::Sum {
+                op: actual_op,
+                field: if actual_op == SummaryOp::Sum {
                     number.clone()
                 } else {
                     None
                 },
-                formula: (op == SummaryOp::Formula).then(|| "=".to_string()),
+                formula: (actual_op == SummaryOp::Formula).then(|| "=".to_string()),
             });
         }));
         Callback::from(move |_| run())

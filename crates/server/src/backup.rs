@@ -44,6 +44,15 @@ pub async fn create(db: &Db, asset_dir: &Path, out_dir: &Path) -> anyhow::Result
         .await
         .with_context(|| format!("could not create {}", out_dir.display()))?;
     let out_dir = tokio::fs::canonicalize(out_dir).await?;
+    if let Ok(canon_assets) = tokio::fs::canonicalize(asset_dir).await
+        && out_dir.starts_with(&canon_assets)
+    {
+        anyhow::bail!(
+            "the backup directory ({}) cannot be inside the upload directory ({})",
+            out_dir.display(),
+            canon_assets.display()
+        );
+    }
     // Only one backup runs at a time, so leftovers are from an interrupted one.
     remove_partials(&out_dir).await?;
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -57,8 +66,16 @@ pub async fn create(db: &Db, asset_dir: &Path, out_dir: &Path) -> anyhow::Result
         conn.execute(&format!("VACUUM INTO '{snapshot_sql}'"), &[])
             .await
             .context("could not copy the database")?;
-        let final_path = out_dir.join(format!("{PREFIX}{stamp}{SUFFIX}"));
-        let partial = out_dir.join(format!(".{PREFIX}{stamp}{SUFFIX}.partial"));
+        let mut final_path = out_dir.join(format!("{PREFIX}{stamp}{SUFFIX}"));
+        let mut suffix_n = 2u32;
+        while tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+            final_path = out_dir.join(format!("{PREFIX}{stamp}-{suffix_n}{SUFFIX}"));
+            suffix_n += 1;
+        }
+        let partial = out_dir.join(format!(
+            ".{PREFIX}{stamp}-{}{SUFFIX}.partial",
+            uuid::Uuid::new_v4()
+        ));
         let (snapshot_file, asset_dir) = (snapshot.clone(), asset_dir.to_path_buf());
         let partial_file = partial.clone();
         let assets = tokio::task::spawn_blocking(move || {
@@ -111,6 +128,7 @@ fn write_archive(
         collect_files(asset_dir, asset_dir, &mut files)?;
     }
     files.sort();
+    let mut written_assets = 0usize;
     for relative in &files {
         let name = format!(
             "storage/{}",
@@ -126,6 +144,7 @@ fn write_archive(
         };
         zip.start_file(name, stored)?;
         std::io::copy(&mut BufReader::new(file), &mut zip)?;
+        written_assets += 1;
     }
     zip.start_file("backup.json", deflated)?;
     let manifest = serde_json::json!({
@@ -133,12 +152,12 @@ fn write_archive(
         "vulse_version": env!("CARGO_PKG_VERSION"),
         "created_at": created_at,
         "database": "vulse.db",
-        "assets": files.len(),
+        "assets": written_assets,
         "restore": "Stop Vulse, put vulse.db at VULSE_DB_PATH (removing any vulse.db-wal beside it) and storage/ at ASSET_DIR, then start Vulse.",
     });
     zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
     zip.finish()?.flush()?;
-    Ok(files.len())
+    Ok(written_assets)
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -390,12 +409,26 @@ pub fn spawn_socket(db: Db, asset_dir: PathBuf, db_path: &Path) {
     };
     // Connecting needs write permission on the socket, which the default
     // umask already limits to the owner; 0600 also removes read access.
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), "could not restrict backup socket permissions: {e}");
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let owner_uid = std::fs::metadata(&path)
+        .ok()
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m));
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
+            if let (Some(expected), Ok(cred)) = (owner_uid, stream.peer_cred())
+                && cred.uid() != expected
+                && cred.uid() != 0
+            {
+                tracing::warn!(uid = cred.uid(), "rejected backup socket connection from another user");
+                continue;
+            }
             let (db, asset_dir) = (db.clone(), asset_dir.clone());
             tokio::spawn(async move {
                 if let Err(e) = answer(stream, &db, &asset_dir).await {

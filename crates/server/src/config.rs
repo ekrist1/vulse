@@ -35,10 +35,23 @@ impl Config {
         }
         let public_url =
             nonempty("VULSE_PUBLIC_URL").map(|url| url.trim_end_matches('/').to_string());
-        if let Some(url) = &public_url
-            && !url.starts_with("https://") && !url.starts_with("http://") {
+        if let Some(url) = &public_url {
+            if !url.starts_with("https://") && !url.starts_with("http://") {
                 anyhow::bail!("VULSE_PUBLIC_URL must start with https:// or http://");
             }
+            let parsed = url::Url::parse(url)
+                .ok()
+                .filter(|u| {
+                    u.username().is_empty()
+                        && u.password().is_none()
+                        && u.query().is_none()
+                        && u.fragment().is_none()
+                        && u.path() == "/"
+                        && u.host().is_some()
+                })
+                .context("VULSE_PUBLIC_URL must be an origin such as https://cms.example.com")?;
+            let _ = parsed;
+        }
         let cookie_secure = match nonempty("VULSE_COOKIE_SECURE") {
             Some(value) => flag("VULSE_COOKIE_SECURE", &value)?,
             None => public_url
@@ -56,10 +69,16 @@ impl Config {
         // OAuth requires https, except on this machine during development.
         if mcp
             && let Some(url) = &public_url
-            && let Some(rest) = url.strip_prefix("http://")
+            && let Ok(parsed) = url::Url::parse(url)
+            && parsed.scheme() == "http"
         {
-            let host = rest.split(['/', ':']).next().unwrap_or_default();
-            if !["localhost", "127.0.0.1", "[::1]"].contains(&host) {
+            let loopback = match parsed.host() {
+                Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            if !loopback {
                 anyhow::bail!("VULSE_PUBLIC_URL must use https:// when VULSE_MCP is on");
             }
         }

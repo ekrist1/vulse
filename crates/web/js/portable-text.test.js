@@ -64,4 +64,12 @@ test("preserves newline marks, adjacent matching spans, and maximum key lengths"
   const doc = toTiptap([original], "collection");
   doc.content[0].content.at(-1).text += " changed";
   assert(toPortable(doc)[0].children.every((s) => s._key.length <= 80));
+
+  // Lifting a styled list item out of a list resets its style to normal,
+  // while quoting a list preserves blockquote style on its items.
+  const listed = toTiptap([{ ...block("item", "h2", "Listed"), listItem: "bullet", level: 1 }], "collection");
+  const unlisted = { type: "doc", content: [listed.content[0].content[0].content[0]] };
+  assert.equal(toPortable(unlisted)[0].style, "normal");
+  const quotedList = { type: "doc", content: [{ type: "blockquote", content: [toTiptap([{ ...block("q", "normal", "Quoted item"), listItem: "bullet", level: 1 }], "collection").content[0]] }] };
+  assert.equal(toPortable(quotedList)[0].style, "blockquote");
 });

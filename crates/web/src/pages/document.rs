@@ -241,21 +241,42 @@ pub fn document_page(props: &DocumentPageProps) -> Html {
                     return;
                 }
                 let mut next = (*inputs).clone();
-                for (index, field) in collection.blueprint.fields.iter().enumerate() {
-                    if let Some(old) = draft.blueprint.fields.iter().position(|f| {
-                        f.name == field.name
-                            && f.kind == field.kind
-                            && f.items == field.items
-                            && f.collection == field.collection
-                    })
-                        && draft.inputs.get(old) != draft.baseline.get(old)
-                            && let Some(value) = draft.inputs.get(old) {
-                                next[index] = value.clone();
-                            }
+                let mut applied = 0usize;
+                let mut skipped = 0usize;
+                for (old, old_field) in draft.blueprint.fields.iter().enumerate() {
+                    if draft.inputs.get(old) == draft.baseline.get(old) {
+                        continue;
+                    }
+                    if let Some(index) = collection.blueprint.fields.iter().position(|field| {
+                        field.name == old_field.name
+                            && field.kind == old_field.kind
+                            && field.items == old_field.items
+                            && field.collection == old_field.collection
+                    }) && let Some(value) = draft.inputs.get(old)
+                    {
+                        next[index] = value.clone();
+                        applied += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                if skipped > 0 && applied == 0 {
+                    error.set(
+                        "The fields edited in this draft were renamed, retyped or removed. The draft is kept on this device; copy needed values before discarding it."
+                            .into(),
+                    );
+                    return;
                 }
                 inputs.set(next);
-                pending.set(None);
-                error.set(String::new());
+                if skipped > 0 {
+                    error.set(
+                        "Matching fields were applied, while renamed or retyped draft fields remain saved in the draft until you discard it."
+                            .into(),
+                    );
+                } else {
+                    pending.set(None);
+                    error.set(String::new());
+                }
             });
         }
     });

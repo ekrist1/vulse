@@ -316,10 +316,19 @@ pub async fn update_collection(
                 ));
             }
             if !failing.is_empty() {
-                let hint = if !retyped.is_empty() && !body.convert_field_values {
+                let convertible: Vec<_> = retyped
+                    .iter()
+                    .filter(|(_, _, new)| {
+                        !matches!(
+                            new.kind,
+                            FieldType::PortableText | FieldType::Array | FieldType::Calculated
+                        )
+                    })
+                    .collect();
+                let hint = if !convertible.is_empty() && !body.convert_field_values {
                     format!(
                         " To convert stored values to the new type of {}, confirm with convert_field_values.",
-                        retyped
+                        convertible
                             .iter()
                             .map(|(name, old, new)| format!(
                                 "'{name}' ({} → {})",

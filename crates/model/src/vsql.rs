@@ -420,8 +420,13 @@ impl Parser<'_> {
             let table = self.table()?;
             self.expect_keyword("SET")?;
             let mut set = Vec::new();
+            let mut assigned = std::collections::HashSet::new();
             loop {
+                let at = self.at();
                 let field = self.name("field name")?;
+                if !assigned.insert(field.clone()) {
+                    return error(format!("'{field}' is set more than once"), at);
+                }
                 if !self.symbol("=") {
                     return error("expected '=' after the field name", self.at());
                 }
@@ -982,6 +987,28 @@ fn call(name: &str, args: &[SqlExpr], star: bool, scope: &Scope) -> Result<Value
                 .unwrap_or(Value::Null),
         });
     }
+    let normalize = |v: Value| match v.as_f64() {
+        Some(n) if v.is_f64() => number(n),
+        _ => v,
+    };
+    if name == "IF" {
+        if args.len() != 3 {
+            return Err("IF takes 3 arguments".into());
+        }
+        let cond = eval(&args[0], scope)?;
+        let negated = crate::call_function("NOT", &[cond])?;
+        let branch = if negated == Value::Bool(false) { 1 } else { 2 };
+        return eval(&args[branch], scope).map(normalize);
+    }
+    if name == "IFERROR" {
+        if args.len() != 2 {
+            return Err("IFERROR takes 2 arguments".into());
+        }
+        return match eval(&args[0], scope) {
+            Ok(v) => Ok(normalize(v)),
+            Err(_) => eval(&args[1], scope).map(normalize),
+        };
+    }
     let values = args
         .iter()
         .map(|a| eval(a, scope))
@@ -989,7 +1016,7 @@ fn call(name: &str, args: &[SqlExpr], star: bool, scope: &Scope) -> Result<Value
     match name {
         "COALESCE" | "IFNULL" => Ok(values
             .into_iter()
-            .find(|v| !v.is_null())
+            .find(|v| !v.is_null() && *v != json!(""))
             .unwrap_or(Value::Null)),
         "LENGTH" => crate::call_function("LEN", &values),
         "SUBSTR" => {
@@ -1000,10 +1027,7 @@ fn call(name: &str, args: &[SqlExpr], star: bool, scope: &Scope) -> Result<Value
             crate::call_function("MID", &values)
         }
         "MIN" | "MAX" => crate::call_function(name, &values),
-        _ => crate::call_function(name, &values).map(|v| match v.as_f64() {
-            Some(n) => number(n),
-            None => v,
-        }),
+        _ => crate::call_function(name, &values).map(normalize),
     }
 }
 
@@ -1159,7 +1183,16 @@ pub fn run_select(
         let key = select
             .group_by
             .iter()
-            .map(|e| eval(e, &scope))
+            .map(|e| {
+                eval(e, &scope).map(|v| match v {
+                    Value::String(s) if s.is_empty() => Value::Null,
+                    Value::Number(n) => n
+                        .as_f64()
+                        .map(|f| number(if f == 0.0 { 0.0 } else { f }))
+                        .unwrap_or(Value::Number(n)),
+                    other => other,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let key = serde_json::to_string(&key).unwrap_or_default();
         let slot = *index.entry(key).or_insert_with(|| {
@@ -1354,5 +1387,15 @@ mod tests {
                 .unwrap_err()
                 .contains("not a condition")
         );
+        assert!(
+            parse_sql("UPDATE b SET fte = 1, fte = 2")
+                .unwrap_err()
+                .message
+                .contains("set more than once")
+        );
+        let (_, rows, _) = select(
+            "SELECT IFERROR(1 / 0, 99), IF(fte > 100, 1 / 0, 42), IFNULL('', 'fallback') FROM b WHERE id = '1'",
+        );
+        assert_eq!(rows, vec![vec![json!(99), json!(42), json!("fallback")]]);
     }
 }

@@ -10,8 +10,14 @@ COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:22-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 
-RUN rustup target add wasm32-unknown-unknown \
-    && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+RUN ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+         x86_64) TRUNK_TARGET="x86_64-unknown-linux-gnu" ;; \
+         aarch64|arm64) TRUNK_TARGET="aarch64-unknown-linux-gnu" ;; \
+         *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && rustup target add wasm32-unknown-unknown \
+    && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${TRUNK_TARGET}.tar.gz" \
     | tar -xz -C /usr/local/bin
 
 WORKDIR /src

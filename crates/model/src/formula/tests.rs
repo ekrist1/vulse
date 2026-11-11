@@ -424,3 +424,43 @@ fn compiled_formulas_calculate_like_each_call_compiling() {
     assert_eq!(body["label"], "big");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn edge_cases_in_round_search_match_and_lookup_precision() {
+    assert_eq!(run("ROUND(100, 307)"), Ok(json!(100.0)));
+    assert_eq!(run("ROUND(1e295, 20)"), Ok(json!(1e295)));
+    assert_eq!(run("SEARCH(\"x\", \"İx\")"), Ok(json!(2)));
+    assert_eq!(run("YEAR(2958465.5)"), Ok(json!(9999)));
+
+    let bp: Blueprint = serde_json::from_value(json!({
+        "fields": [
+            {"name": "arr", "type": "json"},
+            {"name": "pos", "type": "calculated", "formula": "=MATCH(5, [arr], 1)"},
+            {"name": "rate_label", "type": "calculated", "formula": "=XLOOKUP(0.1 + 0.2, [rates.factor], [rates.label])"},
+            {"name": "rate_sum", "type": "calculated", "formula": "=SUMIFS([rates.val], [rates.factor], 0.1 + 0.2)"}
+        ]
+    }))
+    .unwrap();
+    let mut lookups = Lookups::default();
+    lookups.insert(
+        "rates",
+        "factor",
+        Arc::new(LookupColumn::new("rates", vec![json!(0.3), json!(0.5)])),
+    );
+    lookups.insert(
+        "rates",
+        "label",
+        Arc::new(LookupColumn::new("rates", vec![json!("hit"), json!("miss")])),
+    );
+    lookups.insert(
+        "rates",
+        "val",
+        Arc::new(LookupColumn::new("rates", vec![json!(10), json!(20)])),
+    );
+    let (out, errors) =
+        CompiledFormulas::new(&bp).calculate(&json!({"arr": [1, 3, 7, null]}), &lookups);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(out["pos"], json!(2));
+    assert_eq!(out["rate_label"], json!("hit"));
+    assert_eq!(out["rate_sum"], json!(10.0));
+}

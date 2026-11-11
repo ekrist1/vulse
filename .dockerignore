@@ -1,8 +1,11 @@
 target
 storage
+backups
 release
 *.db
 *.db-*
+.env
+.env.*
 .git
 .cursor
 crates/web/dist

@@ -13,7 +13,7 @@ pub use eval::{LookupColumn, Lookups};
 pub use functions::call_function;
 pub use parser::{Expr, formula_dependencies, inspect_formula};
 pub use rename::{rename_formula_fields, rename_formula_references};
-pub use value::text_value;
+pub use value::{significant, text_value};
 
 use crate::{Blueprint, FieldType};
 use eval::{Ctx, resolve};

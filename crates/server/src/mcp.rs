@@ -278,8 +278,8 @@ impl VulseMcp {
             let conn = self.conn().await?;
             let collections =
                 content::visible_collections(&conn, principal, MAX_COLLECTIONS, offset).await?;
-            let next_offset =
-                (collections.len() as u32 == MAX_COLLECTIONS).then_some(offset + MAX_COLLECTIONS);
+            let next_offset = (collections.len() as u32 == MAX_COLLECTIONS)
+                .then(|| offset.saturating_add(MAX_COLLECTIONS));
             let items: Vec<Value> = collections
                 .iter()
                 .map(|collection| {
@@ -620,6 +620,19 @@ async fn find_collection(
     key: &str,
 ) -> Result<CollectionView, AppError> {
     let key = key.trim();
+    if let Some(scope_id) = &principal.collection_scope {
+        let scoped = store::find_collection(conn, scope_id)
+            .await?
+            .ok_or(AppError::Forbidden(
+                "this api key is limited to one collection".into(),
+            ))?;
+        if key == scoped.id || key.eq_ignore_ascii_case(&scoped.name) {
+            return Ok(scoped);
+        }
+        return Err(AppError::Forbidden(
+            "this api key is limited to one collection".into(),
+        ));
+    }
     let found = match store::find_collection(conn, key).await? {
         Some(collection) => Some(collection),
         None => store::find_collection_by_name(conn, &key.to_ascii_lowercase()).await?,

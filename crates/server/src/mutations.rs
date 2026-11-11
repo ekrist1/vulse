@@ -56,7 +56,11 @@ fn merged(
         if field.kind == FieldType::Calculated {
             return Err(AppError::bad("calculated fields are read-only"));
         }
-        body.insert(key.clone(), value.clone());
+        if value.is_null() {
+            body.remove(key);
+        } else {
+            body.insert(key.clone(), value.clone());
+        }
     }
     Ok(Value::Object(body))
 }
@@ -256,8 +260,18 @@ pub(crate) async fn run_undo(
         let deletions:Vec<_>=snapshot.after.iter().filter(|d|!snapshot.before.iter().any(|b|b.id==d.id)).map(|d|d.id.clone()).collect();
         crate::relationships::guard_delete(conn,id,&deletions,"document").await?;
         let now=timeutil::now_rfc3339();
+        for doc in &snapshot.before {
+            vulse_model::validate_document(&collection.blueprint, &doc.body)
+                .map_err(AppError::bad)?;
+        }
         for doc in &snapshot.after {if !snapshot.before.iter().any(|before|before.id==doc.id){store::delete_document(conn,id,&doc.id).await?;}}
-        for doc in &snapshot.before {if !store::document_exists(conn,id,&doc.id).await?{store::insert_document(conn,&doc.id,id,&doc.body,&doc.created_at).await?;}store::update_document(conn,id,&doc.id,&doc.body,&now).await?;}
+        for doc in &snapshot.before {
+            if !store::document_exists(conn, id, &doc.id).await? {
+                store::insert_document_as(conn, &doc.id, id, &doc.body, &doc.created_at, &now, "restore").await?;
+            } else {
+                store::update_document(conn, id, &doc.id, &doc.body, &now).await?;
+            }
+        }
         for doc in &snapshot.before {check_body(conn,id,&collection.name,&collection.blueprint,&doc.body).await?;}
         conn.execute("DELETE FROM record_actions WHERE id=?1",&[text(action_id)]).await?;
         let lookups=crate::lookups::load(conn,&collection.blueprint).await?;let mut documents=vec![];for doc in &snapshot.before {let mut current=store::find_document(conn,id,&doc.id).await?.ok_or(AppError::NotFound)?;materialize(&collection.blueprint,&lookups,&mut current);documents.push(current);}

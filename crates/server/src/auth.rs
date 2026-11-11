@@ -223,8 +223,13 @@ pub async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_ascii_lowercase();
-    let account = account_key(&email);
     let address = address_key(&ip);
+    if check_email(&email).is_err() {
+        state.throttle.check(&[(&address, ADDRESS_LIMIT)])?;
+        state.throttle.fail(&[&address]);
+        return Err(AppError::Unauthorized);
+    }
+    let account = account_key(&email);
     state
         .throttle
         .check(&[(&account, ACCOUNT_LIMIT), (&address, ADDRESS_LIMIT)])?;
@@ -282,22 +287,28 @@ pub async fn change_password(
     SessionOnly(principal): SessionOnly,
     Json(body): Json<ChangePassword>,
 ) -> Result<StatusCode, AppError> {
-    let account = account_key(&principal.email);
-    state.throttle.check(&[(&account, ACCOUNT_LIMIT)])?;
+    let pw_key = format!("password_change:{}", principal.user_id);
+    state.throttle.check(&[(&pw_key, ACCOUNT_LIMIT)])?;
     check_password(&body.new_password).map_err(AppError::bad)?;
+    if check_password(&body.current_password).is_err() {
+        state.throttle.fail(&[&pw_key]);
+        return Err(AppError::bad("the current password is not correct"));
+    }
     let conn = state.db.connect().await?;
     let user = store::find_user(&conn, &principal.user_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
     if !verify_on_worker(&state, body.current_password, Some(user.password_hash)).await? {
-        state.throttle.fail(&[&account]);
+        state.throttle.fail(&[&pw_key]);
         return Err(AppError::bad("the current password is not correct"));
     }
+    state.throttle.clear(&pw_key);
     let password_hash = hash_on_worker(&state, body.new_password).await?;
     conn.with_app_tx(async |conn| {
         store::set_password_hash(conn, &principal.user_id, &password_hash).await?;
         store::delete_user_sessions(conn, &principal.user_id, principal.session_hash.as_deref())
             .await?;
+        store::delete_links_for_email(conn, &user.email, LinkPurpose::Reset).await?;
         Ok(())
     })
     .await?;
@@ -662,15 +673,20 @@ fn bearer_token(parts: &Parts) -> Option<String> {
 }
 
 fn cookie_from_headers(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        if let Some(value) = part
-            .trim()
-            .strip_prefix(name)
-            .and_then(|v| v.strip_prefix('='))
-            && !value.is_empty() {
+    for header_value in headers.get_all(header::COOKIE) {
+        for part in header_value.as_bytes().split(|&b| b == b';') {
+            let Ok(part) = std::str::from_utf8(part) else {
+                continue;
+            };
+            if let Some(value) = part
+                .trim()
+                .strip_prefix(name)
+                .and_then(|v| v.strip_prefix('='))
+                && !value.is_empty()
+            {
                 return Some(value.to_string());
             }
+        }
     }
     None
 }

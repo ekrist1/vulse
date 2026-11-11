@@ -97,7 +97,7 @@ export function toPortable(doc) {
     } else if (node.type === "image") {
       if (node.attrs?.assetId) blocks.push({ _key: unique(node.attrs.portableKey), _type: "image", asset: { _type: "reference", _ref: node.attrs.assetId } });
     } else if (node.type === "paragraph" || node.type === "heading") {
-      const style = node.type === "heading" ? `h${node.attrs.level}` : context.quote ? "blockquote" : node.attrs?.portableStyle || "normal";
+      const style = node.type === "heading" ? `h${node.attrs.level}` : context.quote ? "blockquote" : (context.list && node.attrs?.portableStyle) || "normal";
       const block = { _key: unique(node.attrs?.portableKey), _type: "block", style, markDefs: [], children: spans(node) };
       block.children.forEach((span, index) => span._key = `${block._key.slice(0, 64)}_s${index}`);
       if (context.list) {
@@ -119,7 +119,7 @@ export function toPortable(doc) {
       if (original && original._key === block._key && shape(original) === shape(block)) blocks.push(original);
       else blocks.push(block);
     } else if (node.type === "bulletList" || node.type === "orderedList") {
-      for (const child of node.content || []) visit(child, { list: node.type === "bulletList" ? "bullet" : "number", depth: (context.depth || 0) + 1 });
+      for (const child of node.content || []) visit(child, { ...context, list: node.type === "bulletList" ? "bullet" : "number", depth: (context.depth || 0) + 1 });
     } else {
       for (const child of node.content || []) visit(child, { ...context, quote: context.quote || node.type === "blockquote" });
     }

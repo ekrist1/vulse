@@ -34,12 +34,14 @@ pub fn history_panel(props: &HistoryProps) -> Html {
         let doc = props.document.as_ref().map(|d| d.id.clone());
         let version = props.document.as_ref().map(|d| d.updated_at.clone());
         let epoch = epoch.clone();
+        let offset_state = offset.clone();
         use_effect_with(
             (collection, doc, version, *offset, *refresh),
             move |(id, doc, _, offset, _)| {
                 *epoch.borrow_mut() += 1;
                 let generation = *epoch.borrow();
                 let (id, doc, offset) = (id.clone(), doc.clone(), *offset);
+                let offset_state = offset_state.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let result = if let Some(doc) = doc {
                         api::revisions(&id, &doc, offset).await
@@ -51,6 +53,10 @@ pub fn history_panel(props: &HistoryProps) -> Html {
                     }
                     match result {
                         Ok(page) => {
+                            if page.items.is_empty() && offset > 0 {
+                                offset_state.set(offset.saturating_sub(20));
+                                return;
+                            }
                             more.set(page.items.len() == 20);
                             revisions.set(page.items);
                             error.set(String::new());

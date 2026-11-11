@@ -21,7 +21,8 @@ struct Inner {
     on_change: Callback<()>,
     on_message: RefCell<Option<Handler>>,
     on_open: RefCell<Option<Handler>>,
-    /// Whether a connection has opened before, so the next is a reconnect.
+    on_error: RefCell<Option<Handler>>,
+    /// Whether a connection has opened before, or started hidden in a background tab.
     opened: Cell<bool>,
 }
 
@@ -32,9 +33,12 @@ impl Inner {
         *self.debounce.borrow_mut() = Some(Timeout::new(300, move || on_change.emit(())));
     }
     fn connect(&self) {
-        if self.source.borrow().is_some() {
-            return;
+        if let Some(existing) = self.source.borrow().as_ref() {
+            if existing.ready_state() != EventSource::CLOSED {
+                return;
+            }
         }
+        self.disconnect();
         let Ok(source) = EventSource::new(&self.url) else {
             return;
         };
@@ -45,11 +49,15 @@ impl Inner {
         if let Some(handler) = self.on_open.borrow().as_ref() {
             source.set_onopen(Some(handler.as_ref().unchecked_ref()));
         }
+        if let Some(handler) = self.on_error.borrow().as_ref() {
+            source.set_onerror(Some(handler.as_ref().unchecked_ref()));
+        }
         *self.source.borrow_mut() = Some(source);
     }
     fn disconnect(&self) {
         if let Some(source) = self.source.borrow_mut().take() {
             source.set_onopen(None);
+            source.set_onerror(None);
             source.close();
         }
     }
@@ -65,6 +73,7 @@ impl Changes {
     /// Calls `on_change` after changes, and after reconnecting or returning
     /// to the tab, when changes may have been missed.
     pub fn listen(collection_id: &str, on_change: Callback<()>) -> Self {
+        let started_hidden = hidden();
         let inner = Rc::new(Inner {
             url: format!("/api/v1/collections/{collection_id}/events"),
             source: RefCell::new(None),
@@ -72,7 +81,8 @@ impl Changes {
             on_change,
             on_message: RefCell::new(None),
             on_open: RefCell::new(None),
-            opened: Cell::new(false),
+            on_error: RefCell::new(None),
+            opened: Cell::new(started_hidden),
         });
         let weak = Rc::downgrade(&inner);
         *inner.on_message.borrow_mut() = Some(Closure::new(move |_| {
@@ -86,6 +96,19 @@ impl Changes {
                 && inner.opened.replace(true)
             {
                 inner.schedule();
+            }
+        }));
+        let weak = Rc::downgrade(&inner);
+        *inner.on_error.borrow_mut() = Some(Closure::new(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                let closed = inner
+                    .source
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.ready_state() == EventSource::CLOSED);
+                if closed {
+                    inner.disconnect();
+                }
             }
         }));
         let weak = Rc::downgrade(&inner);

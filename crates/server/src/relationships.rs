@@ -260,31 +260,42 @@ pub async fn backlinks(
     }
     let (limit, offset) = page_query(&query)?;
     let rows=conn.query("SELECT c.id,c.name,d.id,d.body,c.blueprint,l.field FROM document_links l JOIN documents d ON d.id=l.source_id JOIN collections c ON c.id=d.collection_id WHERE l.kind='document' AND l.target_collection=?1 AND l.target_id=?2 AND (?3 IS NULL OR c.id=?3) ORDER BY c.name,d.id,l.field LIMIT ?4 OFFSET ?5",&[text(&id),text(&doc),principal.collection_scope.as_deref().map(text).unwrap_or(SqlValue::Null),SqlValue::Integer(limit as i64),SqlValue::Integer(offset as i64)]).await?;
-    let items = rows
-        .iter()
-        .map(|row| -> anyhow::Result<ReferenceView> {
-            let blueprint: Blueprint = serde_json::from_str(&text_at(row, 4)?)?;
-            let body = serde_json::from_str(&text_at(row, 3)?)?;
-            let document_id = text_at(row, 2)?;
-            let field = text_at(row, 5)?;
-            Ok(ReferenceView {
-                collection_id: text_at(row, 0)?,
-                collection_name: text_at(row, 1)?,
-                title: vulse_model::record_title(
-                    &blueprint,
-                    &vulse_model::calculate_document(&blueprint, &body).0,
-                    &document_id,
-                ),
-                document_id,
-                field: blueprint
-                    .fields
-                    .iter()
-                    .find(|f| f.name == field)
-                    .map(|f| f.display_label().to_string())
-                    .unwrap_or(field),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut contexts: std::collections::HashMap<
+        String,
+        (Blueprint, vulse_model::CompiledFormulas, vulse_model::Lookups),
+    > = std::collections::HashMap::new();
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let collection_id = text_at(row, 0)?;
+        if !contexts.contains_key(&collection_id) {
+            let blueprint: Blueprint =
+                serde_json::from_str(&text_at(row, 4)?).map_err(anyhow::Error::from)?;
+            let formulas = vulse_model::CompiledFormulas::new(&blueprint);
+            let lookups = crate::lookups::load(&conn, &blueprint).await?;
+            contexts.insert(collection_id.clone(), (blueprint, formulas, lookups));
+        }
+        let (blueprint, formulas, lookups) = &contexts[&collection_id];
+        let body: serde_json::Value =
+            serde_json::from_str(&text_at(row, 3)?).map_err(anyhow::Error::from)?;
+        let document_id = text_at(row, 2)?;
+        let field = text_at(row, 5)?;
+        items.push(ReferenceView {
+            collection_id,
+            collection_name: text_at(row, 1)?,
+            title: vulse_model::record_title(
+                blueprint,
+                &formulas.calculate(&body, lookups).0,
+                &document_id,
+            ),
+            document_id,
+            field: blueprint
+                .fields
+                .iter()
+                .find(|f| f.name == field)
+                .map(|f| f.display_label().to_string())
+                .unwrap_or(field),
+        });
+    }
     Ok(Json(Page {
         items,
         limit,

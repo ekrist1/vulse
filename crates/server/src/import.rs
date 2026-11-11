@@ -9,7 +9,7 @@ use axum::{
     Json,
     extract::{Multipart, Path, State},
 };
-use calamine::{Data, Reader, open_workbook_auto_from_rs};
+use calamine::{Data, Reader, Xlsx};
 use serde_json::{Map, Value};
 use std::{collections::HashSet, io::Cursor};
 use vulse_model::{
@@ -32,6 +32,14 @@ struct Table {
     first_row: usize,
 }
 
+fn multipart_error(err: axum::extract::multipart::MultipartError) -> AppError {
+    if err.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge
+    } else {
+        AppError::bad(err.to_string())
+    }
+}
+
 pub async fn import_file(
     State(state): State<AppState>,
     Editor(principal): Editor,
@@ -47,68 +55,37 @@ pub async fn import_file(
     let mut mode = String::from("append");
     let mut match_field = String::new();
     let mut has_headers = true;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::bad(e.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         match field.name().unwrap_or("") {
             "file" => {
                 if file.is_some() {
                     return Err(AppError::bad("send one file"));
                 }
                 let name = field.file_name().unwrap_or("").to_owned();
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?;
+                let bytes = field.bytes().await.map_err(multipart_error)?;
                 if bytes.len() > MAX_BYTES {
                     return Err(AppError::PayloadTooLarge);
                 }
                 file = Some((name, bytes.to_vec()));
             }
             "mapping" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?;
+                let text = field.text().await.map_err(multipart_error)?;
                 mapping = Some(
                     serde_json::from_str(&text).map_err(|_| AppError::bad("invalid mapping"))?,
                 );
             }
-            "sheet" => {
-                sheet = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?
-            }
-            "mode" => {
-                mode = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?
-            }
-            "match_field" => {
-                match_field = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?
-            }
+            "sheet" => sheet = field.text().await.map_err(multipart_error)?,
+            "mode" => mode = field.text().await.map_err(multipart_error)?,
+            "match_field" => match_field = field.text().await.map_err(multipart_error)?,
             "commit" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?;
+                let value = field.text().await.map_err(multipart_error)?;
                 if value != "true" && value != "false" {
                     return Err(AppError::bad("commit must be true or false"));
                 }
                 commit = value == "true";
             }
             "has_headers" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad(e.to_string()))?;
+                let value = field.text().await.map_err(multipart_error)?;
                 if value != "true" && value != "false" {
                     return Err(AppError::bad("has_headers must be true or false"));
                 }
@@ -129,7 +106,7 @@ pub async fn import_file(
     let result = conn
         .with_app_transaction(commit, async |conn| {
             let collection = workspace_collection(conn, &principal, &id).await?;
-            let lookups = crate::lookups::load(conn, &collection.blueprint).await?;
+            let mut lookups = crate::lookups::load(conn, &collection.blueprint).await?;
             let formulas = vulse_model::CompiledFormulas::new(&collection.blueprint);
             let mapping = match mapping {
                 Some(m) => m,
@@ -172,9 +149,9 @@ pub async fn import_file(
                     if let Some(key)=match_key(&body[&match_field])&& existing.insert(key,(doc,body)).is_some(){result.errors.push(ImportIssue{row:0,field:Some(match_field.clone()),message:"Existing records contain duplicate matching values. Resolve them before importing updates.".into()});}
                 }
             }
-            let mut seen_keys=HashSet::new();
+            let mut seen_keys = HashSet::new();
             let mut found = crate::content::Found::default();
-            let mut bodies = vec![];
+            let mut staged = vec![];
             for (i, row) in table.rows.iter().enumerate() {
                 if row.iter().all(|c| c.trim().is_empty()) {
                     continue;
@@ -211,18 +188,46 @@ pub async fn import_file(
                         }
                     }
                 }
-                let mut body=Value::Object(obj);
-                let mut target=None;let mut same=false;
-                if mode=="upsert"{
+                let mut body = Value::Object(obj);
+                let mut target = None;
+                let mut same = false;
+                if mode == "upsert" {
                     match match_key(&body[&match_field]) {
-                        None=>{failed=true;result.errors.push(ImportIssue{row:row_number,field:Some(match_field.clone()),message:"Every imported row needs a nonempty matching value".into()});},
-                        Some(key)=>{
-                            if !seen_keys.insert(key.clone()){failed=true;result.errors.push(ImportIssue{row:row_number,field:Some(match_field.clone()),message:"Duplicate matching value in this file".into()});}
-                            if let Some((doc,previous))=existing.get(&key){let mut merged=previous.as_object().cloned().unwrap_or_default();merged.extend(body.as_object().unwrap().clone());body=Value::Object(merged);same=semantic_eq(previous,&body);target=Some(doc.clone());}
+                        None => {
+                            failed = true;
+                            result.errors.push(ImportIssue {
+                                row: row_number,
+                                field: Some(match_field.clone()),
+                                message: "Every imported row needs a nonempty matching value"
+                                    .into(),
+                            });
+                        }
+                        Some(key) => {
+                            if !seen_keys.insert(key.clone()) {
+                                failed = true;
+                                result.errors.push(ImportIssue {
+                                    row: row_number,
+                                    field: Some(match_field.clone()),
+                                    message: "Duplicate matching value in this file".into(),
+                                });
+                            }
+                            if let Some((doc, previous)) = existing.get(&key) {
+                                let mut merged = previous.as_object().cloned().unwrap_or_default();
+                                merged.extend(body.as_object().unwrap().clone());
+                                body = Value::Object(merged);
+                                same = semantic_eq(previous, &body);
+                                target = Some(doc.clone());
+                            }
                         }
                     }
                 }
-                let action=if target.is_none(){"create"}else if same{"unchanged"}else{"update"};
+                let action = if target.is_none() {
+                    "create"
+                } else if same {
+                    "unchanged"
+                } else {
+                    "update"
+                };
                 if !failed {
                     match check_body_with(
                         conn,
@@ -234,9 +239,8 @@ pub async fn import_file(
                     )
                     .await
                     {
-                        Ok(()) => {}
+                        Ok(()) => staged.push((row_number, target, body, action)),
                         Err(AppError::BadRequest(message)) => {
-                            failed = true;
                             result.errors.push(ImportIssue {
                                 row: row_number,
                                 field: None,
@@ -245,24 +249,84 @@ pub async fn import_file(
                         }
                         Err(e) => return Err(e),
                     }
-                    let (computed, errors) =
-                        formulas.calculate(&body, &lookups);
-                    for (field, message) in errors {
-                        failed = true;
-                        result.errors.push(ImportIssue {
-                            row: row_number,
-                            field: Some(field),
-                            message,
-                        });
+                }
+            }
+            // Self-referencing collection lookups (e.g. `SUM([items.amount])`)
+            // see the batch being imported rather than only pre-import records.
+            let self_fields: Vec<String> = vulse_model::lookup_references(&collection.blueprint)
+                .into_iter()
+                .filter_map(|(col_name, field)| (col_name == collection.name).then_some(field))
+                .filter(|field| !crate::lookups::reads_collections(&collection.blueprint, field))
+                .collect();
+            if !self_fields.is_empty() && result.errors.is_empty() {
+                let mut post_bodies: Vec<Value> = store::list_document_bodies(conn, &id)
+                    .await?
+                    .into_iter()
+                    .map(|(doc_id, old_body)| {
+                        staged
+                            .iter()
+                            .find(|(_, t, _, _)| t.as_deref() == Some(doc_id.as_str()))
+                            .map(|(_, _, new_body, _)| new_body.clone())
+                            .unwrap_or(old_body)
+                    })
+                    .collect();
+                for (_, target, body, _) in &staged {
+                    if target.is_none() {
+                        post_bodies.push(body.clone());
                     }
+                }
+                let local_calc = self_fields.iter().any(|f| {
+                    collection
+                        .blueprint
+                        .fields
+                        .iter()
+                        .any(|d| d.name == *f && d.kind == FieldType::Calculated)
+                });
+                let empty_lookups = vulse_model::Lookups::default();
+                let mut cols: Vec<Vec<Value>> =
+                    vec![Vec::with_capacity(post_bodies.len()); self_fields.len()];
+                for mut b in post_bodies {
+                    if local_calc {
+                        b = formulas.calculate(&b, &empty_lookups).0;
+                    }
+                    for (idx, field) in self_fields.iter().enumerate() {
+                        cols[idx].push(b.get(field).cloned().unwrap_or_default());
+                    }
+                }
+                for (field, values) in self_fields.iter().zip(cols) {
+                    lookups.insert(
+                        &collection.name,
+                        field,
+                        std::sync::Arc::new(vulse_model::LookupColumn::new(
+                            &collection.name,
+                            values,
+                        )),
+                    );
+                }
+            }
+            let mut bodies = Vec::with_capacity(staged.len());
+            for (row_number, target, body, action) in staged {
+                let (computed, errors) = formulas.calculate(&body, &lookups);
+                let mut failed = false;
+                for (field, message) in errors {
+                    failed = true;
+                    result.errors.push(ImportIssue {
+                        row: row_number,
+                        field: Some(field),
+                        message,
+                    });
+                }
+                if !failed {
                     if result.preview.len() < 10 {
                         result.preview.push(computed);
                         result.preview_actions.push(action.into());
                     }
-                }
-                if !failed {
-                    match action{"create"=>result.created+=1,"update"=>result.updated+=1,_=>result.unchanged+=1}
-                    bodies.push((target,body,action));
+                    match action {
+                        "create" => result.created += 1,
+                        "update" => result.updated += 1,
+                        _ => result.unchanged += 1,
+                    }
+                    bodies.push((target, body, action));
                 }
             }
             if result.row_count == 0 {
@@ -309,31 +373,21 @@ pub async fn suggest_fields(
     let mut file = None;
     let mut sheet = String::new();
     let mut has_headers = true;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::bad(e.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         let name = field.name().unwrap_or("").to_owned();
         if name == "file" {
             if file.is_some() {
                 return Err(AppError::bad("send one file"));
             }
             let file_name = field.file_name().unwrap_or("").to_owned();
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|e| AppError::bad(e.to_string()))?;
+            let bytes = field.bytes().await.map_err(multipart_error)?;
             if bytes.len() > MAX_BYTES {
                 return Err(AppError::PayloadTooLarge);
             }
             file = Some((file_name, bytes.to_vec()));
             continue;
         }
-        let value = field
-            .text()
-            .await
-            .map_err(|e| AppError::bad(e.to_string()))?;
+        let value = field.text().await.map_err(multipart_error)?;
         match name.as_str() {
             "sheet" => sheet = value,
             "has_headers" if value == "true" || value == "false" => {
@@ -534,9 +588,8 @@ fn decimal_comma(kind: FieldType, cell: &str) -> Result<std::borrow::Cow<'_, str
 }
 pub(crate) fn convert(kind: FieldType, cell: &str) -> Result<Value, String> {
     match kind {
-        FieldType::String | FieldType::Asset | FieldType::Reference => {
-            Ok(Value::String(cell.into()))
-        }
+        FieldType::String => Ok(Value::String(cell.into())),
+        FieldType::Asset | FieldType::Reference => Ok(Value::String(cell.trim().into())),
         FieldType::Number => {
             let n: Value =
                 serde_json::from_str(cell.trim()).map_err(|_| "Expected a finite number")?;
@@ -653,11 +706,9 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Resul
             "Choose a .csv or .xlsx file; save legacy .xls workbooks as .xlsx first".into(),
         );
     }
-    if name.to_ascii_lowercase().ends_with(".xlsx") {
-        preflight_xlsx(bytes)?;
-    }
-    let mut book = open_workbook_auto_from_rs(Cursor::new(bytes))
-        .map_err(|e| format!("Cannot read workbook: {e}"))?;
+    preflight_xlsx(bytes)?;
+    let mut book =
+        Xlsx::new(Cursor::new(bytes)).map_err(|e| format!("Cannot read workbook: {e}"))?;
     let sheets = book.sheet_names().to_vec();
     let selected = if sheet.is_empty() {
         sheets.first().ok_or("Workbook has no worksheets")?.clone()
@@ -673,39 +724,54 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Resul
         return Err("Maximum 50,000 rows and 200 columns per worksheet".into());
     }
     let first_row = range.start().map_or(1, |(row, _)| row as usize + 1) + header_rows;
+    let mut used_bytes = 0u64;
     let mut rows = range.rows();
     let headers = if has_headers {
-        rows.next()
-            .ok_or("Worksheet is empty")?
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
+        let header_row = rows.next().ok_or("Worksheet is empty")?;
+        let mut out = Vec::with_capacity(header_row.len());
+        for c in header_row {
+            out.push(cell_text(c, first_row.saturating_sub(1), &mut used_bytes)?);
+        }
+        out
     } else {
         numbered_headers(range.width())
     };
     validate_headers(&headers)?;
-    let rows = rows
-        .enumerate()
-        .map(|(i, row)| {
-            row.iter()
-                .map(|c| match c {
-                    Data::Error(e) => {
-                        Err(format!("Row {}: spreadsheet error {e:?}", first_row + i))
-                    }
-                    Data::DateTimeIso(s) => Ok(s.clone()),
-                    Data::DateTime(dt) if dt.is_datetime() => Ok(excel_datetime(dt)),
-                    _ => Ok(c.to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut out_rows = Vec::with_capacity(range.height().saturating_sub(header_rows));
+    for (i, row) in rows.enumerate() {
+        let mut out_row = Vec::with_capacity(row.len());
+        for c in row {
+            out_row.push(cell_text(c, first_row + i, &mut used_bytes)?);
+        }
+        out_rows.push(out_row);
+    }
     Ok(Table {
         headers,
-        rows,
+        rows: out_rows,
         sheets,
         sheet: selected,
         first_row,
     })
+}
+
+fn cell_text(cell: &Data, row_num: usize, used_bytes: &mut u64) -> Result<String, String> {
+    let text = match cell {
+        Data::Error(e) => return Err(format!("Row {row_num}: spreadsheet error {e:?}")),
+        Data::String(s) | Data::DateTimeIso(s) => {
+            *used_bytes = used_bytes.saturating_add(s.len() as u64 + 16);
+            if *used_bytes > MAX_EXPANDED {
+                return Err("Expanded worksheet exceeds 200 MB".into());
+            }
+            return Ok(s.clone());
+        }
+        Data::DateTime(dt) if dt.is_datetime() => excel_datetime(dt),
+        other => other.to_string(),
+    };
+    *used_bytes = used_bytes.saturating_add(text.len() as u64 + 16);
+    if *used_bytes > MAX_EXPANDED {
+        return Err("Expanded worksheet exceeds 200 MB".into());
+    }
+    Ok(text)
 }
 /// Names columns of a file without a header row.
 fn numbered_headers(count: usize) -> Vec<String> {
@@ -737,34 +803,80 @@ fn preflight_xlsx(bytes: &[u8]) -> Result<(), String> {
     let mut total = 0u64;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        total = total
+        let declared = total
             .checked_add(entry.size())
             .ok_or("Workbook is too large")?;
-        if total > MAX_EXPANDED {
+        if declared > MAX_EXPANDED {
             return Err("Expanded workbook exceeds 200 MB".into());
         }
-        if !entry.name().starts_with("xl/worksheets/") || !entry.name().ends_with(".xml") {
+        let remaining = MAX_EXPANDED - total;
+        let is_xml = entry.name().to_ascii_lowercase().ends_with(".xml")
+            || entry.name().to_ascii_lowercase().ends_with(".rels");
+        if !is_xml {
+            let copied = std::io::copy(&mut entry.by_ref().take(remaining + 1), &mut std::io::sink())
+                .map_err(|e| e.to_string())?;
+            total += copied;
+            if total > MAX_EXPANDED {
+                return Err("Expanded workbook exceeds 200 MB".into());
+            }
             continue;
         }
         let mut xml = Vec::new();
         entry
             .by_ref()
-            .take(MAX_EXPANDED + 1)
+            .take(remaining + 1)
             .read_to_end(&mut xml)
             .map_err(|e| e.to_string())?;
-        if xml.len() as u64 > MAX_EXPANDED {
-            return Err("Expanded worksheet exceeds 200 MB".into());
+        total += xml.len() as u64;
+        if total > MAX_EXPANDED {
+            return Err("Expanded workbook exceeds 200 MB".into());
         }
         let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+        let mut root_seen = false;
+        let mut current_row = 0usize;
+        let mut current_col = 0usize;
         loop {
             match reader.read_event().map_err(|e| e.to_string())? {
-                Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"c" => {
-                    for attr in e.attributes() {
-                        let attr = attr.map_err(|e| e.to_string())?;
-                        if attr.key.as_ref() == b"r" {
-                            let value = std::str::from_utf8(&attr.value)
-                                .map_err(|_| "Invalid cell coordinate")?;
-                            check_coordinate(value)?;
+                Event::Start(e) | Event::Empty(e) => {
+                    let local = e.local_name();
+                    if !root_seen {
+                        root_seen = true;
+                        if local.as_ref() != b"worksheet" {
+                            break;
+                        }
+                    }
+                    if local.as_ref() == b"row" {
+                        current_row = current_row.saturating_add(1);
+                        current_col = 0;
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| e.to_string())?;
+                            if attr.key.local_name().as_ref() == b"r" {
+                                let value = std::str::from_utf8(&attr.value)
+                                    .map_err(|_| "Invalid row coordinate")?;
+                                let r: usize =
+                                    value.parse().map_err(|_| "Invalid row coordinate")?;
+                                if r == 0 || r > MAX_ROWS + 1 {
+                                    return Err(coordinate_limit_msg());
+                                }
+                                current_row = current_row.max(r);
+                            }
+                        }
+                        if current_row > MAX_ROWS + 1 {
+                            return Err(coordinate_limit_msg());
+                        }
+                    } else if local.as_ref() == b"c" {
+                        current_col = current_col.saturating_add(1);
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| e.to_string())?;
+                            if attr.key.local_name().as_ref() == b"r" {
+                                let value = std::str::from_utf8(&attr.value)
+                                    .map_err(|_| "Invalid cell coordinate")?;
+                                let col = check_coordinate(value)?;
+                                current_col = current_col.max(col);
+                            }
+                        }
+                        if current_col > MAX_COLUMNS {
+                            return Err(coordinate_limit_msg());
                         }
                     }
                 }
@@ -775,11 +887,22 @@ fn preflight_xlsx(bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
-fn check_coordinate(value: &str) -> Result<(), String> {
+
+fn coordinate_limit_msg() -> String {
+    format!(
+        "Workbook cells must be within the first {} rows and {MAX_COLUMNS} columns; export a smaller worksheet",
+        MAX_ROWS + 1
+    )
+}
+
+fn check_coordinate(value: &str) -> Result<usize, String> {
     let mut column = 0usize;
     let mut row = 0usize;
     let mut digits = false;
     for c in value.chars() {
+        if c == '$' {
+            continue;
+        }
         if c.is_ascii_uppercase() && !digits {
             column = column
                 .saturating_mul(26)
@@ -794,9 +917,9 @@ fn check_coordinate(value: &str) -> Result<(), String> {
         }
     }
     if row == 0 || column == 0 || row > MAX_ROWS + 1 || column > MAX_COLUMNS {
-        return Err("Workbook cells must be within the first 1,001 rows and 200 columns; export a smaller worksheet".into());
+        return Err(coordinate_limit_msg());
     }
-    Ok(())
+    Ok(column)
 }
 
 #[cfg(test)]
@@ -954,6 +1077,8 @@ mod tests {
     fn rejects_sparse_workbooks_and_invalid_csv() {
         let bytes = workbook(r#"<c r="XFD1048576"><v>12</v></c>"#);
         assert!(parse_file("data.xlsx", &bytes, "", true).is_err());
+        let sparse_row = workbook(r#"</row><row r="1048576"><c><v>12</v></c>"#);
+        assert!(parse_file("data.xlsx", &sparse_row, "", true).is_err());
         for csv in ["a,a\n1,2\n", "a,b\n1\n", ",b\n1,2\n"] {
             assert!(parse_file("data.csv", csv.as_bytes(), "", true).is_err());
         }

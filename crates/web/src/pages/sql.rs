@@ -122,13 +122,28 @@ pub fn sql_page() -> Html {
         .is_some_and(|u| u.role != Role::Viewer);
     let collections = use_state(Vec::<CollectionView>::new);
     let chosen = use_state(String::new);
-    // The statement survives reloads, like record drafts.
-    let sql = use_state(|| {
-        crate::drafts::read::<String>("vulse-sql")
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    });
+    let sql_key = format!(
+        "vulse:sql:{}",
+        session
+            .state
+            .user
+            .as_ref()
+            .map(|u| u.id.as_str())
+            .unwrap_or("signedout")
+    );
+    // The statement survives reloads, scoped to the signed-in user.
+    let sql = use_state(|| String::new());
+    {
+        let sql = sql.clone();
+        let sql_key = sql_key.clone();
+        use_effect_with(sql_key, move |sql_key| {
+            let saved = crate::drafts::read::<String>(sql_key)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            sql.set(saved);
+        });
+    }
     let result = use_state(|| None::<(String, SqlResult)>);
     let error = use_state(String::new);
     let busy = use_state(|| false);
@@ -184,8 +199,9 @@ pub fn sql_page() -> Html {
     };
     let on_change = {
         let sql = sql.clone();
+        let sql_key = sql_key.clone();
         Callback::from(move |next: String| {
-            let _ = crate::drafts::write("vulse-sql", &next);
+            let _ = crate::drafts::write(&sql_key, &next);
             sql.set(next);
         })
     };

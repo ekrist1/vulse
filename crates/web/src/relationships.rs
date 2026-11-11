@@ -11,33 +11,63 @@ pub struct LinksProps {
 pub fn reference_links(props: &LinksProps) -> Html {
     let documents = use_state(Vec::<DocumentView>::new);
     let error = use_state(String::new);
+    let epoch = use_mut_ref(|| 0u64);
     {
         let documents = documents.clone();
         let error = error.clone();
+        let epoch = epoch.clone();
         use_effect_with(
             (props.collection.clone(), props.ids.clone()),
             move |(collection, ids)| {
                 let (collection, ids) = (collection.clone(), ids.clone());
+                let current = {
+                    let mut value = epoch.borrow_mut();
+                    *value += 1;
+                    *value
+                };
                 documents.set(vec![]);
                 error.set(String::new());
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Some(c) = collection {
                         let mut next = vec![];
+                        let mut failed = None;
                         for id in ids {
                             match api::document(&c.id, &id).await {
                                 Ok(d) => next.push(d),
-                                Err(e) => error.set(e),
+                                Err(e) => failed = Some(e),
                             }
                         }
-                        documents.set(next);
-                    } else if !ids.is_empty() {
+                        if *epoch.borrow() == current {
+                            if let Some(e) = failed {
+                                error.set(e);
+                            }
+                            documents.set(next);
+                        }
+                    } else if !ids.is_empty() && *epoch.borrow() == current {
                         error.set("Referenced collection unavailable".into());
                     }
                 });
             },
         );
     }
-    html! {<div class="reference-links">{for documents.iter().map(|d|{let c=props.collection.as_ref().unwrap();html!{<Link<Route> to={Route::Document{id:c.id.clone(),doc_id:d.id.clone()}}>{format!("{} →",vulse_model::record_title(&c.blueprint,&d.body,&d.id))}</Link<Route>>}})}if !error.is_empty(){<span class="error">{(*error).clone()}</span>}</div>}
+    html! {
+        <div class="reference-links">
+            {if let Some(c) = props.collection.as_ref() {
+                html! {
+                    {for documents.iter().map(|d| html! {
+                        <Link<Route> to={Route::Document { id: c.id.clone(), doc_id: d.id.clone() }}>
+                            {format!("{} →", vulse_model::record_title(&c.blueprint, &d.body, &d.id))}
+                        </Link<Route>>
+                    })}
+                }
+            } else {
+                html! {}
+            }}
+            if !error.is_empty() {
+                <span class="error">{(*error).clone()}</span>
+            }
+        </div>
+    }
 }
 #[derive(Properties, PartialEq)]
 pub struct BacklinksProps {
@@ -51,10 +81,12 @@ pub fn backlinks(props: &BacklinksProps) -> Html {
     let offset = use_state(|| 0u32);
     let more = use_state(|| false);
     let error = use_state(String::new);
+    let epoch = use_mut_ref(|| 0u64);
     {
         let links = links.clone();
         let error = error.clone();
         let more = more.clone();
+        let epoch = epoch.clone();
         use_effect_with(
             (
                 props.collection_id.clone(),
@@ -64,14 +96,25 @@ pub fn backlinks(props: &BacklinksProps) -> Html {
             ),
             move |(id, doc, _, offset)| {
                 let (id, doc, offset) = (id.clone(), doc.clone(), *offset);
+                let current = {
+                    let mut value = epoch.borrow_mut();
+                    *value += 1;
+                    *value
+                };
                 wasm_bindgen_futures::spawn_local(async move {
                     match api::backlinks(&id, &doc, offset).await {
                         Ok(page) => {
-                            more.set(page.items.len() == 25);
-                            links.set(page.items);
-                            error.set(String::new());
+                            if *epoch.borrow() == current {
+                                more.set(page.items.len() == 25);
+                                links.set(page.items);
+                                error.set(String::new());
+                            }
                         }
-                        Err(e) => error.set(e),
+                        Err(e) => {
+                            if *epoch.borrow() == current {
+                                error.set(e);
+                            }
+                        }
                     }
                 });
             },

@@ -86,13 +86,24 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
     // Formulas can read other collections, which may have been created or
     // changed since this page loaded.
     {
+        let id = props.id.clone();
         let collections = collections.clone();
+        let documents = documents.clone();
         use_effect_with((*tab).clone(), move |tab| {
             if tab == "fields" {
+                let id = id.clone();
                 let collections = collections.clone();
+                let documents = documents.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Ok(items) = api::collections().await {
                         collections.set(items);
+                    }
+                    let sample_query = vulse_model::RecordQuery {
+                        limit: 100,
+                        ..vulse_model::RecordQuery::default()
+                    };
+                    if let Ok(result) = api::query_records(&id, &sample_query).await {
+                        documents.set(result.items);
                     }
                 });
             }
@@ -115,6 +126,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let key = draft_key.clone();
         let draft_version = draft_version.clone();
         let collapsed = collapsed.clone();
+        let confirmed_removals = confirmed_removals.clone();
         let authed = session.state.user.is_some();
         use_effect_with((id.clone(), authed, *refresh), move |(id, authed, _)| {
             if !*authed {
@@ -122,6 +134,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
             }
             collection.set(None);
             collapsed.set(None);
+            confirmed_removals.set(Vec::new());
             tab.set("data".into());
             error.set(String::new());
             let id = id.clone();
@@ -198,12 +211,14 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let title_field = title_field.clone();
         let draft_version = draft_version.clone();
         let collection = collection.clone();
+        let confirmed_removals = confirmed_removals.clone();
         move |_| {
             if let Some(d) = (*pending).clone() {
                 let saved: Vec<String> = collection
                     .as_ref()
                     .map(|c| c.blueprint.fields.iter().map(|f| f.name.clone()).collect())
                     .unwrap_or_default();
+                confirmed_removals.set(Vec::new());
                 name.set(d.name);
                 visibility.set(d.visibility);
                 fields.set(adopt_saved_rows(d.blueprint.fields, &saved));
@@ -218,11 +233,13 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
         let key = draft_key.clone();
         let draft_error = draft_error.clone();
         let confirm = confirm.clone();
+        let confirmed_removals = confirmed_removals.clone();
         move |_| {
             let pending = pending.clone();
             let key = key.clone();
             let draft_error = draft_error.clone();
             let confirm = confirm.clone();
+            let confirmed_removals = confirmed_removals.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let request = ConfirmRequest::danger(
                     "Discard this collection draft?",
@@ -234,6 +251,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 }
                 match crate::drafts::clear(&key) {
                     Ok(()) => {
+                        confirmed_removals.set(Vec::new());
                         pending.set(None);
                         draft_error.set(String::new());
                     }
@@ -1225,6 +1243,57 @@ struct OptionsEditorProps {
     on_change: Callback<FieldDef>,
 }
 
+#[derive(Clone, PartialEq)]
+struct OptionSlot {
+    key: u64,
+    origin: Option<String>,
+}
+
+fn derive_option_slots(
+    saved: &[String],
+    options: &[String],
+    renames: &std::collections::BTreeMap<String, String>,
+    seq: &mut u64,
+) -> Vec<OptionSlot> {
+    let mut claimed = std::collections::HashSet::new();
+    options
+        .iter()
+        .map(|value| {
+            let origin = saved
+                .iter()
+                .find(|s| !claimed.contains(*s) && *s == value && !renames.contains_key(*s))
+                .cloned()
+                .or_else(|| {
+                    renames
+                        .iter()
+                        .find(|(from, to)| !claimed.contains(*from) && *to == value)
+                        .map(|(from, _)| from.clone())
+                });
+            if let Some(from) = &origin {
+                claimed.insert(from.clone());
+            }
+            *seq += 1;
+            OptionSlot { key: *seq, origin }
+        })
+        .collect()
+}
+
+fn compute_option_renames(
+    slots: &[OptionSlot],
+    options: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut renames = std::collections::BTreeMap::new();
+    for (slot, value) in slots.iter().zip(options) {
+        if let Some(from) = &slot.origin
+            && from != value
+            && !options.contains(from)
+        {
+            renames.insert(from.clone(), value.clone());
+        }
+    }
+    renames
+}
+
 /// Allowed values of a text field. Editing a saved value renames it: records
 /// holding it get the new value when the fields are saved.
 #[function_component(OptionsEditor)]
@@ -1232,21 +1301,23 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
     let field = &props.field;
     let options = field.options.clone().unwrap_or_default();
     let renames = field.renamed_options.clone().unwrap_or_default();
-    // The saved value an option row started from, if any.
-    let origin_of = {
-        let renames = renames.clone();
-        let saved = props.saved.clone();
-        move |value: &str| -> Option<String> {
-            renames
-                .iter()
-                .find(|(_, to)| *to == value)
-                .map(|(from, _)| from.clone())
-                .or_else(|| {
-                    (saved.iter().any(|s| s == value) && !renames.contains_key(value))
-                        .then(|| value.to_string())
-                })
+    let seq = use_mut_ref(|| 0u64);
+    let slots = use_mut_ref(Vec::<OptionSlot>::new);
+    let saved_snapshot = use_mut_ref(Vec::<String>::new);
+    {
+        let mut s = slots.borrow_mut();
+        let mut saved_prev = saved_snapshot.borrow_mut();
+        if field.options.is_none() {
+            s.clear();
+            *saved_prev = props.saved.clone();
+        } else if s.len() != options.len() || *saved_prev != props.saved {
+            let mut next_seq = *seq.borrow();
+            *s = derive_option_slots(&props.saved, &options, &renames, &mut next_seq);
+            *seq.borrow_mut() = next_seq;
+            *saved_prev = props.saved.clone();
         }
-    };
+    }
+    let current_slots = slots.borrow().clone();
     let emit = {
         let field = field.clone();
         let on_change = props.on_change.clone();
@@ -1261,14 +1332,18 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
         let emit = emit.clone();
         let records = props.records.clone();
         let origin = props.origin.clone();
+        let saved = props.saved.clone();
+        let slots = slots.clone();
+        let seq = seq.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if !input.checked() {
+                slots.borrow_mut().clear();
                 emit(None, Default::default());
                 return;
             }
-            // Start from the values loaded records already hold.
-            let mut values: Vec<String> = Vec::new();
+            // Start from saved options or the values loaded records already hold.
+            let mut values: Vec<String> = saved.clone();
             for record in &records {
                 if let Some(value) = origin
                     .as_ref()
@@ -1285,6 +1360,10 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
             if values.is_empty() {
                 values.push(String::new());
             }
+            let mut next_seq = *seq.borrow();
+            *slots.borrow_mut() =
+                derive_option_slots(&saved, &values, &Default::default(), &mut next_seq);
+            *seq.borrow_mut() = next_seq;
             emit(Some(values), Default::default());
         })
     };
@@ -1303,50 +1382,49 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
             if field.options.is_some() {
                 <ol class="option-list">
                     { for options.iter().enumerate().map(|(index, value)| {
-                        let origin = origin_of(value);
+                        let slot = current_slots.get(index).cloned().unwrap_or(OptionSlot { key: index as u64, origin: None });
+                        let origin = slot.origin.clone();
                         let edit = {
-                            let (options, renames, emit, origin) = (options.clone(), renames.clone(), emit.clone(), origin.clone());
+                            let (options, slots_ref, emit) = (options.clone(), slots.clone(), emit.clone());
                             Callback::from(move |event: InputEvent| {
                                 let input: HtmlInputElement = event.target_unchecked_into();
                                 let text = input.value();
                                 let mut options = options.clone();
-                                let mut renames = renames.clone();
-                                if let Some(from) = &origin {
-                                    renames.remove(from);
-                                    if *from != text {
-                                        renames.insert(from.clone(), text.clone());
-                                    }
-                                }
                                 options[index] = text;
+                                let renames = compute_option_renames(&slots_ref.borrow(), &options);
                                 emit(Some(options), renames);
                             })
                         };
                         let shift = |delta: isize| {
-                            let (options, renames, emit) = (options.clone(), renames.clone(), emit.clone());
+                            let (options, slots_ref, emit) = (options.clone(), slots.clone(), emit.clone());
                             Callback::from(move |_| {
                                 let target = index as isize + delta;
                                 if target >= 0 && (target as usize) < options.len() {
                                     let mut options = options.clone();
                                     options.swap(index, target as usize);
-                                    emit(Some(options), renames.clone());
+                                    slots_ref.borrow_mut().swap(index, target as usize);
+                                    let renames = compute_option_renames(&slots_ref.borrow(), &options);
+                                    emit(Some(options), renames);
                                 }
                             })
                         };
                         let remove = {
-                            let (options, renames, emit, origin) = (options.clone(), renames.clone(), emit.clone(), origin.clone());
+                            let (options, slots_ref, emit) = (options.clone(), slots.clone(), emit.clone());
                             Callback::from(move |_| {
                                 let mut options = options.clone();
-                                let mut renames = renames.clone();
                                 options.remove(index);
-                                if let Some(from) = &origin {
-                                    renames.remove(from);
+                                let mut s = slots_ref.borrow_mut();
+                                if index < s.len() {
+                                    s.remove(index);
                                 }
+                                let renames = compute_option_renames(&s, &options);
+                                drop(s);
                                 emit(Some(options), renames);
                             })
                         };
-                        let renamed_from = origin.filter(|from| from != value);
+                        let renamed_from = origin.filter(|from| from != value && !options.contains(from));
                         html! {
-                            <li key={index}>
+                            <li key={slot.key}>
                                 <div class="row">
                                     <input aria-label={format!("Allowed value {}", index + 1)} maxlength={vulse_model::MAX_OPTION_LENGTH.to_string()} value={value.clone()} oninput={edit} />
                                     <button type="button" class="secondary" aria-label={format!("Move allowed value {} up", index + 1)} disabled={index == 0} onclick={shift(-1)}>{"↑"}</button>
@@ -1361,11 +1439,18 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
                     }) }
                 </ol>
                 <button type="button" class="secondary" disabled={options.len() >= vulse_model::MAX_FIELD_OPTIONS} onclick={Callback::from({
-                    let (options, renames, emit) = (options.clone(), renames.clone(), emit.clone());
+                    let (options, slots_ref, seq, emit) = (options.clone(), slots.clone(), seq.clone(), emit.clone());
                     move |_| {
                         let mut options = options.clone();
                         options.push(String::new());
-                        emit(Some(options), renames.clone());
+                        let mut next_seq = *seq.borrow() + 1;
+                        *seq.borrow_mut() = next_seq;
+                        let mut s = slots_ref.borrow_mut();
+                        s.push(OptionSlot { key: next_seq, origin: None });
+                        let renames = compute_option_renames(&s, &options);
+                        drop(s);
+                        let _ = &mut next_seq;
+                        emit(Some(options), renames);
                     }
                 })}>{"Add value"}</button>
                 if !removed.is_empty() {
@@ -1549,6 +1634,39 @@ mod tests {
         assert_eq!(row_origin(&rows[0], &["other".into()]), None);
         assert_eq!(collapse_key(&rows[0], &["other".into()]), "new:gone");
         assert_eq!(strip_self_marks(&rows)[0].renamed_from, None);
+    }
+
+    #[test]
+    fn option_slots_keep_row_origins_independent_of_typed_values() {
+        let saved = vec!["Active".to_string(), "Draft".into()];
+        let mut seq = 0u64;
+        let mut options = saved.clone();
+        let mut slots = derive_option_slots(&saved, &options, &Default::default(), &mut seq);
+        // Add a new option and type through `"Active"` to `"Active+"`.
+        options.push(String::new());
+        seq += 1;
+        slots.push(OptionSlot {
+            key: seq,
+            origin: None,
+        });
+        options[2] = "Active".into();
+        assert!(compute_option_renames(&slots, &options).is_empty());
+        options[2] = "Active+".into();
+        assert!(compute_option_renames(&slots, &options).is_empty());
+
+        // Clearing `"Draft"` to `""` while another blank row is removed keeps `"Draft"`'s origin.
+        options.push(String::new());
+        seq += 1;
+        slots.push(OptionSlot {
+            key: seq,
+            origin: None,
+        });
+        options[1] = String::new();
+        options.pop();
+        slots.pop();
+        options[1] = "Pending".into();
+        let renames = compute_option_renames(&slots, &options);
+        assert_eq!(renames.get("Draft").map(String::as_str), Some("Pending"));
     }
 
     #[test]

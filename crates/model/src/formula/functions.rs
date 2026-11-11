@@ -81,12 +81,20 @@ pub(super) fn function(n: &str, a: &[&Value]) -> Result<Value, String> {
             number(first()? - b * (first()? / b).floor())
         }
         "ROUND" | "ROUNDUP" | "ROUNDDOWN" => {
+            let x0 = first()?;
             let d = second()?.trunc();
             if !(-308.0..=308.0).contains(&d) {
                 return Err("#NUM! digits out of range".into());
             }
+            if x0 == 0.0 {
+                return number(0.0);
+            }
             let f = 10f64.powf(d);
-            let x = significant(first()? * f);
+            let scaled = x0 * f;
+            if d >= 0.0 && (!scaled.is_finite() || scaled.abs() >= 9_007_199_254_740_992.0) {
+                return number(x0);
+            }
+            let x = significant(scaled);
             number(match n {
                 "ROUND" => x.round() / f,
                 "ROUNDUP" => x.signum() * x.abs().ceil() / f,
@@ -228,30 +236,45 @@ pub(super) fn function(n: &str, a: &[&Value]) -> Result<Value, String> {
             let needle = s();
             let text = text_value(a[1]);
             let start = if a.len() == 3 { index(a[2], 1)? - 1 } else { 0 };
-            if start > text.chars().count() {
+            let total_chars = text.chars().count();
+            if start > total_chars {
                 return Err("#VALUE! start exceeds text length".into());
             }
-            let tail: String = text.chars().skip(start).collect();
-            let (needle, tail) = if n == "SEARCH" {
-                (needle.to_lowercase(), tail.to_lowercase())
-            } else {
-                (needle, tail)
-            };
-            if n == "SEARCH" && needle.contains(['*', '?', '~']) {
-                if tail.chars().count() > 32767 {
+            let tail_chars: Vec<char> = text.chars().skip(start).collect();
+            if n == "FIND" {
+                let tail: String = tail_chars.iter().collect();
+                let p = tail.find(&needle).ok_or("#VALUE! text not found")?;
+                return Ok(json!(start + tail[..p].chars().count() + 1));
+            }
+            let needle = needle.to_lowercase();
+            if needle.contains(['*', '?', '~']) {
+                if tail_chars.len() > 32767 {
                     return Err("#VALUE! SEARCH text exceeds 32767 characters".into());
                 }
-                let chars: Vec<char> = tail.chars().collect();
                 let mut budget = 1_000_000usize;
-                for i in 0..=chars.len() {
-                    if wildcard_chars(&chars[i..], &needle, true, &mut budget)? {
+                for i in 0..=tail_chars.len() {
+                    let sub_lower: Vec<char> =
+                        tail_chars[i..].iter().flat_map(|c| c.to_lowercase()).collect();
+                    if wildcard_chars(&sub_lower, &needle, true, &mut budget)? {
                         return Ok(json!(start + i + 1));
                     }
                 }
                 return Err("#VALUE! text not found".into());
             }
-            let p = tail.find(&needle).ok_or("#VALUE! text not found")?;
-            Ok(json!(start + tail[..p].chars().count() + 1))
+            let mut lower_tail = String::new();
+            let mut byte_to_orig_char = Vec::with_capacity(tail_chars.len() + 1);
+            for (orig_idx, ch) in tail_chars.iter().enumerate() {
+                byte_to_orig_char.push((lower_tail.len(), orig_idx));
+                lower_tail.extend(ch.to_lowercase());
+            }
+            byte_to_orig_char.push((lower_tail.len(), tail_chars.len()));
+            let p = lower_tail.find(&needle).ok_or("#VALUE! text not found")?;
+            let orig_idx = byte_to_orig_char
+                .iter()
+                .rfind(|&&(byte_pos, _)| byte_pos <= p)
+                .map(|&(_, idx)| idx)
+                .unwrap_or(0);
+            Ok(json!(start + orig_idx + 1))
         }
         "EXACT" => Ok(json!(s() == text_value(a[1]))),
         "VALUE" => number(first()?),
@@ -298,27 +321,35 @@ pub(super) fn function(n: &str, a: &[&Value]) -> Result<Value, String> {
                 return Err("#VALUE! MATCH mode must be -1, 0 or 1".into());
             }
             let mut found = None;
-            for (i, v) in v.iter().enumerate() {
+            for (i, item) in v.iter().enumerate() {
+                if mode != 0.0 && item.is_null() {
+                    continue;
+                }
                 let equal = if mode == 0.0
                     && a[0].is_string()
                     && text_value(a[0]).contains(['*', '?', '~'])
                 {
                     wildcard(
-                        &text_value(v).to_lowercase(),
+                        &text_value(item).to_lowercase(),
                         &text_value(a[0]).to_lowercase(),
                         false,
                     )?
                 } else {
-                    compare(v, a[0], "=")?
+                    compare(item, a[0], "=")?
                 };
                 if equal && mode == 0.0 {
                     return Ok(json!(i + 1));
                 }
                 if equal {
                     found = Some(i + 1);
+                    continue;
                 }
-                if mode != 0.0 && compare(v, a[0], if mode == 1.0 { "<=" } else { ">=" })? {
-                    found = Some(i + 1);
+                if mode != 0.0 {
+                    if compare(item, a[0], if mode == 1.0 { "<=" } else { ">=" })? {
+                        found = Some(i + 1);
+                    } else {
+                        break;
+                    }
                 }
             }
             found.map(|i| json!(i)).ok_or("#N/A".into())

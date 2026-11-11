@@ -347,10 +347,16 @@ pub fn rename_summary_fields(spec: &mut SummarySpec, renames: &BTreeMap<String, 
             measure.field = Some(next.clone());
         }
     }
-    if let Some(next) = spec.sort.as_ref().and_then(|s| renames.get(s))
-        && spec.group_by.iter().any(|g| g.field == *next) {
-            spec.sort = Some(next.clone());
-        }
+    let sorting_measure = spec
+        .sort
+        .as_ref()
+        .is_some_and(|s| spec.measures.iter().any(|m| m.name == *s));
+    if !sorting_measure
+        && let Some(next) = spec.sort.as_ref().and_then(|s| renames.get(s))
+        && spec.group_by.iter().any(|g| g.field == *next)
+    {
+        spec.sort = Some(next.clone());
+    }
 }
 
 /// Why a summary formula cannot use `[collection.field]`, and what to do.

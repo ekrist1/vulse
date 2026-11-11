@@ -137,9 +137,21 @@ async fn target(
     statement: &SqlStatement,
 ) -> Result<CollectionView, AppError> {
     let name = statement.table();
-    let collection = store::find_collection_by_name(conn, name)
-        .await?
-        .ok_or_else(|| AppError::bad(format!("There is no collection named '{name}'.")))?;
+    let collection = if let Some(scope_id) = &principal.collection_scope {
+        let scoped = store::find_collection(conn, scope_id)
+            .await?
+            .ok_or_else(|| AppError::Forbidden("this api key is limited to one collection".into()))?;
+        if !name.eq_ignore_ascii_case(&scoped.name) {
+            return Err(AppError::Forbidden(
+                "this api key is limited to one collection".into(),
+            ));
+        }
+        scoped
+    } else {
+        store::find_collection_by_name(conn, name)
+            .await?
+            .ok_or_else(|| AppError::bad(format!("There is no collection named '{name}'.")))?
+    };
     require_collection(principal, &collection.id)?;
     let fields = &collection.blueprint.fields;
     for field in statement.fields() {
@@ -617,14 +629,23 @@ fn result(
     plan: &[Planned],
     done: bool,
 ) -> SqlResult {
-    // The confirmation covers the statement and the exact record versions.
+    // The confirmation covers the statement, collection schema, exact record
+    // versions, and planned post-update bodies (including cross-collection lookups).
     let mut hash = Sha256::new();
     hash.update(sql.as_bytes());
+    hash.update(b"\0");
+    hash.update(collection.id.as_bytes());
+    hash.update(b"@");
+    hash.update(collection.updated_at.as_bytes());
     for change in plan {
         hash.update(b"\n");
         hash.update(change.doc.id.as_bytes());
         hash.update(b"@");
         hash.update(change.doc.updated_at.as_bytes());
+        hash.update(b"=");
+        if let Ok(encoded) = serde_json::to_vec(&change.body) {
+            hash.update(&encoded);
+        }
     }
     SqlResult {
         kind: statement.kind().into(),

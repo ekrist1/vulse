@@ -34,6 +34,14 @@ pub async fn list_assets(
     }))
 }
 
+fn multipart_error(err: axum::extract::multipart::MultipartError) -> AppError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge
+    } else {
+        AppError::bad(err.to_string())
+    }
+}
+
 pub async fn upload_asset(
     State(state): State<AppState>,
     Editor(principal): Editor,
@@ -42,26 +50,19 @@ pub async fn upload_asset(
 ) -> Result<(StatusCode, Json<AssetView>), AppError> {
     let conn = state.db.connect().await?;
     let collection = workspace_collection(&conn, &principal, &id).await?;
-    let mut file: Option<(String, String, Vec<u8>)> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| AppError::bad(err.to_string()))?
-    {
+    let mut file: Option<(String, String, Bytes)> = None;
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         if field.name() != Some("file") {
             continue;
         }
         let filename = safe_filename(field.file_name().unwrap_or("file"));
         let content_type = normalize_content_type(field.content_type().unwrap_or(""))
             .ok_or_else(|| AppError::bad("unsupported content type"))?;
-        let data = field
-            .bytes()
-            .await
-            .map_err(|err| AppError::bad(err.to_string()))?;
+        let data = field.bytes().await.map_err(multipart_error)?;
         if data.len() > MAX_UPLOAD_BYTES {
             return Err(AppError::PayloadTooLarge);
         }
-        file = Some((filename, content_type, data.to_vec()));
+        file = Some((filename, content_type, data));
         break;
     }
     let Some((filename, content_type, data)) = file else {
@@ -197,7 +198,10 @@ pub fn asset_path(root: &Path, storage_key: &str) -> Option<PathBuf> {
 
 pub fn normalize_content_type(raw: &str) -> Option<String> {
     let essence = raw.split(';').next()?.trim().to_ascii_lowercase();
-    if essence.is_empty()
+    let (major, subtype) = essence.split_once('/')?;
+    if major.is_empty()
+        || subtype.is_empty()
+        || subtype.contains('/')
         || !essence
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '+' | '-' | '.'))
@@ -205,11 +209,7 @@ pub fn normalize_content_type(raw: &str) -> Option<String> {
     {
         return None;
     }
-    if essence.starts_with("image/")
-        || essence.starts_with("video/")
-        || essence.starts_with("audio/")
-        || essence == "application/pdf"
-    {
+    if matches!(major, "image" | "video" | "audio") || essence == "application/pdf" {
         Some(essence)
     } else {
         None

@@ -6,6 +6,7 @@
 //! collections themselves, so lookups never chain.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use vulse_model::{
@@ -25,8 +26,10 @@ pub(crate) struct Cached {
 /// Cached columns by collection id.
 pub(crate) type Cache = Mutex<HashMap<String, Cached>>;
 static CACHE: LazyLock<Cache> = LazyLock::new(Default::default);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn invalidate(collection_id: &str) {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -60,7 +63,9 @@ async fn columns(
 ) -> anyhow::Result<Vec<(String, Arc<LookupColumn>)>> {
     // A transaction sees its own writes (or an older read snapshot). Neither
     // may reuse or populate the cache shared with other requests.
-    let cache = if conn.in_transaction() {
+    let in_tx = conn.in_transaction();
+    let generation = GENERATION.load(Ordering::Acquire);
+    let cache = if in_tx {
         &conn.lookup_cache
     } else {
         &CACHE
@@ -136,19 +141,23 @@ async fn columns(
             )
         })
         .collect();
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = cache
-        .entry(collection.id.clone())
-        .or_insert_with(|| Cached {
-            fingerprint: fingerprint.clone(),
-            columns: HashMap::new(),
-        });
-    if entry.fingerprint != fingerprint {
-        entry.fingerprint = fingerprint;
-        entry.columns.clear();
-    }
-    for (field, column) in &found {
-        entry.columns.insert(field.clone(), column.clone());
+    if in_tx || GENERATION.load(Ordering::Acquire) == generation {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if in_tx || GENERATION.load(Ordering::Acquire) == generation {
+            let entry = cache
+                .entry(collection.id.clone())
+                .or_insert_with(|| Cached {
+                    fingerprint: fingerprint.clone(),
+                    columns: HashMap::new(),
+                });
+            if entry.fingerprint != fingerprint {
+                entry.fingerprint = fingerprint;
+                entry.columns.clear();
+            }
+            for (field, column) in &found {
+                entry.columns.insert(field.clone(), column.clone());
+            }
+        }
     }
     Ok(found)
 }

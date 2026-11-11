@@ -43,6 +43,8 @@ const REQUEST_SECONDS: i64 = 10 * 60;
 const ACCESS_PREFIX: &str = "vat_";
 const REFRESH_PREFIX: &str = "vrt_";
 const MAX_REDIRECT_URIS: usize = 10;
+/// Authorization requests allowed from one client address in a throttle window.
+const AUTHORIZE_LIMIT: usize = 120;
 /// How long a client's metadata document is used before it is read again.
 const METADATA_SECONDS: i64 = 24 * 60 * 60;
 const OPEN_REGISTRATION: &str = "mcp_open_registration";
@@ -418,39 +420,58 @@ async fn find_client(
     // address's limit.
     state.throttle.check(&[(address, ADDRESS_LIMIT)])?;
     state.throttle.fail(&[address]);
-    let metadata = match client_metadata::fetch(id).await {
-        Ok(body) => client_metadata::parse(id, &body),
-        Err(err) => Err(err),
-    };
-    let metadata = match (metadata, stored) {
-        (Ok(metadata), _) => metadata,
+    let body = match client_metadata::fetch(id).await {
+        Ok(body) => body,
         // An outage at the client's site does not disconnect people.
-        (Err(err), Some(stored)) => {
-            tracing::warn!(client_id = id, error = %err, "using the cached client metadata");
-            return Ok(Ok(stored.client));
-        }
-        (Err(err), None) => return Ok(Err(format!("Vulse cannot use this app: {err}."))),
+        Err(err) => match stored {
+            Some(stored) => {
+                tracing::warn!(client_id = id, error = %err, "using the cached client metadata");
+                return Ok(Ok(stored.client));
+            }
+            None => return Ok(Err(format!("Vulse cannot use this app: {err}."))),
+        },
+    };
+    let metadata = match client_metadata::parse(id, &body) {
+        Ok(metadata) => metadata,
+        Err(err) => return Ok(Err(format!("Vulse cannot use this app: {err}."))),
     };
     let now = timeutil::now_secs();
     let uris = serde_json::to_string(&metadata.redirect_uris).map_err(anyhow::Error::from)?;
-    let approved_at = if open_registration(conn).await? {
-        text(&now)
+    let open = open_registration(conn).await?;
+    let added_redirects = stored.as_ref().is_some_and(|stored| {
+        metadata
+            .redirect_uris
+            .iter()
+            .any(|uri| !stored.client.redirect_uris.contains(uri))
+    });
+    if !open && added_redirects {
+        conn.execute(
+            "UPDATE oauth_clients
+             SET name = ?2, redirect_uris = ?3, fetched_at = ?4, approved_at = NULL, approved_by = NULL
+             WHERE id = ?1",
+            &[text(id), text(&metadata.name), text(&uris), text(&now)],
+        )
+        .await?;
     } else {
-        SqlValue::Null
-    };
-    conn.execute(
-        "INSERT INTO oauth_clients (id, name, redirect_uris, created_at, approved_at, fetched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?4)
-         ON CONFLICT (id) DO UPDATE SET name = ?2, redirect_uris = ?3, fetched_at = ?4",
-        &[
-            text(id),
-            text(&metadata.name),
-            text(&uris),
-            text(&now),
-            approved_at,
-        ],
-    )
-    .await?;
+        let approved_at = if open {
+            text(&now)
+        } else {
+            SqlValue::Null
+        };
+        conn.execute(
+            "INSERT INTO oauth_clients (id, name, redirect_uris, created_at, approved_at, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)
+             ON CONFLICT (id) DO UPDATE SET name = ?2, redirect_uris = ?3, fetched_at = ?4",
+            &[
+                text(id),
+                text(&metadata.name),
+                text(&uris),
+                text(&now),
+                approved_at,
+            ],
+        )
+        .await?;
+    }
     Ok(stored_client(conn, id)
         .await?
         .map(|stored| stored.client)
@@ -548,6 +569,9 @@ async fn authorize(
             "supported scopes are records:read and records:write",
         );
     };
+    let auth_key = format!("oauth_authorize:{ip}");
+    state.throttle.check(&[(&auth_key, AUTHORIZE_LIMIT)])?;
+    state.throttle.fail(&[&auth_key]);
     let id = new_token();
     conn.execute(
         "INSERT INTO oauth_requests
@@ -872,16 +896,38 @@ async fn refresh(state: &AppState, params: &HashMap<String, String>) -> Result<V
                 "the refresh token was issued to another client",
             )));
         }
-        let scope = text_at(row, 4)?;
-        if let Some(requested) = params.get("scope")
-            && !requested
-                .split_whitespace()
+        let mut scope = text_at(row, 4)?;
+        if let Some(requested) = params.get("scope") {
+            let trimmed = requested.trim();
+            if trimmed.is_empty() {
+                return Ok(Err(TokenError::new(
+                    "invalid_scope",
+                    "supported scopes are records:read and records:write",
+                )));
+            }
+            let Some(normalized) = parse_scope(Some(trimmed)) else {
+                return Ok(Err(TokenError::new(
+                    "invalid_scope",
+                    "supported scopes are records:read and records:write",
+                )));
+            };
+            if !normalized
+                .split(' ')
                 .all(|item| scope.split(' ').any(|granted| granted == item))
-        {
-            return Ok(Err(TokenError::new(
-                "invalid_scope",
-                "the requested scope exceeds the grant",
-            )));
+            {
+                return Ok(Err(TokenError::new(
+                    "invalid_scope",
+                    "the requested scope exceeds the grant",
+                )));
+            }
+            if normalized != scope {
+                conn.execute(
+                    "UPDATE oauth_grants SET scope = ?1 WHERE id = ?2",
+                    &[text(&normalized), text(&grant_id)],
+                )
+                .await?;
+                scope = normalized;
+            }
         }
         conn.execute(
             "UPDATE oauth_tokens SET used_at = ?1 WHERE token_hash = ?2",
@@ -1160,25 +1206,24 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// The scheme and the authority's host, port and remainder of a URI.
-pub(crate) fn split_uri(uri: &str) -> Option<(String, &str, Option<&str>, &str)> {
-    let (scheme, rest) = uri.split_once(':')?;
-    let rest = rest.strip_prefix("//")?;
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(end);
-    if authority.contains('@') {
+fn raw_authority_host(after_slashes: &str) -> Option<&str> {
+    let end = after_slashes.find(['/', '?']).unwrap_or(after_slashes.len());
+    let authority = &after_slashes[..end];
+    if authority.is_empty() || authority.contains('@') {
         return None;
     }
-    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
-        let (host, after) = inner.split_once(']')?;
-        (host, after.strip_prefix(':'))
+    if let Some(inner) = authority.strip_prefix('[') {
+        let (host, rest) = inner.split_once(']')?;
+        if !rest.is_empty() && !rest.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok()) {
+            return None;
+        }
+        Some(host)
     } else {
         match authority.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
+            Some((host, port)) => port.parse::<u16>().ok().map(|_| host),
+            None => Some(authority),
         }
-    };
-    Some((scheme.to_ascii_lowercase(), host, port, path))
+    }
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -1186,56 +1231,91 @@ fn is_loopback(host: &str) -> bool {
 }
 
 /// Allowed redirect targets: https, http on this machine, and app-specific
-/// schemes for native apps (RFC 8252). Never a fragment.
+/// schemes for native apps (RFC 8252). Never a fragment, backslash or non-ASCII byte.
 pub(crate) fn valid_redirect(uri: &str) -> bool {
-    if uri.len() > 2000
+    if uri.is_empty()
+        || uri.len() > 2000
+        || !uri.is_ascii()
         || uri.contains('#')
-        || uri.chars().any(|c| c.is_whitespace() || c.is_control())
+        || uri.contains('\\')
+        || uri
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
     {
         return false;
     }
-    let Some((scheme, _)) = uri.split_once(':') else {
+    let Ok(parsed) = url::Url::parse(uri) else {
         return false;
     };
-    let scheme = scheme.to_ascii_lowercase();
-    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some()
     {
         return false;
     }
-    match scheme.as_str() {
-        "https" => split_uri(uri).is_some_and(|(_, host, _, _)| !host.is_empty()),
-        "http" => split_uri(uri).is_some_and(|(_, host, _, _)| is_loopback(host)),
+    match parsed.scheme() {
+        "https" => uri
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+            && raw_authority_host(&uri[8..]).is_some_and(|host| !host.is_empty())
+            && parsed.host_str().is_some_and(|host| !host.is_empty()),
+        "http" => uri
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+            && raw_authority_host(&uri[7..]).is_some_and(is_loopback)
+            && match parsed.host() {
+                Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+                Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+                None => false,
+            },
         "javascript" | "data" | "file" | "vbscript" | "about" | "blob" | "ws" | "wss" => false,
         _ => true,
     }
 }
 
-/// Exact match, except that loopback redirects may use any port, since
+/// Exact match, except that loopback redirects may use any valid port, since
 /// native apps pick a free one at sign-in (RFC 8252).
 fn redirect_matches(registered: &str, presented: &str) -> bool {
+    if !valid_redirect(presented) {
+        return false;
+    }
     if registered == presented {
         return true;
     }
-    match (split_uri(registered), split_uri(presented)) {
-        (Some((scheme, host, _, path)), Some((other_scheme, other_host, _, other_path))) => {
-            scheme == "http"
-                && other_scheme == "http"
-                && is_loopback(host)
-                && host == other_host
-                && path == other_path
-        }
-        _ => false,
+    if !valid_redirect(registered) {
+        return false;
     }
+    let (Ok(reg), Ok(pres)) = (url::Url::parse(registered), url::Url::parse(presented)) else {
+        return false;
+    };
+    if reg.scheme() != "http" || pres.scheme() != "http" {
+        return false;
+    }
+    let reg_after = &registered[7..];
+    let pres_after = &presented[7..];
+    let reg_tail = reg_after
+        .find(['/', '?'])
+        .map(|i| &reg_after[i..])
+        .unwrap_or("");
+    let pres_tail = pres_after
+        .find(['/', '?'])
+        .map(|i| &pres_after[i..])
+        .unwrap_or("");
+    reg.host() == pres.host()
+        && reg.path() == pres.path()
+        && reg.query() == pres.query()
+        && reg_tail == pres_tail
 }
 
 fn redirect_host(uri: &str) -> String {
-    match split_uri(uri) {
-        Some((_, host, _, _)) if !host.is_empty() => host.to_string(),
-        _ => uri.split(':').next().unwrap_or_default().to_string() + ":",
+    if let Ok(parsed) = url::Url::parse(uri) {
+        match parsed.host() {
+            Some(url::Host::Ipv6(ip)) => return ip.to_string(),
+            Some(url::Host::Ipv4(ip)) => return ip.to_string(),
+            Some(url::Host::Domain(domain)) if !domain.is_empty() => return domain.to_string(),
+            _ => return format!("{}:", parsed.scheme()),
+        }
     }
+    uri.split(':').next().unwrap_or_default().to_string() + ":"
 }
 
 fn with_params(uri: &str, pairs: &[(&str, &str)]) -> String {
@@ -1308,6 +1388,10 @@ mod unit {
             "https://user@evil.example/cb",
             "https:///cb",
             "data:text/html,hi",
+            r"https://evil.example\claude.ai/cb",
+            "https://claude.ai/café",
+            "http://[::1]suffix/cb",
+            "http://2130706433/cb",
         ] {
             assert!(!valid_redirect(uri), "{uri}");
         }
@@ -1322,6 +1406,22 @@ mod unit {
         assert!(!redirect_matches(
             "http://localhost:1000/cb",
             "http://localhost:2000/other"
+        ));
+        assert!(!redirect_matches(
+            "http://localhost:1000/cb",
+            "http://localhost:8080#x/cb"
+        ));
+        assert!(!redirect_matches(
+            "http://localhost:1000/cb",
+            r"http://localhost:\other/cb"
+        ));
+        assert!(!redirect_matches(
+            "http://localhost:1000/cb",
+            "http://localhost:abc/cb"
+        ));
+        assert!(!redirect_matches(
+            "http://localhost:1000/cb",
+            "http://localhost:2000/cb?extra=1"
         ));
         assert!(!redirect_matches(
             "https://a.example/cb",

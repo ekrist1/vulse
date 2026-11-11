@@ -12,10 +12,10 @@ extern "C" {
         json: &str,
         change: &JsValue,
     ) -> Result<JsValue, JsValue>;
-    #[wasm_bindgen(js_namespace = ["window", "VulseEditor"], js_name = update)]
-    fn update_editor(handle: &JsValue, json: &str);
-    #[wasm_bindgen(js_namespace = ["window", "VulseEditor"], js_name = destroy)]
-    fn destroy_editor(handle: &JsValue);
+    #[wasm_bindgen(catch, js_namespace = ["window", "VulseEditor"], js_name = update)]
+    fn update_editor(handle: &JsValue, json: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch, js_namespace = ["window", "VulseEditor"], js_name = destroy)]
+    fn destroy_editor(handle: &JsValue) -> Result<(), JsValue>;
 }
 
 #[derive(Properties, PartialEq)]
@@ -57,7 +57,7 @@ pub fn rich_editor(props: &RichEditorProps) -> Html {
             }
             move || {
                 if let Some(editor) = handle.borrow_mut().take() {
-                    destroy_editor(&editor);
+                    let _ = destroy_editor(&editor);
                 }
                 drop(change);
             }
@@ -67,7 +67,7 @@ pub fn rich_editor(props: &RichEditorProps) -> Html {
         let handle = handle.clone();
         use_effect_with(props.value.clone(), move |value| {
             if let Some(editor) = handle.borrow().as_ref() {
-                update_editor(editor, &value.to_string());
+                let _ = update_editor(editor, &value.to_string());
             }
         });
     }

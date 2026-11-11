@@ -128,7 +128,12 @@ pub(crate) async fn run_summary(
                     "CASE WHEN {text}<>'' THEN substr({text},1,{}) END",
                     bucket.width()
                 ),
-                None => column(&group.field, 'r'),
+                None => format!(
+                    "CASE WHEN {} THEN COALESCE(CAST({} AS TEXT),{}) END",
+                    crate::records::nonempty_cell(&group.field),
+                    column(&group.field, 'n'),
+                    column(&group.field, 'r')
+                ),
             }
         })
         .collect();
@@ -140,6 +145,7 @@ pub(crate) async fn run_summary(
         };
         let number = column(field, 'n');
         let text = column(field, 't');
+        let raw = column(field, 'r');
         let date = kind(field) == Some(FieldType::Date);
         let expression = match measure.op {
             SummaryOp::Sum => format!("SUM({number})"),
@@ -152,7 +158,10 @@ pub(crate) async fn run_summary(
                 "COUNT(CASE WHEN {} THEN r.id END)",
                 crate::records::nonempty_cell(field)
             ),
-            SummaryOp::CountUnique => format!("COUNT(DISTINCT {})", column(field, 'r')),
+            SummaryOp::CountUnique => format!(
+                "COUNT(DISTINCT CASE WHEN {} THEN COALESCE(CAST({number} AS TEXT),{raw}) END)",
+                crate::records::nonempty_cell(field)
+            ),
             SummaryOp::Formula => continue,
         };
         columns.push((measure.name.clone(), expression));
@@ -195,7 +204,7 @@ pub(crate) async fn run_summary(
         }
     }
     label_groups(conn, collection, spec, &mut rows, &access).await?;
-    sort_rows(spec, &mut rows);
+    sort_rows(&collection.blueprint, spec, &mut rows);
     let group_count = rows.len() as u64;
     let truncated = rows.len() > MAX_SUMMARY_GROUPS;
     rows.truncate(MAX_SUMMARY_GROUPS);
@@ -219,9 +228,11 @@ fn decode_row(
         .enumerate()
         .map(|(index, group)| match row.get(index) {
             Some(SqlValue::Text(text)) if group.bucket.is_some() => Value::String(text.clone()),
-            Some(SqlValue::Text(raw)) => {
-                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
-            }
+            Some(SqlValue::Text(raw)) => match serde_json::from_str::<Value>(raw) {
+                Ok(Value::Number(n)) => n.as_f64().map(number).unwrap_or(Value::Number(n)),
+                Ok(other) => other,
+                Err(_) => Value::String(raw.clone()),
+            },
             _ => Value::Null,
         })
         .collect::<Vec<_>>();
@@ -293,21 +304,25 @@ async fn label_groups(
         };
         // Keep the already-visible reference ID when its title is inaccessible.
         let target = target.filter(|target| access.can_read(target));
+        let target_ctx = match &target {
+            Some(target) => Some((
+                target,
+                vulse_model::CompiledFormulas::new(&target.blueprint),
+                crate::lookups::load(conn, &target.blueprint).await?,
+            )),
+            None => None,
+        };
         for row in rows.iter_mut() {
             let value = &row.group[index];
-            let label = match (value, &target) {
+            let label = match (value, &target_ctx) {
                 (Value::Null, _) => "(empty)".to_string(),
-                (Value::String(id), Some(target)) => {
+                (Value::String(id), Some((target, formulas, lookups))) => {
                     let key = (target.id.clone(), id.clone());
                     if !titles.contains_key(&key) {
                         let title = store::find_document(conn, &target.id, id)
                             .await?
                             .map(|mut doc| {
-                                crate::content::materialize(
-                                    &target.blueprint,
-                                    &Default::default(),
-                                    &mut doc,
-                                );
+                                crate::content::materialize_with(formulas, lookups, &mut doc);
                                 vulse_model::record_title(&target.blueprint, &doc.body, &doc.id)
                             })
                             .unwrap_or_else(|| format!("Missing record {id}"));
@@ -325,7 +340,7 @@ async fn label_groups(
 
 /// Orders groups by the chosen column, or by the group values. Empty values
 /// always come last.
-fn sort_rows(spec: &SummarySpec, rows: &mut [SummaryRow]) {
+fn sort_rows(blueprint: &vulse_model::Blueprint, spec: &SummarySpec, rows: &mut [SummaryRow]) {
     let measure = spec
         .sort
         .as_ref()
@@ -334,16 +349,45 @@ fn sort_rows(spec: &SummarySpec, rows: &mut [SummaryRow]) {
         .sort
         .as_ref()
         .and_then(|name| spec.group_by.iter().position(|g| g.field == *name));
+    let is_ref: Vec<bool> = spec
+        .group_by
+        .iter()
+        .map(|g| {
+            blueprint
+                .fields
+                .iter()
+                .any(|f| f.name == g.field && f.kind == FieldType::Reference)
+        })
+        .collect();
+    let cmp_group = |a: &SummaryRow, b: &SummaryRow, index: usize| -> Ordering {
+        if is_ref.get(index).copied().unwrap_or(false) {
+            match (&a.group[index], &b.group[index]) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => Ordering::Greater,
+                (_, Value::Null) => Ordering::Less,
+                _ => {
+                    let ord = a
+                        .labels
+                        .get(index)
+                        .map(|s| s.to_lowercase())
+                        .cmp(&b.labels.get(index).map(|s| s.to_lowercase()));
+                    if spec.descending { ord.reverse() } else { ord }
+                }
+            }
+        } else {
+            compare(&a.group[index], &b.group[index], spec.descending)
+        }
+    };
     rows.sort_by(|a, b| {
         let ordering = if let Some(name) = measure {
-            compare(&a.values[name], &b.values[name], spec.descending)
+            let av = a.values.get(name).unwrap_or(&Value::Null);
+            let bv = b.values.get(name).unwrap_or(&Value::Null);
+            compare(av, bv, spec.descending)
         } else if let Some(index) = group {
-            compare(&a.group[index], &b.group[index], spec.descending)
+            cmp_group(a, b, index)
         } else {
-            a.group
-                .iter()
-                .zip(&b.group)
-                .map(|(x, y)| compare(x, y, spec.descending))
+            (0..a.group.len().min(b.group.len()))
+                .map(|index| cmp_group(a, b, index))
                 .find(|o| o.is_ne())
                 .unwrap_or(Ordering::Equal)
         };

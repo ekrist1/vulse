@@ -6,8 +6,11 @@ use serde_json::{Value, json};
 /// text by value, other text case-insensitively.
 pub(super) fn match_key(v: &Value) -> String {
     match as_number(v) {
-        // -0 and 0 are the same value.
-        Some(n) => if n == 0.0 { 0.0 } else { n }.to_string(),
+        // -0 and 0 are the same value; round to spreadsheet significant digits.
+        Some(n) => {
+            let n = significant(n);
+            if n == 0.0 { 0.0 } else { n }.to_string()
+        }
         None => text_value(v).to_lowercase(),
     }
 }
@@ -65,7 +68,7 @@ pub fn text_value(v: &Value) -> String {
 }
 /// `x` to 15 significant digits, the precision spreadsheets calculate with,
 /// so binary noise such as 1.005 * 100 = 100.49999999999999 rounds as written.
-pub(super) fn significant(x: f64) -> f64 {
+pub fn significant(x: f64) -> f64 {
     if x == 0.0 || !x.is_finite() {
         return x;
     }
@@ -116,16 +119,17 @@ pub(super) fn date(v: &Value) -> Result<NaiveDate, String> {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| "#VALUE! expected YYYY-MM-DD".into())
     } else {
         let n = num(v)?;
-        if !(1.0..=2_958_465.0).contains(&n) {
+        let day = n.trunc();
+        if !(1.0..=2_958_465.0).contains(&day) {
             return Err("#NUM! date out of range".into());
         }
-        if n.trunc() == 60.0 {
+        if day == 60.0 {
             return Err("#NUM! Excel's fictitious 1900-02-29 is unsupported".into());
         }
         NaiveDate::from_ymd_opt(1899, 12, 31)
             .unwrap()
             .checked_add_signed(Duration::days(
-                n.trunc() as i64 - if n >= 60.0 { 1 } else { 0 },
+                day as i64 - if day >= 60.0 { 1 } else { 0 },
             ))
             .ok_or("#NUM!".into())
     }

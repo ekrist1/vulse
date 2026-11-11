@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,8 @@ impl Throttle {
         let mut failures = self.failures.lock().expect("throttle lock");
         let mut wait = Duration::ZERO;
         for (key, limit) in keys {
-            if let Some(times) = failures.get_mut(*key) {
+            let key = bound_key(key);
+            if let Some(times) = failures.get_mut(key.as_ref()) {
                 times.retain(|time| now.duration_since(*time) < WINDOW);
                 if times.len() >= *limit {
                     let oldest = times[times.len() - limit];
@@ -62,14 +64,42 @@ impl Throttle {
                 times.retain(|time| now.duration_since(*time) < WINDOW);
                 !times.is_empty()
             });
+            if failures.len() >= MAX_TRACKED {
+                let drop_count = (MAX_TRACKED / 10).max(1);
+                let mut by_age: Vec<(String, Instant)> = failures
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.last().copied().unwrap_or(now)))
+                    .collect();
+                by_age.sort_unstable_by_key(|(_, last)| *last);
+                for (old_key, _) in by_age.into_iter().take(drop_count) {
+                    failures.remove(&old_key);
+                }
+            }
         }
         for key in keys {
-            failures.entry((*key).to_string()).or_default().push(now);
+            let key = bound_key(key);
+            let times = failures.entry(key.into_owned()).or_default();
+            times.retain(|time| now.duration_since(*time) < WINDOW);
+            if times.len() < 256 {
+                times.push(now);
+            }
         }
     }
 
     pub fn clear(&self, key: &str) {
-        self.failures.lock().expect("throttle lock").remove(key);
+        let key = bound_key(key);
+        self.failures
+            .lock()
+            .expect("throttle lock")
+            .remove(key.as_ref());
+    }
+}
+
+fn bound_key(key: &str) -> Cow<'_, str> {
+    if key.len() <= 300 {
+        Cow::Borrowed(key)
+    } else {
+        Cow::Owned(format!("sha256:{}", crate::auth::hash_secret(key)))
     }
 }
 
@@ -79,6 +109,42 @@ pub fn account_key(email: &str) -> String {
 
 pub fn address_key(ip: &str) -> String {
     format!("address:{ip}")
+}
+
+fn normalize_ip(raw: &str) -> Option<String> {
+    let parsed = raw
+        .parse::<IpAddr>()
+        .or_else(|_| raw.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()?;
+    Some(canonical_ip(parsed))
+}
+
+fn canonical_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            if v6.is_loopback() || v6.is_unspecified() {
+                return v6.to_string();
+            }
+            let [a, b, c, d, ..] = v6.segments();
+            std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0).to_string()
+        }
+    }
+}
+
+fn forwarded_ip(headers: &axum::http::HeaderMap) -> Option<String> {
+    // The trusted proxy appends the address it saw, either to the last
+    // `X-Forwarded-For` header or as a new trailing header field.
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        let text = String::from_utf8_lossy(value.as_bytes());
+        if let Some(entry) = text.rsplit(',').map(str::trim).find(|v| !v.is_empty()) {
+            return normalize_ip(entry);
+        }
+    }
+    None
 }
 
 /// Client address used for throttling.
@@ -91,22 +157,15 @@ impl FromRequestParts<AppState> for ClientIp {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if state.auth.trust_proxy {
-            // The trusted proxy appends the address it saw, so the last entry
-            // is the only one a client cannot forge.
-            let forwarded = parts
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.rsplit(',').map(str::trim).find(|v| !v.is_empty()));
-            if let Some(ip) = forwarded {
-                return Ok(ClientIp(ip.to_string()));
-            }
+        if state.auth.trust_proxy
+            && let Some(ip) = forwarded_ip(&parts.headers)
+        {
+            return Ok(ClientIp(ip));
         }
         let ip = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|info| info.0.ip().to_string())
+            .map(|info| canonical_ip(info.0.ip()))
             .unwrap_or_else(|| "unknown".into());
         Ok(ClientIp(ip))
     }

@@ -4672,6 +4672,7 @@ dependencies = [
  "tracing-subscriber",
  "turso",
  "turso_serverless",
+ "url",
  "uuid",
  "vulse-model",
  "zip",

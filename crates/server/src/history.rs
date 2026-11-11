@@ -159,12 +159,30 @@ pub async fn restore(
  let current=store::find_document(conn,&id,&doc).await?;
  if let Some(current)=&current {if write.expected_updated_at.is_none(){return Err(AppError::conflict("Reload the record before restoring a version"));}crate::mutations::check_version(current,write.expected_updated_at.as_deref())?;}
  else if write.expected_updated_at.is_some(){return Err(AppError::conflict("The record was deleted. Restore it from Trash."));}
- let source=vulse_model::source_document(&collection.blueprint,&revision.body);
+ let source = vulse_model::source_document(&collection.blueprint, &revision.body);
+ vulse_model::validate_document(&collection.blueprint, &source).map_err(AppError::bad)?;
+ let now = timeutil::now_rfc3339();
  // Insert first to permit a deleted record's self reference; the transaction rolls back on validation errors.
- if current.is_none(){store::insert_document(conn,&doc,&id,&source,&revision.record_created_at).await?;}
- check_body(conn,&id,&collection.name,&collection.blueprint,&source).await?;
- store::update_document(conn,&id,&doc,&source,&timeutil::now_rfc3339()).await?;
- snapshot(conn,&id,&doc,"restore").await?;
+ if let Some(current) = &current {
+     check_body(conn, &id, &collection.name, &collection.blueprint, &source).await?;
+     let same = current.body == source;
+     store::update_document_as(conn, &id, &doc, &source, &now, "restore").await?;
+     if same {
+         snapshot(conn, &id, &doc, "restore").await?;
+     }
+ } else {
+     store::insert_document_as(
+         conn,
+         &doc,
+         &id,
+         &source,
+         &revision.record_created_at,
+         &now,
+         "restore",
+     )
+     .await?;
+     check_body(conn, &id, &collection.name, &collection.blueprint, &source).await?;
+ }
  let mut result=store::find_document(conn,&id,&doc).await?.ok_or(AppError::NotFound)?;let lookups=crate::lookups::load(conn,&collection.blueprint).await?;materialize(&collection.blueprint,&lookups,&mut result);Ok(result)
  }).await?;
     Ok(Json(result))

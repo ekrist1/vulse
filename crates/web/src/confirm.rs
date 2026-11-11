@@ -15,6 +15,7 @@
 use futures_channel::oneshot;
 use web_sys::HtmlDialogElement;
 use yew::prelude::*;
+use yew_router::prelude::use_location;
 
 #[derive(Clone, PartialEq)]
 pub struct ConfirmRequest {
@@ -80,6 +81,7 @@ pub fn confirm_provider(props: &ConfirmProviderProps) -> Html {
     let request = use_state(|| None::<ConfirmRequest>);
     let pending = use_mut_ref(|| None::<oneshot::Sender<bool>>);
     let dialog = use_node_ref();
+    let route_path = use_location().map(|loc| loc.path().to_string());
     let answer = {
         let request = request.clone();
         let pending = pending.clone();
@@ -90,6 +92,12 @@ pub fn confirm_provider(props: &ConfirmProviderProps) -> Html {
             request.set(None);
         })
     };
+    {
+        let answer = answer.clone();
+        use_effect_with(route_path, move |_| {
+            answer.emit(false);
+        });
+    }
     let open = {
         let request = request.clone();
         let pending = pending.clone();

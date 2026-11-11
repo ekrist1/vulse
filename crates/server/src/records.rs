@@ -327,7 +327,9 @@ pub(crate) fn query_sql(
     };
     let mut order = vec![];
     if !query.group_field.is_empty() {
-        order.push(format!("r.{} ASC", column(&query.group_field, 't')));
+        let g = column(&query.group_field, 't');
+        order.push(format!("(r.{g} IS NULL OR r.{g}='') ASC"));
+        order.push(format!("r.{g} ASC"));
     }
     order.push(format!("({sorted} IS NULL) ASC"));
     order.push(format!("{sorted} {direction}"));
@@ -580,10 +582,22 @@ pub async fn rename_view_values(
         let mut config: SavedViewWrite = serde_json::from_str(&text_at(&row, 1)?)?;
         let mut changed = false;
         for filter in &mut config.query.filters {
+            if !matches!(filter.op.as_str(), "eq" | "neq") {
+                continue;
+            }
             let next = renames
                 .get(&filter.field)
                 .zip(filter.value.as_str())
-                .and_then(|(values, value)| values.get(value));
+                .and_then(|(values, value)| {
+                    values
+                        .get(value)
+                        .or_else(|| {
+                            values
+                                .iter()
+                                .find(|(old, _)| old.eq_ignore_ascii_case(value))
+                                .map(|(_, new)| new)
+                        })
+                });
             if let Some(next) = next {
                 filter.value = serde_json::Value::String(next.clone());
                 changed = true;

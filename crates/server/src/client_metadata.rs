@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::oauth::{check_client_metadata, split_uri};
+use crate::oauth::check_client_metadata;
 
 const MAX_BYTES: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,28 +26,51 @@ pub fn is_metadata_url(client_id: &str) -> bool {
 /// the client's name.
 pub fn domain(client_id: &str) -> Option<String> {
     is_metadata_url(client_id)
-        .then(|| split_uri(client_id).map(|(_, host, _, _)| host.to_ascii_lowercase()))
+        .then(|| target(client_id).ok().map(|(host, _)| host))
         .flatten()
 }
 
 /// The host and port to fetch, for an https URL with a path and a domain name.
 fn target(url: &str) -> Result<(String, u16), String> {
     let invalid = || "the client_id is not a usable https URL".to_string();
-    if url.len() > 2000 || url.contains('#') || url.chars().any(|c| c.is_whitespace()) {
+    if url.len() > 2000
+        || !url.is_ascii()
+        || !url.starts_with("https://")
+        || url.contains('#')
+        || url.contains('\\')
+        || url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
         return Err(invalid());
     }
-    let (scheme, host, port, path) = split_uri(url).ok_or_else(invalid)?;
-    if scheme != "https" || host.is_empty() || !path.starts_with('/') || path == "/" {
+    let parsed = url::Url::parse(url).map_err(|_| invalid())?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path().is_empty()
+        || parsed.path() == "/"
+    {
         return Err(invalid());
     }
-    if host.parse::<IpAddr>().is_ok() || host.contains(':') {
-        return Err("the client_id must use a domain name, not an IP address".into());
+    // Require an explicit slash path in the raw URL as well (reject `https://host` or `https://host?q`).
+    let after_scheme = &url["https://".len()..];
+    if !after_scheme.contains('/') || after_scheme.find('?').is_some_and(|q| q < after_scheme.find('/').unwrap_or(usize::MAX)) {
+        return Err(invalid());
     }
-    let port = match port {
-        Some(port) => port.parse().map_err(|_| invalid())?,
-        None => 443,
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) if !domain.is_empty() => {
+            if domain.parse::<IpAddr>().is_ok() {
+                return Err("the client_id must use a domain name, not an IP address".into());
+            }
+            domain.to_ascii_lowercase()
+        }
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
+            return Err("the client_id must use a domain name, not an IP address".into());
+        }
+        _ => return Err(invalid()),
     };
-    Ok((host.to_ascii_lowercase(), port))
+    let port = parsed.port().unwrap_or(443);
+    Ok((host, port))
 }
 
 /// Addresses on the public internet: not this machine, private networks,
@@ -93,21 +116,29 @@ pub async fn fetch(url: &str) -> Result<Vec<u8>, String> {
         return Ok(document.clone().into_bytes());
     }
     let (host, port) = target(url)?;
+    let parsed_url = url::Url::parse(url).map_err(|_| "the client_id is not a usable https URL".to_string())?;
     let unreachable = || format!("could not read the app's details from {host}");
-    let address: SocketAddr = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|_| unreachable())?
-        .find(|address| is_public(address.ip()))
-        .ok_or_else(|| format!("{host} is not a public address"))?;
+    let addresses: Vec<SocketAddr> = tokio::time::timeout(
+        TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| unreachable())?
+    .map_err(|_| unreachable())?
+    .filter(|address| is_public(address.ip()))
+    .collect();
+    if addresses.is_empty() {
+        return Err(format!("{host} is not a public address"));
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(TIMEOUT)
         .no_proxy()
-        .resolve(&host, address)
+        .resolve_to_addrs(&host, &addresses)
         .build()
         .map_err(|_| unreachable())?;
     let mut response = client
-        .get(url)
+        .get(parsed_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
@@ -238,8 +269,13 @@ mod unit {
             "https://[::1]/client",
             "https://user@claude.ai/client",
             "https://claude.ai/client#x",
+            r"https://internal.corp\.attacker.example/client.json",
+            r"https://127.0.0.1\.attacker.example:8443/client.json",
+            "https://claude.ai/client\\path",
+            "https://claude.ai/café.json",
         ] {
             assert!(target(url).is_err(), "{url}");
+            assert!(domain(url).is_none(), "{url}");
         }
     }
 

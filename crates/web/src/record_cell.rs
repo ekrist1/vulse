@@ -5,12 +5,43 @@ use vulse_model::{
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
+/// A value shared by reference. Props holding one are cloned and compared
+/// by pointer, so a table can hand the same record or field to every cell
+/// without copying it.
+pub struct Shared<T>(std::rc::Rc<T>);
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(std::rc::Rc::new(value))
+    }
+}
+impl<T> From<std::rc::Rc<T>> for Shared<T> {
+    fn from(value: std::rc::Rc<T>) -> Self {
+        Self(value)
+    }
+}
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<T: PartialEq> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct CellProps {
-    pub collections: Vec<vulse_model::CollectionView>,
+    pub collections: Shared<Vec<vulse_model::CollectionView>>,
     pub collection_id: String,
-    pub document: DocumentView,
-    pub field: FieldDef,
+    pub document: Shared<DocumentView>,
+    pub field: Shared<FieldDef>,
     pub on_saved: Callback<MutationResult>,
 }
 #[function_component(RecordCell)]

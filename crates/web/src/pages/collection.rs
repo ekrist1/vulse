@@ -7,6 +7,7 @@ use crate::{
     formula_builder::FormulaEditor,
     import::ImportPanel,
 };
+use crate::record_cell::Shared;
 use std::collections::BTreeSet;
 use vulse_model::{
     ArrayItems, Blueprint, CollectionView, DocumentView, FieldDef, FieldType, Role,
@@ -28,8 +29,8 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
     // Saved fields whose removal was confirmed with the Remove button.
     let confirmed_removals = use_state(Vec::<String>::new);
     let collection = use_state(|| None::<CollectionView>);
-    let collections = use_state(Vec::<CollectionView>::new);
-    let documents = use_state(Vec::<DocumentView>::new);
+    let collections = use_state(|| Shared::new(Vec::<CollectionView>::new()));
+    let documents = use_state(|| Shared::new(Vec::<DocumentView>::new()));
     let name = use_state(String::new);
     let visibility = use_state(|| Visibility::Private);
     let fields = use_state(Vec::<FieldDef>::new);
@@ -96,14 +97,14 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 let documents = documents.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Ok(items) = api::collections().await {
-                        collections.set(items);
+                        collections.set(Shared::new(items));
                     }
                     let sample_query = vulse_model::RecordQuery {
                         limit: 100,
                         ..vulse_model::RecordQuery::default()
                     };
                     if let Ok(result) = api::query_records(&id, &sample_query).await {
-                        documents.set(result.items);
+                        documents.set(Shared::new(result.items));
                     }
                 });
             }
@@ -155,10 +156,10 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                     Err(err) => error.set(err),
                 }
                 if let Ok(items) = api::collections().await {
-                    collections.set(items);
+                    collections.set(Shared::new(items));
                 }
                 match api::query_records(&id, &vulse_model::RecordQuery::default()).await {
-                    Ok(result) => documents.set(result.items),
+                    Ok(result) => documents.set(Shared::new(result.items)),
                     Err(err) => error.set(err),
                 }
             });
@@ -446,10 +447,10 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                         collection.set(Some(item));
                         status.set("Changes saved".into());
                         if let Ok(items) = api::collections().await {
-                            collections.set(items);
+                            collections.set(Shared::new(items));
                         }
                         match api::query_records(&id, &vulse_model::RecordQuery::default()).await {
-                            Ok(result) => documents.set(result.items),
+                            Ok(result) => documents.set(Shared::new(result.items)),
                             Err(e) => error.set(e),
                         }
                     }
@@ -521,7 +522,7 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
                 if draft_version.as_ref()!=Some(&item.updated_at){<section class="card draft-banner"><p>{"This draft was based on an older collection version. Review the fields against the current collection before saving."}</p><details><summary>{"Current collection fields"}</summary><pre>{serde_json::to_string_pretty(&item.blueprint).unwrap_or_default()}</pre></details><button class="secondary" onclick={use_latest_version}>{"Use latest collection version"}</button></section>}
                 if dirty {<p role="status" class="muted">{if draft_error.is_empty(){"Unsaved fields and settings · draft saved on this device"}else{"Unsaved fields and settings · draft storage unavailable"}}</p>}
                 if *tab=="trash" {<crate::history::HistoryPanel collection={item.clone()}/>}
-                if *tab=="data" {<crate::records::RecordsPanel key={item.id.clone()} collection={item.clone()} collections={(*collections).clone()}/>}
+                if *tab=="data" {<crate::records::RecordsPanel key={item.id.clone()} collection={item.clone()} collections={(**collections).clone()}/>}
                 if *tab=="fields" {<fieldset class="draft-fields" disabled={*busy||pending.is_some()}>
                     <div class="section-heading"><div><h2>{"Shape your collection"}</h2><p class="muted">{"Choose the fields each record contains. Calculated fields update automatically."}</p></div><button disabled={*busy} onclick={on_save.clone()}>{if *busy{"Saving…"}else{"Save fields"}}</button></div>
                     <section class="card"><h2>{"Record titles"}</h2><p class="muted">{"Choose the field shown in record links and reference pickers. API field names stay unchanged."}</p><label>{"Title field"}<select aria-label="Title field" onchange={Callback::from({let title_field=title_field.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();title_field.set(select.value());}})}><option value="" selected={title_field.is_empty()}>{"Automatic · first text field"}</option>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date|FieldType::Calculated)).map(|f|html!{<option value={f.name.clone()} selected={*title_field==f.name}>{f.display_label().to_string()}</option>})}</select></label></section><BlueprintEditor collection_id={item.id.clone()} records={(*documents).clone()} fields={(*fields).clone()} collections={(*collections).clone()} current={item.name.clone()} saved_fields={item.blueprint.fields.iter().map(|f|f.name.clone()).collect::<Vec<_>>()} saved_options={item.blueprint.fields.iter().filter_map(|f|Some((f.name.clone(),f.options.clone()?))).collect::<std::collections::BTreeMap<_,_>>()} on_renamed={Callback::from({let title_field=title_field.clone();move |(old,new):(String,String)|{if *title_field==old{title_field.set(new);}}})} on_removed={Callback::from({let confirmed=confirmed_removals.clone();move |name:String|{let mut next=(*confirmed).clone();next.push(name);confirmed.set(next);}})} on_change={Callback::from({let fields=fields.clone();move |next|fields.set(next)})} collapsed={(*collapsed).clone()} on_collapse={Callback::from({let collapsed=collapsed.clone();move |next|collapsed.set(Some(next))})}/>
@@ -540,9 +541,9 @@ pub fn collection_page(props: &CollectionPageProps) -> Html {
 #[derive(Properties, PartialEq)]
 struct BlueprintEditorProps {
     collection_id: String,
-    records: Vec<DocumentView>,
+    records: Shared<Vec<DocumentView>>,
     fields: Vec<FieldDef>,
-    collections: Vec<CollectionView>,
+    collections: Shared<Vec<CollectionView>>,
     current: String,
     /// Field names in the saved collection.
     saved_fields: Vec<String>,
@@ -556,6 +557,33 @@ struct BlueprintEditorProps {
     /// Collapsed rows by `collapse_key`, once any row was toggled.
     collapsed: Option<BTreeSet<String>>,
     on_collapse: Callback<BTreeSet<String>>,
+}
+
+/// What field rows read when an event fires: the editor's state as of its
+/// last render. Rows hold it by reference and it always compares equal, so
+/// editing one field re-renders that row only, not every row of the list.
+struct RowsState {
+    fields: Shared<Vec<FieldDef>>,
+    collapsed: BTreeSet<String>,
+    on_change: Callback<Vec<FieldDef>>,
+    on_removed: Callback<String>,
+    on_renamed: Callback<(String, String)>,
+    on_collapse: Callback<BTreeSet<String>>,
+}
+
+#[derive(Clone)]
+struct RowsHandle(std::rc::Rc<std::cell::RefCell<RowsState>>);
+impl PartialEq for RowsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl RowsHandle {
+    /// The current fields, to change and send to `on_change`.
+    fn fields(&self) -> (Vec<FieldDef>, Callback<Vec<FieldDef>>) {
+        let state = self.0.borrow();
+        ((*state.fields).clone(), state.on_change.clone())
+    }
 }
 
 #[function_component(BlueprintEditor)]
@@ -619,6 +647,18 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
             })
         })
     };
+    let shared_fields = Shared::new(props.fields.clone());
+    let state = || RowsState {
+        fields: shared_fields.clone(),
+        collapsed: collapsed_keys.clone(),
+        on_change: props.on_change.clone(),
+        on_removed: props.on_removed.clone(),
+        on_renamed: props.on_renamed.clone(),
+        on_collapse: props.on_collapse.clone(),
+    };
+    let rows = use_mut_ref(state);
+    *rows.borrow_mut() = state();
+    let rows = RowsHandle(rows);
     let all_open = keys.iter().all(|k| !collapsed_keys.contains(k));
     let all_closed = keys.iter().all(|k| collapsed_keys.contains(k));
     html! {
@@ -642,36 +682,26 @@ fn blueprint_editor(props: &BlueprintEditorProps) -> Html {
                     .and_then(|name| props.saved_options.get(name))
                     .cloned()
                     .unwrap_or_default();
-                let key = keys[index].clone();
-                let open = !collapsed_keys.contains(&key);
-                let on_toggle = {
-                    let on_collapse = props.on_collapse.clone();
-                    let keys = collapsed_keys.clone();
-                    Callback::from(move |_| {
-                        let mut next = keys.clone();
-                        if !next.remove(&key) {
-                            next.insert(key.clone());
-                        }
-                        on_collapse.emit(next);
-                    })
-                };
+                let row_key = keys[index].clone();
+                let open = !collapsed_keys.contains(&row_key);
+                // Only an open calculated field shows the other fields.
+                let siblings = (open && field.kind == FieldType::Calculated)
+                    .then(|| shared_fields.clone());
                 html! {
                     <FieldRow
                         {open}
-                        {on_toggle}
+                        {row_key}
                         key={index}
                         records={props.records.clone()}
                         index={index}
                         field={field.clone()}
-                        total={props.fields.len()}
+                        last={index + 1 == props.fields.len()}
                         collections={props.collections.clone()}
                         current={props.current.clone()}
-                        fields={props.fields.clone()}
+                        {siblings}
                         {origin}
                         {saved_options}
-                        on_removed={props.on_removed.clone()}
-                        on_renamed={props.on_renamed.clone()}
-                        on_change={props.on_change.clone()}
+                        rows={rows.clone()}
                     />
                 }
             }) }
@@ -823,34 +853,34 @@ fn carry_collapsed(
 
 #[derive(Properties, PartialEq)]
 struct FieldRowProps {
-    records: Vec<DocumentView>,
+    records: Shared<Vec<DocumentView>>,
     index: usize,
-    total: usize,
+    /// Whether this is the last row.
+    last: bool,
     field: FieldDef,
-    collections: Vec<CollectionView>,
+    collections: Shared<Vec<CollectionView>>,
     current: String,
-    fields: Vec<FieldDef>,
+    /// All fields, for a row that shows them (see `BlueprintEditor`).
+    siblings: Option<Shared<Vec<FieldDef>>>,
     /// The saved field this row edits, under its saved name, if any.
     origin: Option<String>,
     /// The saved field's allowed values.
     saved_options: Vec<String>,
-    on_removed: Callback<String>,
-    on_renamed: Callback<(String, String)>,
-    on_change: Callback<Vec<FieldDef>>,
     /// Whether the field's settings are shown, or only its summary.
     open: bool,
-    on_toggle: Callback<()>,
+    /// The row's `collapse_key`.
+    row_key: String,
+    rows: RowsHandle,
 }
 
 #[function_component(FieldRow)]
 fn field_row(props: &FieldRowProps) -> Html {
     let confirm = use_confirm();
     let patch = {
-        let fields = props.fields.clone();
+        let rows = props.rows.clone();
         let index = props.index;
-        let on_change = props.on_change.clone();
         Callback::from(move |next: FieldDef| {
-            let mut fields = fields.clone();
+            let (mut fields, on_change) = rows.fields();
             if index < fields.len() {
                 fields[index] = next;
                 on_change.emit(fields);
@@ -858,11 +888,10 @@ fn field_row(props: &FieldRowProps) -> Html {
         })
     };
     let move_by = {
-        let fields = props.fields.clone();
+        let rows = props.rows.clone();
         let index = props.index;
-        let on_change = props.on_change.clone();
         Callback::from(move |delta: isize| {
-            let mut fields = fields.clone();
+            let (mut fields, on_change) = rows.fields();
             let target = index as isize + delta;
             if target >= 0 && (target as usize) < fields.len() {
                 fields.swap(index, target as usize);
@@ -870,25 +899,38 @@ fn field_row(props: &FieldRowProps) -> Html {
             }
         })
     };
+    let on_toggle = {
+        let rows = props.rows.clone();
+        let key = props.row_key.clone();
+        Callback::from(move |_: MouseEvent| {
+            let (mut next, on_collapse) = {
+                let state = rows.0.borrow();
+                (state.collapsed.clone(), state.on_collapse.clone())
+            };
+            if !next.remove(&key) {
+                next.insert(key.clone());
+            }
+            on_collapse.emit(next);
+        })
+    };
     let remove = {
-        let fields = props.fields.clone();
+        let rows = props.rows.clone();
         let index = props.index;
-        let on_change = props.on_change.clone();
-        let on_removed = props.on_removed.clone();
+        let records = props.records.clone();
         // Calculated fields store nothing, so only stored saved fields ask.
         let saved = props
             .origin
             .clone()
             .filter(|_| props.field.kind != FieldType::Calculated);
         let label = props.field.display_label().to_string();
-        let has_values = saved.as_ref().is_some_and(|origin| {
-            props
-                .records
-                .iter()
-                .any(|r| r.body.get(origin).is_some_and(|v| !v.is_null()))
-        });
         Callback::from(move |_| {
-            let mut fields = fields.clone();
+            let (mut fields, on_change) = rows.fields();
+            let on_removed = rows.0.borrow().on_removed.clone();
+            let has_values = saved.as_ref().is_some_and(|origin| {
+                records
+                    .iter()
+                    .any(|r| r.body.get(origin).is_some_and(|v| !v.is_null()))
+            });
             if index >= fields.len() {
                 return;
             }
@@ -925,12 +967,12 @@ fn field_row(props: &FieldRowProps) -> Html {
     // keystroke, so intermediate names never capture other fields' references.
     let focused_name = use_mut_ref(|| None::<String>);
     let commit_name = {
-        let fields = props.fields.clone();
+        let rows = props.rows.clone();
         let index = props.index;
-        let on_change = props.on_change.clone();
-        let on_renamed = props.on_renamed.clone();
         let focused = focused_name.clone();
         Callback::from(move |_: Event| {
+            let (fields, on_change) = rows.fields();
+            let on_renamed = rows.0.borrow().on_renamed.clone();
             let Some(old) = focused.borrow_mut().take() else {
                 return;
             };
@@ -972,7 +1014,7 @@ fn field_row(props: &FieldRowProps) -> Html {
     };
     let summary = html! {
         <div class="field-summary">
-            <button type="button" class="field-toggle" aria-expanded={props.open.to_string()} onclick={props.on_toggle.reform(|_| ())}>
+            <button type="button" class="field-toggle" aria-expanded={props.open.to_string()} onclick={on_toggle}>
                 <span class="field-chevron" aria-hidden="true">{"▸"}</span>
                 <strong>{title.to_string()}</strong>
                 if !field.display_label().eq_ignore_ascii_case(&field.name) && !field.name.is_empty() {
@@ -987,7 +1029,7 @@ fn field_row(props: &FieldRowProps) -> Html {
                     let move_by = move_by.clone();
                     move |_| move_by.emit(-1)
                 })}>{"Up"}</button>
-                <button class="secondary" type="button" aria-label={format!("Move {title} down")} disabled={props.index + 1 == props.total} onclick={Callback::from({
+                <button class="secondary" type="button" aria-label={format!("Move {title} down")} disabled={props.last} onclick={Callback::from({
                     let move_by = move_by.clone();
                     move |_| move_by.emit(1)
                 })}>{"Down"}</button>
@@ -1126,7 +1168,7 @@ fn field_row(props: &FieldRowProps) -> Html {
                 {number_format_editor(&field, &patch)}
             }
             if field.kind == FieldType::Calculated {
-                <FormulaEditor records={props.records.clone()} field={field.clone()} fields={props.fields.clone()} collections={props.collections.clone()} current={props.current.clone()} on_change={patch.clone()}/>
+                <FormulaEditor records={(*props.records).clone()} field={field.clone()} fields={props.siblings.as_ref().map(|f| (**f).clone()).unwrap_or_default()} collections={(*props.collections).clone()} current={props.current.clone()} on_change={patch.clone()}/>
             }
         </div>
     }
@@ -1238,7 +1280,7 @@ struct OptionsEditorProps {
     field: FieldDef,
     /// The saved field's allowed values.
     saved: Vec<String>,
-    records: Vec<DocumentView>,
+    records: Shared<Vec<DocumentView>>,
     origin: Option<String>,
     on_change: Callback<FieldDef>,
 }
@@ -1355,7 +1397,7 @@ fn options_editor(props: &OptionsEditorProps) -> Html {
             }
             // Start from saved options or the values loaded records already hold.
             let mut values: Vec<String> = saved.clone();
-            for record in &records {
+            for record in records.iter() {
                 if let Some(value) = origin
                     .as_ref()
                     .and_then(|name| record.body.get(name))

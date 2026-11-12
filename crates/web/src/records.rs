@@ -24,6 +24,8 @@ pub struct RecordsProps {
     pub collection: CollectionView,
     pub collections: Vec<CollectionView>,
 }
+const FREEZE_KEY: &str = "vulse:records:freeze";
+
 #[function_component(RecordsPanel)]
 pub fn records_panel(props: &RecordsProps) -> Html {
     let confirm = crate::confirm::use_confirm();
@@ -54,6 +56,22 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         items.iter().cloned().map(Shared::new).collect::<Vec<_>>()
     });
     let selected = use_state(String::new);
+    // Keeps the Record column in view while the table scrolls sideways.
+    // Remembered on this device.
+    let frozen = use_state(|| {
+        crate::drafts::read::<bool>(FREEZE_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    });
+    let toggle_frozen = Callback::from({
+        let frozen = frozen.clone();
+        move |_: MouseEvent| {
+            let next = !*frozen;
+            let _ = crate::drafts::write(FREEZE_KEY, &next);
+            frozen.set(next);
+        }
+    });
     let view_name = use_state(String::new);
     let loading = use_state(|| true);
     let error = use_state(String::new);
@@ -115,7 +133,11 @@ pub fn records_panel(props: &RecordsProps) -> Html {
     });
     {
         let picked = picked.clone();
-        use_effect_with((*query).clone(), move |_| picked.set(vec![]));
+        use_effect_with((*query).clone(), move |_| {
+            if !picked.is_empty() {
+                picked.set(vec![]);
+            }
+        });
     }
     let on_saved = Callback::from({
         let refresh = refresh.clone();
@@ -265,6 +287,9 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         let shown = shown.clone();
         let picked = picked.clone();
         let loud = use_mut_ref(|| false);
+        // The search and filters last loaded: typing in them waits for a
+        // pause, while paging, sorting and reloads load at once.
+        let typed = use_mut_ref(|| None::<(String, Vec<RecordFilter>)>);
         use_effect_with(
             (props.collection.clone(), (*query).clone(), *reload),
             move |(collection, query, _)| {
@@ -278,10 +303,13 @@ pub fn records_panel(props: &RecordsProps) -> Html {
                 let id = collection.id.clone();
                 let query = query.clone();
                 let picked = picked.clone();
-                let timer = gloo_timers::callback::Timeout::new(200, move || {
-                    if !quiet {
-                        loading.set(true);
-                    }
+                let text = (query.search.clone(), query.filters.clone());
+                let typing = typed
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|previous| *previous != text);
+                *typed.borrow_mut() = Some(text);
+                let timer = gloo_timers::callback::Timeout::new(if typing { 200 } else { 0 }, move || {
                     wasm_bindgen_futures::spawn_local(async move {
                         let result = api::query_records(&id, &query).await;
                         if *epoch.borrow() != current {
@@ -613,9 +641,11 @@ pub fn records_panel(props: &RecordsProps) -> Html {
         if !picked.is_empty(){<div class="bulk-toolbar"><button type="button" class="secondary" disabled={*working||columns.is_empty()} onclick={Callback::from({let export=run_export.clone();move |_|export.emit(true)})}>{"Export selected"}</button><strong>{format!("{} selected",picked.len())}</strong><button type="button" class="secondary" disabled={*working||bulk_field.is_empty()} onclick={Callback::from({let open=bulk_open.clone();move |_|open.set(!*open)})}>{"Bulk edit"}</button><button type="button" class="secondary" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("duplicate".into())})}>{"Duplicate selected"}</button><button type="button" class="danger" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("delete".into())})}>{"Delete selected"}</button><button type="button" class="text-button" onclick={Callback::from({let picked=picked.clone();move |_|picked.set(vec![])})}>{"Clear selection"}</button></div>}
         if *bulk_open&&!picked.is_empty(){<div class="bulk-editor"><label>{"Field to update"}<select aria-label="Bulk field" onchange={Callback::from({let field=bulk_field.clone();let value=bulk_value.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();field.set(input.value());value.set(String::new());}})}>{for fields.iter().filter(|f|matches!(f.kind,FieldType::String|FieldType::Number|FieldType::Boolean|FieldType::Date)).map(|f|html!{<option value={f.name.clone()} selected={*bulk_field==f.name}>{f.display_label().to_string()}</option>})}</select></label><label>{"New value"}{if fields.iter().find(|f|f.name==*bulk_field).is_some_and(|f|f.kind==FieldType::Date){html!{<input aria-label="Bulk value" type="date" value={(*bulk_value).clone()} oninput={Callback::from({let value=bulk_value.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();value.set(input.value());}})}/>}}else if let Some(options)=fields.iter().find(|f|f.name==*bulk_field).and_then(|f|f.options.clone()){html!{<crate::form::OptionSelect label="Bulk value" {options} value={(*bulk_value).clone()} on_change={Callback::from({let value=bulk_value.clone();move |next:String|value.set(next)})}/>}}else if fields.iter().find(|f|f.name==*bulk_field).is_some_and(|f|f.kind==FieldType::Boolean){html!{<select aria-label="Bulk value" onchange={Callback::from({let value=bulk_value.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();value.set(input.value());}})}><option value="false" selected={!bulk_value.eq_ignore_ascii_case("true")}>{"False"}</option><option value="true" selected={bulk_value.eq_ignore_ascii_case("true")}>{"True"}</option></select>}}else{html!{<input aria-label="Bulk value" value={(*bulk_value).clone()} oninput={Callback::from({let value=bulk_value.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();value.set(input.value());}})}/>}}}</label><button type="button" disabled={*working} onclick={Callback::from({let run=run_bulk.clone();move |_|run.emit("update".into())})}>{"Apply to selected"}</button><p class="muted">{"Only this field changes. Calculated fields stay read-only. The whole batch must pass validation."}</p></div>}
         if page.items.is_empty() && !*loading{<div class="empty-state"><h2>{if page.total==0&&query.filters.is_empty()&&query.search.is_empty(){"No records yet"}else{"No matching records"}}</h2><p>{"Add a record, import data, or adjust your view."}</p></div>}
-        else{<div class="table-scroll records-scroll"><table class="records-table"><thead><tr><th><input type="checkbox" aria-label="Select visible records" disabled={*loading||*working} checked={!page.items.is_empty()&&page.items.iter().all(|d|picked.iter().any(|p|p.id==d.id))} onchange={Callback::from({let picked=picked.clone();let items=page.items.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();picked.set(if input.checked(){items.clone()}else{vec![]});}})}/></th><th>{"Record"}</th>{for visible.iter().map(|f|html!{<ColumnHeader key={f.name.clone()} field={(*f).clone()}/>})}<th>{"Updated"}</th></tr></thead><tbody>{for page.items.iter().zip(shared_items.iter()).enumerate().map(|(index,(document,shared))|{
+        else{<div class="table-scroll records-scroll"><table class={if *frozen{"records-table frozen"}else{"records-table"}}><thead><tr><th><input type="checkbox" aria-label="Select visible records" disabled={*loading||*working} checked={!page.items.is_empty()&&page.items.iter().all(|d|picked.iter().any(|p|p.id==d.id))} onchange={Callback::from({let picked=picked.clone();let items=page.items.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();picked.set(if input.checked(){items.clone()}else{vec![]});}})}/></th><th>{"Record"}<button type="button" class="freeze-toggle" aria-pressed={frozen.to_string()} title="Keep the Record column in view while scrolling sideways" onclick={toggle_frozen}>{if *frozen{"Unfreeze"}else{"Freeze"}}</button></th>{for visible.iter().map(|f|html!{<ColumnHeader key={f.name.clone()} field={(*f).clone()}/>})}<th>{"Updated"}</th></tr></thead><tbody>{for page.items.iter().zip(shared_items.iter()).enumerate().map(|(index,(document,shared))|{
+            // Rows are not keyed by record: paging then updates the cells in place,
+            // far cheaper in a wide table than building every cell again.
             let group=if query.group_field.is_empty(){None}else{let value=display_value(&document.body[&query.group_field]);if index==0||display_value(&page.items[index-1].body[&query.group_field])!=value{Some(if value.is_empty(){"Empty".into()}else{value})}else{None}};
-            html!{<>{if let Some(group)=group{html!{<tr class="group-row"><th colspan={(visible.len()+3).to_string()}>{group}</th></tr>}}else{html!{}}}<tr key={document.id.clone()}><td><input type="checkbox" aria-label={format!("Select record {}",document.id)} disabled={*loading||*working} checked={picked.iter().any(|p|p.id==document.id)} onchange={Callback::from({let picked=picked.clone();let document=document.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=(*picked).clone();next.retain(|d|d.id!=document.id);if input.checked(){next.push(document.clone());}picked.set(next);}})}/></td><td><Link<Route> to={Route::Document{id:props.collection.id.clone(),doc_id:document.id.clone()}}>{format!("{} →",record_title(&props.collection.blueprint,&document.body,&document.id))}</Link<Route>></td>{for visible.iter().map(|field|html!{<crate::record_cell::RecordCell key={field.name.clone()} collections={shared_collections.clone()} collection_id={props.collection.id.clone()} document={shared.clone()} field={(*field).clone()} on_saved={on_saved.clone()}/>})}<td class="muted">{document.updated_at.chars().take(10).collect::<String>()}</td></tr></>}
+            html!{<>{if let Some(group)=group{html!{<tr class="group-row"><th colspan={(visible.len()+3).to_string()}>{group}</th></tr>}}else{html!{}}}<tr><td><input type="checkbox" aria-label={format!("Select record {}",document.id)} disabled={*loading||*working} checked={picked.iter().any(|p|p.id==document.id)} onchange={Callback::from({let picked=picked.clone();let document=document.clone();move |e:Event|{let input:HtmlInputElement=e.target_unchecked_into();let mut next=(*picked).clone();next.retain(|d|d.id!=document.id);if input.checked(){next.push(document.clone());}picked.set(next);}})}/></td><td><Link<Route> to={Route::Document{id:props.collection.id.clone(),doc_id:document.id.clone()}}>{format!("{} →",record_title(&props.collection.blueprint,&document.body,&document.id))}</Link<Route>></td>{for visible.iter().map(|field|html!{<crate::record_cell::RecordCell key={field.name.clone()} collections={shared_collections.clone()} collection_id={props.collection.id.clone()} document={shared.clone()} field={(*field).clone()} on_saved={on_saved.clone()}/>})}<td class="muted">{document.updated_at.chars().take(10).collect::<String>()}</td></tr></>}
         })}</tbody></table></div>}
         <div class="table-footer"><span class="muted">{format!("{} records · Page {} of {}",page.total,current+1,pages)}</span><div class="row"><label class="page-size">{"Rows"}<select aria-label="Rows per page" onchange={Callback::from({let query=(*query).clone();let change=change.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();let mut next=query.clone();next.limit=input.value().parse().unwrap_or(25);change.emit(next);}})}>{for [25,50,100].into_iter().map(|size|html!{<option value={size.to_string()} selected={query.limit==size}>{size}</option>})}</select></label><button type="button" class="secondary" disabled={query.offset==0||*loading} onclick={Callback::from({let query=query.clone();move |_|{let mut next=(*query).clone();next.offset=next.offset.saturating_sub(next.limit);query.set(next);}})}>{"Previous"}</button><button type="button" class="secondary" disabled={current+1>=pages||*loading} onclick={Callback::from({let query=query.clone();move |_|{let mut next=(*query).clone();next.offset+=next.limit;query.set(next);}})}>{"Next"}</button></div></div>
         </>}

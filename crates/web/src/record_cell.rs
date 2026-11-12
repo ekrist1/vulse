@@ -46,7 +46,10 @@ pub struct CellProps {
 }
 #[function_component(RecordCell)]
 pub fn record_cell(props: &CellProps) -> Html {
-    let editing = use_state(|| false);
+    // The record being edited here. Paging shows another record in the same
+    // cell, which must not inherit an edit in progress.
+    let editing = use_state(|| None::<String>);
+    let is_editing = editing.as_deref() == Some(props.document.id.as_str());
     let draft = use_state(String::new);
     let base = use_state(String::new);
     let error = use_state(String::new);
@@ -63,11 +66,12 @@ pub fn record_cell(props: &CellProps) -> Html {
         let error = error.clone();
         let version = props.document.updated_at.clone();
         let value = value.clone();
+        let id = props.document.id.clone();
         move |_| {
             draft.set(value.clone());
             base.set(version.clone());
             error.set(String::new());
-            editing.set(true);
+            editing.set(Some(id.clone()));
         }
     });
     let save = Callback::from({
@@ -120,7 +124,7 @@ pub fn record_cell(props: &CellProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 match api::patch_record(&collection, &id, &body).await {
                     Ok(result) => {
-                        editing.set(false);
+                        editing.set(None);
                         saved.emit(result);
                     }
                     Err(message) => error.set(message),
@@ -133,7 +137,7 @@ pub fn record_cell(props: &CellProps) -> Html {
         let editing = editing.clone();
         let error = error.clone();
         move |()| {
-            editing.set(false);
+            editing.set(None);
             error.set(String::new());
         }
     });
@@ -142,7 +146,7 @@ pub fn record_cell(props: &CellProps) -> Html {
         FieldType::String | FieldType::Number | FieldType::Boolean | FieldType::Date
     );
     html! {<td class={if calculated_error.is_some(){"cell-error"}else if props.field.kind==FieldType::Calculated{"cell-calculated"}else{""}} title={calculated_error.cloned().unwrap_or_else(||value.clone())}>
-        if *editing {<div class="inline-cell">
+        if is_editing {<div class="inline-cell">
             if props.field.kind==FieldType::Boolean {<select aria-label={format!("Edit {}",props.field.display_label())} disabled={*busy} onchange={Callback::from({let draft=draft.clone();move |e:Event|{let input:HtmlSelectElement=e.target_unchecked_into();draft.set(input.value());}})}><option value="true" selected={draft.eq_ignore_ascii_case("true")}>{"True"}</option><option value="false" selected={!draft.eq_ignore_ascii_case("true")}>{"False"}</option></select>}
             else if let Some(options)=props.field.options.clone() {<crate::form::OptionSelect label={format!("Edit {}",props.field.display_label())} {options} value={(*draft).clone()} disabled={*busy} on_change={Callback::from({let draft=draft.clone();move |value:String|draft.set(value)})}/>}
             else {<input aria-label={format!("Edit {}",props.field.display_label())} type={match props.field.kind{FieldType::Number=>"number",FieldType::Date=>"date",_=>"text"}} step="any" disabled={*busy} value={(*draft).clone()} oninput={Callback::from({let draft=draft.clone();move |e:InputEvent|{let input:HtmlInputElement=e.target_unchecked_into();draft.set(input.value());}})} onkeydown={Callback::from({let save=save.clone();let cancel=cancel.clone();move |e:KeyboardEvent|{if e.key()=="Enter"{e.prevent_default();save.emit(());}else if e.key()=="Escape"{e.prevent_default();cancel.emit(());}}})}/>}

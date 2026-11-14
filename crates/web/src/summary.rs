@@ -616,7 +616,7 @@ fn summary_builder(props: &SummaryBuilderProps) -> Html {
                 </select>
             </label>
             if measure.op == SummaryOp::Formula {
-                <FormulaEditor summary={true} formula_label={format!("Value {} formula", index + 1)} field={formula_field} fields={formula_fields} on_change={Callback::from(move |field:FieldDef|on_formula.emit(field.formula.unwrap_or_default()))}/>
+                <FormulaEditor collection_fields={props.fields.clone()} summary={true} formula_label={format!("Value {} formula", index + 1)} field={formula_field} fields={formula_fields} on_change={Callback::from(move |field:FieldDef|on_formula.emit(field.formula.unwrap_or_default()))}/>
             } else {
                 <label>{"Of field"}
                     <select aria-label={format!("Value {} field", index + 1)} onchange={on_field}>

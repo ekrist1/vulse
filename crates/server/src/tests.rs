@@ -4362,6 +4362,34 @@ async fn summaries_group_aggregate_calculate_and_save_with_views() {
     assert_eq!(result["group_count"], 4);
     assert_eq!(result["truncated"], false);
 
+    let (status, direct) = summarize(json!({"summary":{
+        "group_by":[{"field":"name"}],
+        "measures":[
+            {"name":"double","op":"formula","formula":"=SUM([revenue])*2"},
+            {"name":"ratio","op":"formula","formula":"=SUM([revenue])/AVERAGE([employees])"},
+            {"name":"first","op":"formula","formula":"=MIN([opened])"},
+            {"name":"last","op":"formula","formula":"=MAX([opened])"},
+            {"name":"n","op":"formula","formula":"=COUNT([opened])"},
+            {"name":"dependent","op":"formula","formula":"=[double]+SUM([revenue])"}
+        ]
+    }})).await;
+    assert_eq!(status, StatusCode::OK, "{direct}");
+    let values = &direct["rows"][0]["values"];
+    assert_eq!(values["double"], 6000.0);
+    assert_eq!(values["dependent"], 9000.0);
+    assert_eq!(values["first"], "2026-01-15");
+    assert_eq!(values["last"], "2026-01-20");
+    assert_eq!(values["n"], 2);
+    assert_eq!(values.as_object().unwrap().len(), 6);
+    assert_eq!(direct["totals"]["values"]["double"], 14015.0);
+    assert_eq!(direct["totals"]["values"]["n"], 3);
+    let (status, empty) = summarize(json!({
+        "query":{"filters":[{"field":"revenue","op":"gt","value":99999}]},
+        "summary":{"measures":[{"name":"n","op":"formula","formula":"=COUNT([revenue])"}]}
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(empty["totals"]["values"]["n"], 0);
+
     // Filters apply first; sorting by a value; date buckets; reference titles;
     // calculated fields can be aggregated; dates have min and max.
     let (status, result) = summarize(json!({
@@ -4411,7 +4439,8 @@ async fn summaries_group_aggregate_calculate_and_save_with_views() {
             Some(
                 json!({"name":"Per kindergarten","query":{},"columns":["name"],"summary":{
                     "group_by":[{"field":"name"}],
-                    "measures":[{"name":"total_revenue","op":"sum","field":"revenue"}],
+                    "measures":[{"name":"total_revenue","op":"formula","formula":"=SUM([revenue])"},
+                                {"name":"named","op":"formula","formula":"=COUNT([name])"}],
                     "chart":{"kind":"bar","measures":["total_revenue"]}
                 }}),
             ),
@@ -4476,6 +4505,8 @@ async fn summaries_group_aggregate_calculate_and_save_with_views() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(renamed.rows[0].group[0], "Barnehage1");
+    assert_eq!(renamed.rows[0].values["named"], 2);
+    assert_eq!(renamed.rows[0].values["total_revenue"], 3000);
 
     // Public collections can be summarized without credentials, even cross-site.
     let public_spec = json!({"summary":{"measures":[{"name":"n","op":"count"}]}});
@@ -6134,4 +6165,38 @@ async fn cleanup_deletes_expired_undo_snapshots() {
             .status(),
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn summary_direct_aggregates_over_50001_rows() {
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "summary-scale@example.com", "summaryscale").await;
+    let collection = create_collection(&app, &cookie, "summary-scale", "private",
+        json!({"fields":[{"name":"amount","type":"number"},{"name":"bucket","type":"number"}]})).await;
+    let conn = app.db.connect().await.unwrap();
+    // Populate the same typed table used by normal record writes. This isolates
+    // summary query scale from import/history overhead and avoids 50k HTTP calls.
+    let table = crate::rows::table(&collection.id);
+    conn.execute(&format!(r#"WITH RECURSIVE seq(n) AS (
+        SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<50001
+    ) INSERT INTO {table} (id,created_at,updated_at,search,
+        f_amount_n,f_amount_t,f_amount_r,f_bucket_n,f_bucket_t,f_bucket_r)
+      SELECT CAST(n AS TEXT),'2026-01-01','2026-01-01','',
+        n,CAST(n AS TEXT),CAST(n AS TEXT),n%10,CAST(n%10 AS TEXT),CAST(n%10 AS TEXT) FROM seq"#), &[]).await.unwrap();
+    let started = std::time::Instant::now();
+    let (status, result) = json_of::<vulse_model::SummaryResult>(app.call("POST",
+        &format!("/api/v1/collections/{}/summary", collection.id), Some(&cookie), None,
+        Some(json!({"query":{"filters":[{"field":"amount","op":"gt","value":1}]},"summary":{
+            "group_by":[{"field":"bucket"}], "sort":"doubled", "descending":true,
+            "measures":[{"name":"doubled","op":"formula","formula":"=SUM([amount])*2"},
+                        {"name":"average","op":"formula","formula":"=AVERAGE([amount])"}]
+        }}))).await).await;
+    eprintln!("50,001-row direct aggregate summary: {:?}", started.elapsed());
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result.totals.count, 50000);
+    assert_eq!(result.totals.values["doubled"], 2500150000.0);
+    assert_eq!(result.totals.values["average"], 25001.5);
+    assert_eq!(result.rows.len(), 10);
+    assert!(result.rows.iter().all(|r| r.count == 5000 && r.values.len() == 2 && r.errors.is_empty()));
+    assert!(result.rows.windows(2).all(|w| w[0].values["doubled"].as_f64() >= w[1].values["doubled"].as_f64()));
 }

@@ -23,7 +23,7 @@ pub use vsql::{
 pub use summary::{
     ChartKind, DateBucket, MAX_CHART_SERIES, MAX_GROUP_FIELDS, MAX_MEASURES, MAX_SUMMARY_GROUPS,
     SummaryChart, SummaryGroup, SummaryMeasure, SummaryOp, SummaryRequest, SummaryResult,
-    SummaryRow, SummarySpec, apply_summary_formulas, lookup_message, rename_summary_fields, validate_summary,
+    SummaryRow, SummarySpec, summary_formulas, compile_summary, apply_summary_formulas, lookup_message, rename_summary_fields, validate_summary,
 };
 
 pub use blueprint::{

@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use serde_json::{Map, Value};
 use vulse_model::{
     CollectionView, FieldType, MAX_SUMMARY_GROUPS, SavedViewWrite, SummaryOp, SummaryRequest,
-    SummaryResult, SummaryRow, SummarySpec, apply_summary_formulas, validate_summary,
+    SummaryResult, SummaryRow, SummarySpec, validate_summary,
 };
 
 use crate::auth::{AuthUser, Principal, require_collection};
@@ -100,6 +100,9 @@ pub(crate) async fn run_summary(
     let spec = &request.summary;
     let blueprint = &collection.blueprint;
     validate_summary(blueprint, spec).map_err(AppError::bad)?;
+    let expanded = vulse_model::compile_summary(blueprint, spec).map_err(AppError::bad)?;
+    let spec = &expanded;
+    let formulas = vulse_model::summary_formulas(spec);
     // Only the search and filters matter; grouping replaces sorting and paging.
     let mut query = request.query.clone();
     query.sort_field = "created_at".into();
@@ -175,8 +178,9 @@ pub(crate) async fn run_summary(
 
     let totals_sql = format!("SELECT {}{from}", select(&[]));
     let totals = conn.query(&totals_sql, &params).await?;
-    let totals = decode_row(
+    let mut totals = decode_row(
         spec,
+        &formulas,
         &columns,
         &[],
         totals.first().ok_or(AppError::NotFound)?,
@@ -200,7 +204,14 @@ pub(crate) async fn run_summary(
             ));
         }
         for row in &found {
-            rows.push(decode_row(spec, &columns, &spec.group_by, row, keys.len())?);
+            rows.push(decode_row(
+                spec,
+                &formulas,
+                &columns,
+                &spec.group_by,
+                row,
+                keys.len(),
+            )?);
         }
     }
     label_groups(conn, collection, spec, &mut rows, &access).await?;
@@ -208,6 +219,11 @@ pub(crate) async fn run_summary(
     let group_count = rows.len() as u64;
     let truncated = rows.len() > MAX_SUMMARY_GROUPS;
     rows.truncate(MAX_SUMMARY_GROUPS);
+    // Private aggregates are implementation details, never result columns.
+    for row in rows.iter_mut().chain(std::iter::once(&mut totals)) {
+        row.values
+            .retain(|name, _| request.summary.measures.iter().any(|m| m.name == *name));
+    }
     Ok(SummaryResult {
         rows,
         totals,
@@ -218,6 +234,7 @@ pub(crate) async fn run_summary(
 
 fn decode_row(
     spec: &SummarySpec,
+    formulas: &vulse_model::CompiledFormulas,
     columns: &[(String, String)],
     groups: &[vulse_model::SummaryGroup],
     row: &SqlRow,
@@ -261,7 +278,12 @@ fn decode_row(
         values,
         errors: Default::default(),
     };
-    apply_summary_formulas(spec, &mut row);
+    let (body, errors) = formulas.calculate(&Value::Object(row.values), &Default::default());
+    row.values = match body {
+        Value::Object(values) => values,
+        _ => Map::new(),
+    };
+    row.errors = errors;
     Ok(row)
 }
 

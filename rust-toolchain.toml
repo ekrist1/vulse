@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned: turso_core 0.8.x fails to compile on Rust 1.100 (Vec::new_in now
+# shadows turso's TursoVecInExt::new_in). Remove once turso ships a fix.
+channel = "1.99"
+components = ["clippy", "rustfmt", "rust-src"]
+targets = ["wasm32-unknown-unknown"]

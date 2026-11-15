@@ -65,26 +65,17 @@ async fn columns(
     // may reuse or populate the cache shared with other requests.
     let in_tx = conn.in_transaction();
     let generation = GENERATION.load(Ordering::Acquire);
-    let cache = if in_tx {
-        &conn.lookup_cache
-    } else {
-        &CACHE
-    };
+    let cache = if in_tx { &conn.lookup_cache } else { &CACHE };
     let rows = conn
         .query(
-            "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM documents WHERE collection_id=?1",
+            "SELECT version FROM collection_versions WHERE collection_id=?1",
             &[SqlValue::Text(collection.id.clone())],
         )
         .await?;
     let row = rows
         .first()
-        .ok_or_else(|| anyhow::anyhow!("missing count"))?;
-    let fingerprint = format!(
-        "{}|{}|{}",
-        int_at(row, 0)?,
-        text_at(row, 1)?,
-        collection.updated_at
-    );
+        .ok_or_else(|| anyhow::anyhow!("missing collection revision"))?;
+    let fingerprint = format!("{}|{}", int_at(row, 0)?, collection.updated_at);
     let fields: Vec<&String> = fields
         .iter()
         .filter(|f| collection.blueprint.fields.iter().any(|d| d.name == **f))
@@ -122,10 +113,17 @@ async fn columns(
     let formulas = calculated.then(|| CompiledFormulas::new(&collection.blueprint));
     let mut values: Vec<Vec<serde_json::Value>> =
         vec![Vec::with_capacity(rows.len()); fields.len()];
+    let mut failures = vec![0usize; fields.len()];
     for row in &rows {
         let mut body: serde_json::Value = serde_json::from_str(&text_at(row, 0)?)?;
         if let Some(formulas) = &formulas {
-            body = formulas.calculate(&body, &Lookups::default()).0;
+            let (computed, errors) = formulas.calculate(&body, &Lookups::default());
+            for (index, field) in fields.iter().enumerate() {
+                if errors.contains_key(*field) || errors.contains_key("blueprint") {
+                    failures[index] += 1;
+                }
+            }
+            body = computed;
         }
         for (index, field) in fields.iter().enumerate() {
             values[index].push(body.get(*field).cloned().unwrap_or_default());
@@ -134,10 +132,16 @@ async fn columns(
     let found: Vec<(String, Arc<LookupColumn>)> = fields
         .iter()
         .zip(values)
-        .map(|(field, values)| {
+        .zip(failures)
+        .map(|((field, values), failures)| {
             (
                 (*field).clone(),
-                Arc::new(LookupColumn::new(&collection.name, values)),
+                Arc::new(
+                    LookupColumn::new(&collection.name, values).with_error(
+                        (failures > 0)
+                            .then(|| format!("{failures} source records have calculation errors")),
+                    ),
+                ),
             )
         })
         .collect();

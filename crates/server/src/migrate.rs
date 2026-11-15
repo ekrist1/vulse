@@ -20,6 +20,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         14,
         include_str!("../migrations/014_revision_blueprints.sql"),
     ),
+    (
+        15,
+        include_str!("../migrations/015_collection_versions.sql"),
+    ),
 ];
 
 pub async fn migrate(conn: &Conn) -> anyhow::Result<()> {

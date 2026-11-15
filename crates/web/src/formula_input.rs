@@ -234,7 +234,7 @@ fn problem(formula: &str, suggestions: &[Suggestion], lookups: bool) -> Option<S
     }
     let dependencies = vulse_model::formula_dependencies(formula).unwrap_or_default();
     if !lookups
-        && let Some((collection, field)) = dependencies.iter().find_map(|n| n.split_once('.'))
+        && let Some((collection, field)) = dependencies.iter().filter(|n| !n.starts_with("record.") && !n.starts_with("summary.")).find_map(|n| n.split_once('.'))
     {
         let message = vulse_model::lookup_message(collection, field);
         let mut chars = message.chars();
@@ -244,9 +244,12 @@ fn problem(formula: &str, suggestions: &[Suggestion], lookups: bool) -> Option<S
     }
     let unknown: Vec<&String> = dependencies
         .iter()
-        .filter(|name| !suggestions.iter().any(|s| s.name == **name))
+        .filter(|name| !suggestions.iter().any(|s| s.name == **name || (!lookups && s.name == format!("record.{name}"))))
         .collect();
     if let Some((collection, field)) = unknown.iter().find_map(|n| n.split_once('.')) {
+        if !lookups && matches!(collection, "record" | "summary") {
+            return Some(format!("Unknown {} [{collection}.{field}]", if collection == "record" { "collection field" } else { "summary value" }));
+        }
         return Some(
             if suggestions
                 .iter()
@@ -550,6 +553,16 @@ mod tests {
         );
         assert_eq!(call_at("=ROUND((1+2", 11), Some(("ROUND".into(), 0)));
         assert_eq!(call_at("=ROUND(1, 2) + ", 15), None);
+    }
+
+    #[test]
+    fn summary_namespaces_are_suggested_and_validated() {
+        let suggestions = vec![Suggestion {name:"record.amount".into(),label:"Amount".into(),detail:"Collection field".into()},
+            Suggestion {name:"summary.total".into(),label:"Total".into(),detail:"Summary value".into()}];
+        assert!(problem("=SUM([record.amount])+[summary.total]", &suggestions, false).is_none());
+        assert!(problem("=SUM([amount])", &suggestions, false).is_none());
+        assert_eq!(problem("=SUM([record.missing])", &suggestions, false).as_deref(), Some("Unknown collection field [record.missing]"));
+        assert!(problem("=SUM([other.amount])", &suggestions, false).is_some());
     }
 
     #[test]

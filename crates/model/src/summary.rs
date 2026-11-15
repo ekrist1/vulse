@@ -175,7 +175,7 @@ pub struct SummaryResult {
 
 /// Expand direct collection aggregates into private SQL measures. Repeated aggregates
 /// share a measure; the browser never needs the underlying records.
-/// Existing summary names take precedence, preserving scalar formula semantics.
+/// Explicit record/summary namespaces avoid rebinding a formula when values are added.
 pub fn compile_summary(blueprint: &Blueprint, spec: &SummarySpec) -> Result<SummarySpec, String> {
     use crate::FormulaExpression as E;
     fn rewrite(
@@ -193,15 +193,23 @@ pub fn compile_summary(blueprint: &Blueprint, spec: &SummarySpec) -> Result<Summ
                 "COUNT" => Some(SummaryOp::Count),
                 _ => None,
             };
-            if let (Some(op), [E::Field(field)]) = (op, args.as_slice()) {
-                if !original.measures.iter().any(|m| m.name == *field) {
-                    if !bp.fields.iter().any(|f| f.name == *field) {
+            if let (Some(op), [E::Field(reference)]) = (op, args.as_slice()) {
+                let field = reference.strip_prefix("record.").unwrap_or(reference);
+                let explicit_record = reference.starts_with("record.");
+                let summary = original.measures.iter().any(|m| m.name == field);
+                if !explicit_record && summary && bp.fields.iter().any(|f| f.name == field) {
+                    return Err(format!(
+                        "ambiguous [{field}]; use [record.{field}] for the collection field or [summary.{field}] for the summary value"
+                    ));
+                }
+                if !reference.starts_with("summary.") && (explicit_record || !summary) {
+                    if !bp.fields.iter().any(|f| f.name == field) {
                         return Err(format!("unknown collection field [{field}]"));
                     }
                     if let Some(existing) = out
                         .measures
                         .iter()
-                        .find(|m| m.op == op && m.field.as_ref() == Some(field))
+                        .find(|m| m.op == op && m.field.as_deref() == Some(field))
                     {
                         return Ok(E::Field(existing.name.clone()));
                     }
@@ -219,7 +227,7 @@ pub fn compile_summary(blueprint: &Blueprint, spec: &SummarySpec) -> Result<Summ
                     out.measures.push(SummaryMeasure {
                         name: name.clone(),
                         op,
-                        field: Some(field.clone()),
+                        field: Some(field.to_string()),
                         formula: None,
                     });
                     return Ok(E::Field(name));
@@ -227,6 +235,18 @@ pub fn compile_summary(blueprint: &Blueprint, spec: &SummarySpec) -> Result<Summ
             }
         }
         Ok(match e {
+            E::Field(ref name) if name.starts_with("summary.") => {
+                let field = &name[8..];
+                if !original.measures.iter().any(|m| m.name == field) {
+                    return Err(format!("unknown summary value [{name}]"));
+                }
+                E::Field(field.to_string())
+            }
+            E::Field(ref name) if name.starts_with("record.") => {
+                return Err(format!(
+                    "collection field [{name}] needs an aggregate, for example SUM([{name}])"
+                ));
+            }
             E::Field(ref name)
                 if !name.contains('.') && !original.measures.iter().any(|m| m.name == *name) =>
             {
@@ -473,8 +493,11 @@ pub fn apply_summary_formulas(spec: &SummarySpec, row: &mut SummaryRow) {
     if !spec.measures.iter().any(|m| m.op == SummaryOp::Formula) {
         return;
     }
-    let (body, errors) =
-        crate::calculate_document(&formula_blueprint(spec), &Value::Object(row.values.clone()));
+    let (body, errors) = summary_formulas(spec).calculate_with_errors(
+        &Value::Object(row.values.clone()),
+        &Default::default(),
+        &row.errors,
+    );
     if let Value::Object(values) = body {
         row.values = values;
     }
@@ -489,10 +512,15 @@ pub fn rename_summary_fields(spec: &mut SummarySpec, renames: &BTreeMap<String, 
         }
     }
     let summary_names: HashSet<_> = spec.measures.iter().map(|m| m.name.clone()).collect();
-    let collection_renames = renames
+    let collection_renames: BTreeMap<_, _> = renames
         .iter()
         .filter(|(name, _)| !summary_names.contains(*name))
         .map(|(a, b)| (a.clone(), b.clone()))
+        .chain(
+            renames
+                .iter()
+                .map(|(a, b)| (format!("record.{a}"), format!("record.{b}"))),
+        )
         .collect();
     for measure in &mut spec.measures {
         if let Some(formula) = &mut measure.formula {
@@ -517,7 +545,7 @@ pub fn rename_summary_fields(spec: &mut SummarySpec, renames: &BTreeMap<String, 
 /// Why a summary formula cannot use `[collection.field]`, and what to do.
 pub fn lookup_message(collection: &str, field: &str) -> String {
     format!(
-        "summary formulas can only use this summary's values, not [{collection}.{field}]. Add a calculated field that reads {collection} (for example with SUMIFS) to the records, then summarize that field."
+        "summary formulas can only use this collection's fields and summary values, not [{collection}.{field}]. Add a calculated field that reads {collection} (for example with SUMIFS) to the records, then summarize that field."
     )
 }
 
@@ -641,7 +669,30 @@ mod tests {
             {"name":"revenue","op":"count"},
             {"name":"result","op":"formula","formula":"=SUM([revenue])*2"}
         ]}));
-        assert_eq!(compile_summary(&blueprint(), &s).unwrap().measures.len(), 2);
+        assert!(
+            compile_summary(&blueprint(), &s)
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        let mut qualified = s.clone();
+        qualified.measures[1].formula =
+            Some("=SUM([record.revenue])+SUM([summary.revenue])".into());
+        validate_summary(&blueprint(), &qualified).unwrap();
+        assert_eq!(
+            compile_summary(&blueprint(), &qualified)
+                .unwrap()
+                .measures
+                .len(),
+            3
+        );
+        rename_summary_fields(
+            &mut qualified,
+            &BTreeMap::from([("revenue".into(), "income".into())]),
+        );
+        assert_eq!(
+            qualified.measures[1].formula.as_deref(),
+            Some("=SUM([record.income])+SUM([summary.revenue])")
+        );
     }
 
     #[test]

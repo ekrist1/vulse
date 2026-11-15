@@ -44,16 +44,19 @@ pub async fn summarize(
     Json(request): Json<SummaryRequest>,
 ) -> Result<Json<SummaryResult>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = workspace_collection(&conn, &principal, &id).await?;
-    Ok(Json(
-        run_summary(
-            &conn,
-            &collection,
-            &request,
-            SummaryAccess::Authenticated(&principal),
-        )
-        .await?,
-    ))
+    conn.with_app_read_tx(async |conn| {
+        let collection = workspace_collection(conn, &principal, &id).await?;
+        Ok(Json(
+            run_summary(
+                conn,
+                &collection,
+                &request,
+                SummaryAccess::Authenticated(&principal),
+            )
+            .await?,
+        ))
+    })
+    .await
 }
 
 /// Runs the summary saved in a view, with the view's search and filters.
@@ -63,32 +66,35 @@ pub async fn view_summary(
     Path((id, view_id)): Path<(String, String)>,
 ) -> Result<Json<SummaryResult>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = workspace_collection(&conn, &principal, &id).await?;
-    let rows = conn
-        .query(
-            "SELECT config FROM collection_views WHERE id=?1 AND collection_id=?2",
-            &[SqlValue::Text(view_id), SqlValue::Text(id)],
-        )
-        .await?;
-    let row = rows.first().ok_or(AppError::NotFound)?;
-    let config: SavedViewWrite =
-        serde_json::from_str(&text_at(row, 0)?).map_err(anyhow::Error::from)?;
-    let summary = config
-        .summary
-        .ok_or_else(|| AppError::bad("this view has no summary"))?;
-    let request = SummaryRequest {
-        query: config.query,
-        summary,
-    };
-    Ok(Json(
-        run_summary(
-            &conn,
-            &collection,
-            &request,
-            SummaryAccess::Authenticated(&principal),
-        )
-        .await?,
-    ))
+    conn.with_app_read_tx(async |conn| {
+        let collection = workspace_collection(conn, &principal, &id).await?;
+        let rows = conn
+            .query(
+                "SELECT config FROM collection_views WHERE id=?1 AND collection_id=?2",
+                &[SqlValue::Text(view_id), SqlValue::Text(id)],
+            )
+            .await?;
+        let row = rows.first().ok_or(AppError::NotFound)?;
+        let config: SavedViewWrite =
+            serde_json::from_str(&text_at(row, 0)?).map_err(anyhow::Error::from)?;
+        let summary = config
+            .summary
+            .ok_or_else(|| AppError::bad("this view has no summary"))?;
+        let request = SummaryRequest {
+            query: config.query,
+            summary,
+        };
+        Ok(Json(
+            run_summary(
+                conn,
+                &collection,
+                &request,
+                SummaryAccess::Authenticated(&principal),
+            )
+            .await?,
+        ))
+    })
+    .await
 }
 
 pub(crate) async fn run_summary(
@@ -97,6 +103,10 @@ pub(crate) async fn run_summary(
     request: &SummaryRequest,
     access: SummaryAccess<'_>,
 ) -> Result<SummaryResult, AppError> {
+    debug_assert!(
+        conn.in_transaction(),
+        "summary needs a consistent read snapshot"
+    );
     let spec = &request.summary;
     let blueprint = &collection.blueprint;
     validate_summary(blueprint, spec).map_err(AppError::bad)?;
@@ -119,6 +129,46 @@ pub(crate) async fn run_summary(
             .find(|f| f.name == name)
             .map(|f| f.kind)
     };
+
+    // Failed calculated predicates must not silently remove records before aggregation.
+    let mut selection_fields: std::collections::BTreeSet<&str> = spec
+        .group_by
+        .iter()
+        .map(|g| g.field.as_str())
+        .chain(query.filters.iter().map(|f| f.field.as_str()))
+        .filter(|f| kind(f) == Some(FieldType::Calculated))
+        .collect();
+    if !query.search.trim().is_empty() {
+        selection_fields.extend(
+            blueprint
+                .fields
+                .iter()
+                .filter(|f| f.kind == FieldType::Calculated)
+                .map(|f| f.name.as_str()),
+        );
+    }
+    if !selection_fields.is_empty() {
+        let mut predicates: Vec<_> = selection_fields
+            .iter()
+            .map(|field| format!("json_extract(r.calculation_errors, '$.{field}') IS NOT NULL"))
+            .collect();
+        predicates.push("json_extract(r.calculation_errors, '$.blueprint') IS NOT NULL".into());
+        let invalid = conn
+            .query(
+                &format!(
+                    "SELECT 1 FROM {} r WHERE {} LIMIT 1",
+                    plan.table,
+                    predicates.join(" OR ")
+                ),
+                &[],
+            )
+            .await?;
+        if !invalid.is_empty() {
+            return Err(AppError::bad(
+                "Cannot summarize: a calculated field used by grouping, filters, or search contains errors. Fix its source calculations first.",
+            ));
+        }
+    }
 
     // Group keys are stored JSON values; date buckets are plain text prefixes.
     let keys: Vec<String> = spec
@@ -167,12 +217,17 @@ pub(crate) async fn run_summary(
             ),
             SummaryOp::Formula => continue,
         };
-        columns.push((measure.name.clone(), expression));
+        let failed = format!(
+            "COUNT(CASE WHEN json_extract(r.calculation_errors, '$.{}') IS NOT NULL OR json_extract(r.calculation_errors, '$.blueprint') IS NOT NULL THEN 1 END)",
+            field
+        );
+        columns.push((measure.name.clone(), expression, failed));
     }
     let select = |keys: &[String]| {
         let mut parts = keys.to_vec();
         parts.push("COUNT(*)".into());
-        parts.extend(columns.iter().map(|(_, expression)| expression.clone()));
+        parts.extend(columns.iter().map(|(_, expression, _)| expression.clone()));
+        parts.extend(columns.iter().map(|(_, _, failed)| failed.clone()));
         parts.join(",")
     };
 
@@ -186,6 +241,9 @@ pub(crate) async fn run_summary(
         totals.first().ok_or(AppError::NotFound)?,
         0,
     )?;
+
+    #[cfg(test)]
+    pause_for_snapshot_test(&collection.id).await;
 
     let mut rows = Vec::new();
     if keys.is_empty() {
@@ -221,6 +279,8 @@ pub(crate) async fn run_summary(
     rows.truncate(MAX_SUMMARY_GROUPS);
     // Private aggregates are implementation details, never result columns.
     for row in rows.iter_mut().chain(std::iter::once(&mut totals)) {
+        row.errors
+            .retain(|name, _| request.summary.measures.iter().any(|m| m.name == *name));
         row.values
             .retain(|name, _| request.summary.measures.iter().any(|m| m.name == *name));
     }
@@ -235,7 +295,7 @@ pub(crate) async fn run_summary(
 fn decode_row(
     spec: &SummarySpec,
     formulas: &vulse_model::CompiledFormulas,
-    columns: &[(String, String)],
+    columns: &[(String, String, String)],
     groups: &[vulse_model::SummaryGroup],
     row: &SqlRow,
     key_count: usize,
@@ -255,7 +315,8 @@ fn decode_row(
         .collect::<Vec<_>>();
     let count = int_at(row, key_count)? as u64;
     let mut values = Map::new();
-    for (offset, (name, _)) in columns.iter().enumerate() {
+    let mut input_errors = std::collections::BTreeMap::new();
+    for (offset, (name, _, _)) in columns.iter().enumerate() {
         let index = key_count + 1 + offset;
         let value = match row.get(index) {
             Some(SqlValue::Text(text)) => Value::String(text.clone()),
@@ -264,6 +325,13 @@ fn decode_row(
                 .unwrap_or(Value::Null),
         };
         values.insert(name.clone(), value);
+        let failed = int_at(row, key_count + 1 + columns.len() + offset)?;
+        if failed > 0 {
+            input_errors.insert(
+                name.clone(),
+                format!("Incomplete: {failed} source records have calculation errors"),
+            );
+        }
     }
     // A count without a field counts the group's records.
     for measure in &spec.measures {
@@ -278,7 +346,11 @@ fn decode_row(
         values,
         errors: Default::default(),
     };
-    let (body, errors) = formulas.calculate(&Value::Object(row.values), &Default::default());
+    let (body, errors) = formulas.calculate_with_errors(
+        &Value::Object(row.values),
+        &Default::default(),
+        &input_errors,
+    );
     row.values = match body {
         Value::Object(values) => values,
         _ => Map::new(),
@@ -435,5 +507,38 @@ fn compare(a: &Value, b: &Value, descending: bool) -> Ordering {
         ordering.reverse()
     } else {
         ordering
+    }
+}
+
+// Deterministic concurrency test hook; scoped by collection to isolate parallel tests.
+#[cfg(test)]
+type SnapshotPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+static SNAPSHOT_PAUSES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, SnapshotPause>>> =
+    std::sync::LazyLock::new(Default::default);
+#[cfg(test)]
+pub(crate) fn pause_after_totals(
+    id: &str,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached, wait) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    SNAPSHOT_PAUSES
+        .lock()
+        .unwrap()
+        .insert(id.into(), (reached, resumed));
+    (wait, resume)
+}
+#[cfg(test)]
+async fn pause_for_snapshot_test(id: &str) {
+    let pause = SNAPSHOT_PAUSES.lock().unwrap().remove(id);
+    if let Some((reached, resume)) = pause {
+        let _ = reached.send(());
+        let _ = resume.await;
     }
 }

@@ -78,10 +78,14 @@ pub fn summary_panel(props: &SummaryPanelProps) -> Html {
     let result = use_state(|| None::<SummaryResult>);
     let error = use_state(String::new);
     let loading = use_state(|| false);
+    let checked_at = use_state(String::new);
+    let result_for = use_state(|| None::<(String, SummaryRequest)>);
     let epoch = use_mut_ref(|| 0usize);
     let fields = &props.collection.blueprint.fields;
     let invalid = vulse_model::validate_summary(&props.collection.blueprint, &props.spec).err();
     {
+        let checked_at = checked_at.clone();
+        let result_for = result_for.clone();
         let (result, error, loading, epoch) = (
             result.clone(),
             error.clone(),
@@ -108,6 +112,8 @@ pub fn summary_panel(props: &SummaryPanelProps) -> Html {
                         }
                         match outcome {
                             Ok(next) => {
+                                checked_at.set(String::from(js_sys::Date::new_0().to_locale_time_string("en-GB")));
+                                result_for.set(Some((id, request)));
                                 result.set(Some(next));
                                 error.set(String::new());
                             }
@@ -120,6 +126,8 @@ pub fn summary_panel(props: &SummaryPanelProps) -> Html {
             move || drop(timer)
         });
     }
+    let current_request = (props.collection.id.clone(), SummaryRequest { query: props.query.clone(), summary: props.spec.clone() });
+    let matches_request = result_for.as_ref() == Some(&current_request);
     let spec = props.spec.clone();
     let change = props.on_change.clone();
     html! {<div class="summary-panel">
@@ -129,14 +137,18 @@ pub fn summary_panel(props: &SummaryPanelProps) -> Html {
         } else if !error.is_empty() {
             <p class="error" role="alert">{(*error).clone()}</p>
         }
-        if let Some(result) = (*result).clone().filter(|_| invalid.is_none()) {
+        if let Some(result) = (*result).clone().filter(|_| invalid.is_none() && matches_request) {
             <div class={classes!("summary-results", loading.then_some("refreshing"))}>
+                <p class="muted" role="status">{if *loading {format!("Refreshing… Last successful check: {}", *checked_at)} else if !error.is_empty() {format!("Results may be out of date. Last successful check: {}", *checked_at)} else {format!("Last checked: {} · Updates automatically", *checked_at)}}</p>
+                if !result.totals.errors.is_empty() || result.rows.iter().any(|row| !row.errors.is_empty()) {
+                    <p class="error" role="alert">{"Some results could not be calculated. Cells marked Error are incomplete; fix the source calculation errors before relying on these totals."}</p>
+                }
                 if let Some(chart) = &spec.chart {
                     <SummaryChartView spec={spec.clone()} chart={chart.clone()} result={result.clone()} fields={fields.clone()}/>
                 }
                 {summary_table(&props.collection, &spec, &result, &props.on_drill)}
             </div>
-        } else if invalid.is_none() {
+        } else if invalid.is_none() && error.is_empty() {
             <p class="muted summary-loading" role="status">{"Calculating…"}</p>
         }
     </div>}

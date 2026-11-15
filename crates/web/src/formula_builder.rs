@@ -1383,12 +1383,18 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         .cloned()
         .collect();
     let mut advanced_inputs = inputs.clone();
-    for field in &props.collection_fields {
-        if !props.fields.iter().any(|f| f.name == field.name) {
+    if props.summary {
+        for field in &inputs {
             let mut field = field.clone();
-            field.label = Some(format!("{} (collection field; use SUM, AVERAGE, MIN, MAX or COUNT)", field.label.as_deref().unwrap_or(&field.name)));
+            field.name = format!("summary.{}", field.name);
             advanced_inputs.push(field);
         }
+    }
+    for field in &props.collection_fields {
+        let mut field = field.clone();
+        field.name = format!("record.{}", field.name);
+        field.label = Some(format!("{} (collection field; use an aggregate)", field.label.as_deref().unwrap_or(&field.name)));
+        advanced_inputs.push(field);
     }
     let others: Vec<CollectionView> = props
         .collections
@@ -1479,7 +1485,7 @@ pub fn formula_editor(props: &FormulaEditorProps) -> Html {
         _ => None,
     };
     html! {<section class="formula-editor" aria-label={format!("{} calculation",props.field.name)}>
-        <div class="calculation-heading"><div><h3>{if props.summary {"How should this summary value be calculated?"}else{"How should this field be calculated?"}}</h3><p class="muted">{if props.summary {"Use summary values by name or aggregate collection fields directly, for example SUM([arsverk]) * 2. Results update for each group."}else{"Read-only · Updates automatically when its input fields change."}}</p></div><button type="button" class="secondary" onclick={Callback::from({let mode=mode.clone();let formula=formula.clone();let set_draft=set_draft.clone();let inputs=inputs.clone();let summary=props.summary;let name=props.field.name.clone();move |_|{match &*mode{Mode::Guided(_)|Mode::Lookup(_)=>mode.set(Mode::Advanced),Mode::Advanced=>match mode_for(&name,&formula,&inputs,summary){Mode::Advanced=>set_draft.emit(Draft::new("multiply")),next=>mode.set(next)}}}})}>{if !matches!(&*mode,Mode::Advanced){"Edit formula"}else if guided_available{"Use guided builder"}else{"Start a new guided calculation"}}</button></div>
+        <div class="calculation-heading"><div><h3>{if props.summary {"How should this summary value be calculated?"}else{"How should this field be calculated?"}}</h3><p class="muted">{if props.summary {"Use summary values by name or aggregate collection fields directly, for example SUM([record.arsverk]) * 2. Results update for each group."}else{"Read-only · Updates automatically when its input fields change."}}</p></div><button type="button" class="secondary" onclick={Callback::from({let mode=mode.clone();let formula=formula.clone();let set_draft=set_draft.clone();let inputs=inputs.clone();let summary=props.summary;let name=props.field.name.clone();move |_|{match &*mode{Mode::Guided(_)|Mode::Lookup(_)=>mode.set(Mode::Advanced),Mode::Advanced=>match mode_for(&name,&formula,&inputs,summary){Mode::Advanced=>set_draft.emit(Draft::new("multiply")),next=>mode.set(next)}}}})}>{if !matches!(&*mode,Mode::Advanced){"Edit formula"}else if guided_available{"Use guided builder"}else{"Start a new guided calculation"}}</button></div>
         if let Mode::Lookup(draft)=&*mode {
             {task_select.clone()}
             <LookupBuilder draft={draft.clone()} collections={others.clone()} inputs={inputs.clone()} on_change={set_lookup.clone()}/>
@@ -1609,7 +1615,7 @@ struct AdvancedProps {
 #[function_component(AdvancedFormula)]
 fn advanced_formula(props: &AdvancedProps) -> Html {
     html! {<div class="advanced-formula"><FormulaInput label={props.label.clone()} lookups={!props.summary} textarea={props.textarea.clone()} value={props.value.clone()} suggestions={props.suggestions.clone()} on_change={props.on_change.clone()} on_selection={props.on_selection.clone()} placeholder="=ROUND([price] * [quantity], 2)"/>
-        <p class="muted">{if props.summary {"Use [value_name] for a summary value, or SUM([field]), AVERAGE([field]), MIN([field]), MAX([field]) or COUNT([field]) for a collection field. COUNT counts nonempty values. Aggregates use the filtered records in each group. If names overlap, the summary value takes precedence. Use + − * / for arithmetic."}else{"Use [field_name] for a field, [collection.field] for a field of another collection, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions, then press Enter to insert. Select text to wrap it in a function."}}</p><div class="row"><button type="button" class="secondary" onclick={Callback::from({let change=props.on_library.clone();move |_|change.emit(())})}>{"Browse functions"}</button><label class="advanced-insert-field">{"Insert field"}<select aria-label="Insert input field" value="" onchange={Callback::from({let change=props.on_change.clone();let value=props.value.clone();let node=props.textarea.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();if select.value().is_empty(){return;}let name=select.value();let (start,end)=node.cast::<HtmlTextAreaElement>().map(|a|(a.selection_start().ok().flatten().unwrap_or(0) as usize,a.selection_end().ok().flatten().unwrap_or(0) as usize)).unwrap_or((value.encode_utf16().count(),value.encode_utf16().count()));let at=vulse_model::utf16_to_char_index(&value,start);let end=vulse_model::utf16_to_char_index(&value,end);let prefix=if value.is_empty(){"="}else{""};change.emit(replace_chars(&value,at,end,&format!("{prefix}[{name}]")));select.set_value("");}})}><option value="" selected={true}>{"Choose a field…"}</option>{for props.fields.iter().map(|f|html!{<option value={f.name.clone()}>{field_option(f)}</option>})}</select></label></div>
+        <p class="muted">{if props.summary {"Use [value_name] for a summary value, or SUM([record.field]), AVERAGE([record.field]), MIN([record.field]), MAX([record.field]) or COUNT([record.field]) for a collection field. COUNT counts nonempty values. Aggregates use the filtered records in each group. Use [summary.value_name] to explicitly reference a summary value. Ambiguous names must be qualified. Use + − * / for arithmetic."}else{"Use [field_name] for a field, [collection.field] for a field of another collection, quoted text for a string, and + − * / for arithmetic. Type a function name or [ for suggestions, then press Enter to insert. Select text to wrap it in a function."}}</p><div class="row"><button type="button" class="secondary" onclick={Callback::from({let change=props.on_library.clone();move |_|change.emit(())})}>{"Browse functions"}</button><label class="advanced-insert-field">{"Insert field"}<select aria-label="Insert input field" value="" onchange={Callback::from({let change=props.on_change.clone();let value=props.value.clone();let node=props.textarea.clone();move |e:Event|{let select:HtmlSelectElement=e.target_unchecked_into();if select.value().is_empty(){return;}let name=select.value();let (start,end)=node.cast::<HtmlTextAreaElement>().map(|a|(a.selection_start().ok().flatten().unwrap_or(0) as usize,a.selection_end().ok().flatten().unwrap_or(0) as usize)).unwrap_or((value.encode_utf16().count(),value.encode_utf16().count()));let at=vulse_model::utf16_to_char_index(&value,start);let end=vulse_model::utf16_to_char_index(&value,end);let prefix=if value.is_empty(){"="}else{""};change.emit(replace_chars(&value,at,end,&format!("{prefix}[{name}]")));select.set_value("");}})}><option value="" selected={true}>{"Choose a field…"}</option>{for props.fields.iter().map(|f|html!{<option value={f.name.clone()}>{field_option(f)}</option>})}</select></label></div>
     </div>}
 }
 

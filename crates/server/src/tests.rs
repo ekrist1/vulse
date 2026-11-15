@@ -16,6 +16,8 @@ use crate::app;
 mod bench;
 #[path = "tests/bench_write.rs"]
 mod bench_write;
+#[path = "tests/summary_integrity.rs"]
+mod summary_integrity;
 #[path = "tests/beta.rs"]
 mod beta;
 #[path = "tests/compression.rs"]

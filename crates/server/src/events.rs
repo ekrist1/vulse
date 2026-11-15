@@ -2,10 +2,10 @@
 //!
 //! Writes record the collections they change on their connection; the ids
 //! are published when the transaction commits, so a view that reloads on
-//! an event sees the new data. Notifications are per process: with several
-//! server processes, views also reload on a slow timer.
+//! an event sees the new data. A one-second poll of shared database versions
+//! catches writes committed by other processes and missed local notifications.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -59,13 +59,61 @@ struct Watch {
     db: Db,
     id: String,
     ids: BTreeSet<String>,
+    versions: BTreeMap<String, i64>,
+    poll: tokio::time::Interval,
+}
+
+async fn versions(conn: &Conn, ids: &BTreeSet<String>) -> anyhow::Result<BTreeMap<String, i64>> {
+    let params: Vec<_> = ids.iter().cloned().map(crate::db::SqlValue::Text).collect();
+    let slots = (1..=params.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.query(
+        &format!(
+            "SELECT collection_id,version FROM collection_versions WHERE collection_id IN ({slots})"
+        ),
+        &params,
+    )
+    .await?
+    .iter()
+    .map(|r| Ok((crate::db::text_at(r, 0)?, crate::db::int_at(r, 1)?)))
+    .collect()
 }
 
 impl Watch {
+    async fn remote_change(&mut self) -> anyhow::Result<bool> {
+        let conn = self.db.connect().await?;
+        conn.with_app_read_tx(async |conn| {
+            let current = versions(conn, &self.ids).await?;
+            let changed = current != self.versions;
+            if changed {
+                if let Some(collection) = store::find_collection(conn, &self.id).await? {
+                    self.ids = watched(conn, &collection).await?;
+                }
+                self.versions = versions(conn, &self.ids).await?;
+            }
+            Ok(changed)
+        })
+        .await
+        .map_err(Into::into)
+    }
+
     /// Waits for a change that affects the collection's view.
     async fn next(&mut self) -> Option<String> {
         loop {
-            match self.changes.recv().await {
+            let event = tokio::select! {
+                event = self.changes.recv() => event,
+                _ = self.poll.tick() => {
+                    match self.remote_change().await {
+                        Ok(true) => return Some(self.id.clone()),
+                        Ok(false) => {},
+                        Err(error) => tracing::warn!(%error, "checking shared collection versions failed"),
+                    }
+                    continue;
+                }
+            };
+            match event {
                 Ok(changed) => {
                     if changed == self.id {
                         // Its fields may now read other collections.
@@ -98,9 +146,18 @@ pub async fn collection_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let conn = state.db.connect().await?;
     let collection = workspace_collection(&conn, &principal, &id).await?;
+    let ids = watched(&conn, &collection).await?;
+    let versions = versions(&conn, &ids).await?;
+    let mut poll = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let watch = Watch {
         changes: CHANGES.subscribe(),
-        ids: watched(&conn, &collection).await?,
+        ids,
+        versions,
+        poll,
         db: state.db.clone(),
         id: collection.id,
     };

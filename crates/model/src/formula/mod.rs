@@ -212,8 +212,21 @@ impl CompiledFormulas {
 
     /// What `calculate_document_with` returns for the compiled blueprint.
     pub fn calculate(&self, body: &Value, lookups: &Lookups) -> (Value, BTreeMap<String, String>) {
+        self.calculate_with_errors(body, lookups, &BTreeMap::new())
+    }
+
+    /// Preserve failures from materialized inputs instead of treating them as blank cells.
+    pub fn calculate_with_errors(
+        &self,
+        body: &Value,
+        lookups: &Lookups,
+        input_errors: &BTreeMap<String, String>,
+    ) -> (Value, BTreeMap<String, String>) {
         let mut out = body.as_object().cloned().unwrap_or_default();
-        let mut errors = BTreeMap::new();
+        let mut errors = input_errors.clone();
+        for name in errors.keys() {
+            out.insert(name.clone(), Value::Null);
+        }
         let expressions = match &self.expressions {
             Ok(e) => e,
             Err(e) => {
@@ -226,7 +239,10 @@ impl CompiledFormulas {
             body,
             lookups,
         };
-        let mut cache = HashMap::new();
+        let mut cache = input_errors
+            .iter()
+            .map(|(n, e)| (n.clone(), Err(e.clone())))
+            .collect::<HashMap<_, _>>();
         for n in expressions.keys() {
             match resolve(n, &ctx, &mut cache) {
                 Ok(v) => {

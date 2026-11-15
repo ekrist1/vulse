@@ -69,16 +69,19 @@ async fn summary_inner(
     request: vulse_model::SummaryRequest,
 ) -> Result<Json<vulse_model::SummaryResult>, AppError> {
     let conn = state.db.connect().await?;
-    let collection = public_collection(&conn, &path.collection).await?;
-    Ok(Json(
-        crate::summary::run_summary(
-            &conn,
-            &collection,
-            &request,
-            crate::summary::SummaryAccess::Public,
-        )
-        .await?,
-    ))
+    conn.with_app_read_tx(async |conn| {
+        let collection = public_collection(conn, &path.collection).await?;
+        Ok(Json(
+            crate::summary::run_summary(
+                conn,
+                &collection,
+                &request,
+                crate::summary::SummaryAccess::Public,
+            )
+            .await?,
+        ))
+    })
+    .await
 }
 
 pub async fn options() -> Response {

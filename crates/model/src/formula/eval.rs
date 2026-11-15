@@ -5,7 +5,7 @@ use super::value::{compare, criterion, match_key, num, number, text_value, truth
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Columns of other collections that `[collection.field]` references read.
 /// Columns of one collection share a row order, so they line up like ranges.
@@ -21,6 +21,8 @@ pub struct LookupColumn {
     /// Always a `Value::Array`, so functions can borrow the whole column.
     values: Value,
     index: OnceLock<HashMap<String, Vec<usize>>>,
+    error: Option<String>,
+    aggregates: Mutex<HashMap<String, Result<Value, String>>>,
 }
 
 impl LookupColumn {
@@ -29,7 +31,22 @@ impl LookupColumn {
             collection: collection.into(),
             values: Value::Array(values),
             index: OnceLock::new(),
+            error: None,
+            aggregates: Mutex::new(HashMap::new()),
         }
+    }
+    /// A failed source calculation invalidates this range, rather than silently
+    /// dropping failed cells from aggregates or lookup results.
+    pub fn with_error(mut self, error: Option<String>) -> Self {
+        self.error = error;
+        self
+    }
+    fn aggregate(&self, name: &str) -> Result<Value, String> {
+        let mut cache = self.aggregates.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(name.into())
+            .or_insert_with(|| function(name, &[&self.values]))
+            .clone()
     }
     fn values(&self) -> &[Value] {
         self.values
@@ -61,6 +78,10 @@ impl Lookups {
             .get(name)
             .map(Arc::as_ref)
             .ok_or_else(|| format!("#REF! [{name}] is read from its collection on saved records"))
+            .and_then(|column| match &column.error {
+                Some(error) => Err(format!("[{name}]: {error}")),
+                None => Ok(column),
+            })
     }
 }
 
@@ -138,6 +159,25 @@ pub(super) fn eval<'a>(e: &Expr, ctx: &Ctx<'a>, cache: &mut Cache) -> Result<Val
             }
             if n == "XLOOKUP" {
                 return xlookup(args, ctx, cache);
+            }
+            // These pure whole-column aggregates are identical for every dependent
+            // record. Cache once per immutable lookup column, not once per record.
+            if matches!(
+                n.as_str(),
+                "SUM"
+                    | "AVERAGE"
+                    | "MIN"
+                    | "MAX"
+                    | "COUNT"
+                    | "COUNTA"
+                    | "COUNTBLANK"
+                    | "PRODUCT"
+                    | "MEDIAN"
+            ) && let [Expr::Field(name)] = args.as_slice()
+                && name.contains('.')
+                && !ctx.all.contains_key(name)
+            {
+                return ctx.lookups.column(name)?.aggregate(n);
             }
             let mut values = Vec::new();
             let mut bytes = 0usize;

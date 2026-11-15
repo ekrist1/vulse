@@ -27,7 +27,7 @@ const BATCH_PARAMS: usize = 20_000;
 /// text, numbers, sort keys, search text or formula results. Vulse rebuilds
 /// every table on start when the stored version differs (see
 /// `records::rebuild_outdated_tables`).
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 
 /// A record as its row is written from: id, created_at, updated_at, body.
 pub(crate) type Record = (String, String, String, Value);
@@ -69,6 +69,7 @@ fn columns(blueprint: &Blueprint) -> Vec<String> {
         "created_at".into(),
         "updated_at".into(),
         "search".into(),
+        "calculation_errors".into(),
     ];
     for field in &blueprint.fields {
         for part in ['t', 'n', 'r'] {
@@ -88,9 +89,12 @@ fn values(
     lookups: &Lookups,
     body: &Value,
 ) -> Vec<SqlValue> {
-    let (body, _) = formulas.calculate(body, lookups);
+    let (body, errors) = formulas.calculate(body, lookups);
     let mut search = Vec::new();
-    let mut out = vec![SqlValue::Null];
+    let mut out = vec![
+        SqlValue::Null,
+        SqlValue::Text(serde_json::to_string(&errors).expect("string map")),
+    ];
     for field in &blueprint.fields {
         let value = &body[&field.name];
         if value.is_null() {
@@ -168,6 +172,7 @@ async fn create_table(
         "created_at TEXT NOT NULL".into(),
         "updated_at TEXT NOT NULL".into(),
         "search TEXT NOT NULL".into(),
+        "calculation_errors TEXT NOT NULL DEFAULT '{}'".into(),
     ];
     for field in &blueprint.fields {
         definitions.push(format!("{} TEXT", column(&field.name, 't')));
@@ -283,39 +288,66 @@ pub(crate) async fn rebuild(
 /// its indexes, for values calculated from other collections that changed.
 /// Only rows whose values differ from the stored ones are written, so the
 /// table ends as rewriting every row would leave it, without the cost of
-/// rewriting rows and index entries that stay the same. As with rewriting
-/// every row, records missing from the table are added and rows without a
-/// record are left alone.
+/// rewriting rows and index entries that stay the same. Missing rows are
+/// added and rows without a source record are removed.
 pub(crate) async fn refresh(
     conn: &Conn,
     collection_id: &str,
     blueprint: &Blueprint,
     lookups: &Lookups,
 ) -> anyhow::Result<()> {
+    // Keyset paging keeps dependent-record memory bounded. All batches remain
+    // inside the caller's write transaction; none are visible before commit.
+    const BATCH: usize = 256;
     let names = columns(blueprint);
-    let mut stored: HashMap<String, SqlRow> = conn
-        .query(
-            &format!("SELECT {} FROM {}", names.join(", "), table(collection_id)),
-            &[],
-        )
-        .await?
-        .into_iter()
-        .map(|row| Ok((crate::db::text_at(&row, 0)?, row)))
-        .collect::<anyhow::Result<_>>()?;
-    let records = crate::store::list_records(conn, collection_id).await?;
+    let table = table(collection_id);
     let formulas = CompiledFormulas::new(blueprint);
-    let changed: Vec<SqlRow> = records
-        .iter()
-        .filter_map(|record| {
-            let row = row(blueprint, &formulas, lookups, record);
-            let old = stored.remove(&record.0);
-            old.is_none_or(|old| !same_row(&old, &row)).then_some(row)
-        })
-        .collect();
-    for ghost_id in stored.keys() {
-        remove(conn, collection_id, ghost_id).await?;
+    let mut after = String::new();
+    let mut changed_any = false;
+    loop {
+        let records = conn.query(
+            "SELECT id,created_at,updated_at,body FROM documents WHERE collection_id=?1 AND id>?2 ORDER BY id LIMIT ?3",
+            &[SqlValue::Text(collection_id.into()), SqlValue::Text(after.clone()), SqlValue::Integer(BATCH as i64)],
+        ).await?;
+        if records.is_empty() {
+            break;
+        }
+        let last = crate::db::text_at(records.last().unwrap(), 0)?;
+        let mut stored: HashMap<String, SqlRow> = conn.query(
+            &format!("SELECT {} FROM {table} WHERE id IN (SELECT id FROM documents WHERE collection_id=?1 AND id>?2 ORDER BY id LIMIT ?3)", names.join(", ")),
+            &[SqlValue::Text(collection_id.into()), SqlValue::Text(after), SqlValue::Integer(BATCH as i64)],
+        ).await?.into_iter().map(|r| Ok((crate::db::text_at(&r, 0)?, r))).collect::<anyhow::Result<_>>()?;
+        let mut changed = Vec::new();
+        for source in records {
+            let record = (
+                crate::db::text_at(&source, 0)?,
+                crate::db::text_at(&source, 1)?,
+                crate::db::text_at(&source, 2)?,
+                serde_json::from_str(&crate::db::text_at(&source, 3)?)?,
+            );
+            let derived = row(blueprint, &formulas, lookups, &record);
+            if stored
+                .remove(&record.0)
+                .is_none_or(|old| !same_row(&old, &derived))
+            {
+                changed.push(derived);
+            }
+        }
+        changed_any |= !changed.is_empty();
+        insert_rows(conn, collection_id, &names, "INSERT OR REPLACE", changed).await?;
+        after = last;
     }
-    insert_rows(conn, collection_id, &names, "INSERT OR REPLACE", changed).await
+    let removed = conn.execute(&format!("DELETE FROM {table} WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id={table}.id AND d.collection_id=?1)"),
+        &[SqlValue::Text(collection_id.into())]).await?;
+    if changed_any || removed > 0 {
+        conn.execute(
+            "UPDATE collection_versions SET version=version+1 WHERE collection_id=?1",
+            &[SqlValue::Text(collection_id.into())],
+        )
+        .await?;
+        conn.changed(collection_id);
+    }
+    Ok(())
 }
 
 /// Whether a stored row holds exactly the values of a derived one. Values

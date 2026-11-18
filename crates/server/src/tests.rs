@@ -2587,7 +2587,8 @@ async fn upsert_imports_preview_counts_validate_keys_preserve_fields_and_export_
             .contains("products.csv")
     );
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let mut csv = csv::Reader::from_reader(bytes.as_ref());
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").expect("UTF-8 BOM");
+    let mut csv = csv::ReaderBuilder::new().delimiter(b';').from_reader(bytes);
     assert_eq!(
         csv.headers().unwrap(),
         &csv::StringRecord::from(vec!["sku", "name", "total"])
@@ -4161,13 +4162,13 @@ async fn exports_include_columns_from_related_records() {
     let lines: Vec<&str> = csv.lines().collect();
     assert_eq!(
         lines[0],
-        "code,product,product.name,product.double,extras.name"
+        "\u{feff}code;product;product.name;product.double;extras.name"
     );
     assert_eq!(
         lines[1],
-        format!("A1,{},Saw,20.0,\"[\"\"=Pen\"\",\"\"Saw\"\"]\"", saw.id)
+        format!("A1;{};Saw;20,0;\"[\"\"=Pen\"\",\"\"Saw\"\"]\"", saw.id)
     );
-    assert_eq!(lines[2], "B2,,,,[]");
+    assert_eq!(lines[2], "B2;;;;[]");
 
     let (status, json) = body(
         app.call(
@@ -4274,6 +4275,78 @@ async fn exports_include_columns_from_related_records() {
         scoped(json!([{"field":"product","columns":["name"]}])).await,
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn csv_exports_use_semicolons_decimal_commas_and_norwegian_letters() {
+    use vulse_model::ImportResult;
+    let app = TestApp::new().await;
+    let (cookie, _) = register(&app, "norsk@example.com", "norsk").await;
+    let c = create_collection(
+        &app,
+        &cookie,
+        "varer",
+        "private",
+        json!({"fields":[{"name":"navn","type":"string"},{"name":"pris","type":"number"},
+            {"name":"antall","type":"number"},{"name":"tags","type":"array","items":"string"}]}),
+    )
+    .await;
+    create_document(
+        &app,
+        &cookie,
+        &c.id,
+        json!({"navn":"Blåbærsyltetøy; ÆØÅ","pris":1.234,"antall":12,"tags":["søt","rød"]}),
+    )
+    .await;
+    let export = format!("/api/v1/collections/{}/export", c.id);
+    let response = app
+        .call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"csv","columns":["navn","pris","antall","tags"]})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/csv; charset=utf-8"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(
+        text,
+        "\u{feff}navn;pris;antall;tags\n\"Blåbærsyltetøy; ÆØÅ\";1,234;12;\"[\"\"søt\"\",\"\"rød\"\"]\"\n"
+    );
+
+    // The exported file imports again unchanged; 1,234 is not ambiguous here.
+    let (status, result) =
+        json_of::<ImportResult>(upsert_csv(&app, &cookie, &c.id, &text, true, "navn").await)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", result.errors);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!((result.unchanged, result.created, result.updated), (1, 0, 0));
+
+    // A single exported number column has no separator in its header.
+    let response = app
+        .call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"csv","columns":["pris"]})),
+        )
+        .await;
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text, "\u{feff}pris\n1,234\n");
+    let (status, result) =
+        json_of::<ImportResult>(upsert_csv(&app, &cookie, &c.id, &text, true, "pris").await)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", result.errors);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!((result.unchanged, result.created, result.updated), (1, 0, 0));
 }
 
 #[tokio::test]

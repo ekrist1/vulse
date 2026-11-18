@@ -311,38 +311,51 @@ fn summary_csv(fields: &[FieldDef], spec: &SummarySpec, result: &SummaryResult) 
     headers.extend(spec.measures.iter().map(|m| m.name.clone()));
     let mut lines = vec![csv_line(&headers)];
     for row in result.rows.iter() {
-        let mut cells = row.labels.clone();
+        // Number groups use the decimal comma too; other labels stay as shown.
+        let mut cells: Vec<String> = row
+            .labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| match row.group.get(i) {
+                Some(Value::Number(number)) => number.to_string().replace('.', ","),
+                _ => label.clone(),
+            })
+            .collect();
         cells.push(row.count.to_string());
         cells.extend(spec.measures.iter().map(|m| match row.values.get(&m.name) {
             Some(Value::Null) | None => String::new(),
             Some(Value::String(text)) => text.clone(),
+            // Decimal comma, like the record export: 12.5 is written as 12,5.
+            Some(Value::Number(number)) => number.to_string().replace('.', ","),
             Some(value) => value.to_string(),
         }));
         lines.push(csv_line(&cells));
     }
-    lines.join("\r\n") + "\r\n"
+    // The byte order mark makes Excel read the file as UTF-8 (æ, ø, å).
+    format!("\u{feff}{}\r\n", lines.join("\r\n"))
 }
 
-/// Quotes cells as needed and defuses spreadsheet formulas, like the record export.
+/// Quotes cells as needed and defuses spreadsheet formulas, like the record
+/// export. Cells are separated by `;`, since `,` is the decimal mark.
 fn csv_line(cells: &[String]) -> String {
     cells
         .iter()
         .map(|cell| {
             let cell = if cell.trim_start().starts_with(['=', '+', '-', '@'])
-                && cell.parse::<f64>().is_err()
+                && cell.replace(',', ".").parse::<f64>().is_err()
             {
                 format!("'{cell}")
             } else {
                 cell.clone()
             };
-            if cell.contains([',', '"', '\n', '\r']) {
+            if cell.contains([';', '"', '\n', '\r']) {
                 format!("\"{}\"", cell.replace('"', "\"\""))
             } else {
                 cell
             }
         })
         .collect::<Vec<_>>()
-        .join(",")
+        .join(";")
 }
 
 /// Filters that select one group's records in the table.
@@ -1111,6 +1124,31 @@ fn compact(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_lines_use_semicolons_and_keep_decimal_commas() {
+        let cells = ["Blåbær; Æ", "1,5", "-2,25", "=SUM(A1)", "Ørn"].map(String::from);
+        assert_eq!(csv_line(&cells), "\"Blåbær; Æ\";1,5;-2,25;'=SUM(A1);Ørn");
+    }
+
+    #[test]
+    fn summary_csv_writes_numbers_and_number_groups_with_decimal_commas() {
+        let spec: SummarySpec = serde_json::from_value(serde_json::json!({
+            "group_by": [{"field": "pris"}, {"field": "sted"}],
+            "measures": [{"name": "snitt", "op": "average", "field": "pris"}]
+        }))
+        .unwrap();
+        let row = serde_json::json!({"group": [12.5, "Tromsø 1.5"], "labels": ["12.5", "Tromsø 1.5"],
+            "count": 2, "values": {"snitt": 0.75}});
+        let result: SummaryResult = serde_json::from_value(serde_json::json!({
+            "rows": [row], "totals": row, "group_count": 1, "truncated": false
+        }))
+        .unwrap();
+        assert_eq!(
+            summary_csv(&[], &spec, &result),
+            "\u{feff}pris;sted;records;snitt\r\n12,5;Tromsø 1.5;2;0,75\r\n"
+        );
+    }
 
     #[test]
     fn ticks_are_round_and_cover_the_data() {

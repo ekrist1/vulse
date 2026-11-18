@@ -20,6 +20,11 @@ use vulse_model::{
 };
 const MAX_RECORDS: usize = 10_000;
 const MAX_BYTES: usize = 25 * 1024 * 1024;
+/// CSV follows Norwegian spreadsheet conventions: `;` between cells, since
+/// `,` is the decimal mark. The byte order mark makes Excel read the file as
+/// UTF-8, so letters such as æ, ø and å survive.
+const CSV_DELIMITER: u8 = b';';
+const UTF8_BOM: &[u8] = &[0xef, 0xbb, 0xbf];
 pub async fn export_records(
     State(state): State<AppState>,
     AuthUser(principal): AuthUser,
@@ -59,7 +64,7 @@ pub async fn export_records(
  let mut lookups=RelatedCache::default();
  let own=crate::lookups::load(conn,&collection.blueprint).await?;let formulas=vulse_model::CompiledFormulas::new(&collection.blueprint);
  let mut bytes=vec![];
- if write.format=="csv"{csv_row(&mut bytes,&columns.iter().map(|c|c.header(&related)).collect::<Vec<_>>())?;}else{bytes.push(b'[');}
+ if write.format=="csv"{bytes.extend_from_slice(UTF8_BOM);csv_row(&mut bytes,&columns.iter().map(|c|c.header(&related)).collect::<Vec<_>>())?;}else{bytes.push(b'[');}
  let mut emitted=0;
  while emitted<total{
  let mut page_params=params.clone();page_params.push(SqlValue::Integer(100));let limit=format!("?{}",page_params.len());page_params.push(SqlValue::Integer(emitted as i64));let offset=format!("?{}",page_params.len());
@@ -116,6 +121,7 @@ pub async fn export_records(
 fn csv_row(bytes: &mut Vec<u8>, cells: &[String]) -> Result<(), AppError> {
     let mut writer = csv::WriterBuilder::new()
         .has_headers(false)
+        .delimiter(CSV_DELIMITER)
         .from_writer(bytes);
     writer.write_record(cells).map_err(anyhow::Error::from)?;
     writer.flush().map_err(anyhow::Error::from)?;
@@ -308,6 +314,9 @@ fn csv_cell(value: &Value) -> String {
         String::new()
     } else if let Some(text) = value.as_str() {
         safe_csv_text(text)
+    } else if value.is_number() {
+        // Decimal comma: 12.5 is written as 12,5.
+        value.to_string().replace('.', ",")
     } else {
         value.to_string()
     }

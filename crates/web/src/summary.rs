@@ -311,7 +311,16 @@ fn summary_csv(fields: &[FieldDef], spec: &SummarySpec, result: &SummaryResult) 
     headers.extend(spec.measures.iter().map(|m| m.name.clone()));
     let mut lines = vec![csv_line(&headers)];
     for row in result.rows.iter() {
-        let mut cells = row.labels.clone();
+        // Number groups use the decimal comma too; other labels stay as shown.
+        let mut cells: Vec<String> = row
+            .labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| match row.group.get(i) {
+                Some(Value::Number(number)) => number.to_string().replace('.', ","),
+                _ => label.clone(),
+            })
+            .collect();
         cells.push(row.count.to_string());
         cells.extend(spec.measures.iter().map(|m| match row.values.get(&m.name) {
             Some(Value::Null) | None => String::new(),
@@ -1120,6 +1129,25 @@ mod tests {
     fn csv_lines_use_semicolons_and_keep_decimal_commas() {
         let cells = ["Blåbær; Æ", "1,5", "-2,25", "=SUM(A1)", "Ørn"].map(String::from);
         assert_eq!(csv_line(&cells), "\"Blåbær; Æ\";1,5;-2,25;'=SUM(A1);Ørn");
+    }
+
+    #[test]
+    fn summary_csv_writes_numbers_and_number_groups_with_decimal_commas() {
+        let spec: SummarySpec = serde_json::from_value(serde_json::json!({
+            "group_by": [{"field": "pris"}, {"field": "sted"}],
+            "measures": [{"name": "snitt", "op": "average", "field": "pris"}]
+        }))
+        .unwrap();
+        let row = serde_json::json!({"group": [12.5, "Tromsø 1.5"], "labels": ["12.5", "Tromsø 1.5"],
+            "count": 2, "values": {"snitt": 0.75}});
+        let result: SummaryResult = serde_json::from_value(serde_json::json!({
+            "rows": [row], "totals": row, "group_count": 1, "truncated": false
+        }))
+        .unwrap();
+        assert_eq!(
+            summary_csv(&[], &spec, &result),
+            "\u{feff}pris;sted;records;snitt\r\n12,5;Tromsø 1.5;2;0,75\r\n"
+        );
     }
 
     #[test]

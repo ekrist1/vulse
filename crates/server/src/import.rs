@@ -646,25 +646,42 @@ fn excel_datetime(dt: &calamine::ExcelDateTime) -> String {
 }
 /// Picks `,`, `;` or tab by counting each outside quotes on the header line,
 /// since spreadsheets in decimal-comma locales export semicolon-separated CSV.
+/// A header without any of them means a single column: then the first of
+/// `,`, `;`, tab that never appears unquoted is used, so a lone `1,234` cell
+/// (from a decimal-comma export) is not split and the file reads as `;`.
 fn csv_delimiter(text: &str) -> u8 {
-    let mut counts = [(b',', 0), (b';', 0), (b'\t', 0)];
-    let mut quoted = false;
-    for byte in text.bytes() {
-        match byte {
-            b'"' => quoted = !quoted,
-            b'\n' | b'\r' if !quoted => break,
-            _ if !quoted => {
-                if let Some(entry) = counts.iter_mut().find(|(d, _)| *d == byte) {
-                    entry.1 += 1;
+    let candidates = *b",;\t";
+    let unquoted = |stop_at_newline: bool| {
+        let mut counts = [0usize; 3];
+        let mut quoted = false;
+        for byte in text.bytes() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b'\n' | b'\r' if !quoted && stop_at_newline => break,
+                _ if !quoted => {
+                    if let Some(i) = candidates.iter().position(|d| *d == byte) {
+                        counts[i] += 1;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    counts
+        counts
+    };
+    let header = unquoted(true);
+    if let Some((i, _)) = header
         .iter()
-        .max_by_key(|(_, n)| *n)
-        .filter(|(_, n)| *n > 0)
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .max_by_key(|(_, n)| **n)
+    {
+        return candidates[i];
+    }
+    let anywhere = unquoted(false);
+    candidates
+        .iter()
+        .zip(anywhere)
+        .find(|(_, n)| *n == 0)
         .map_or(b',', |(d, _)| *d)
 }
 fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Result<Table, String> {
@@ -1146,6 +1163,14 @@ mod tests {
         assert_eq!(csv.rows[0][6], "3,55");
         assert_eq!(csv.first_row, 1);
         assert_eq!(csv_delimiter("a\tb\n"), b'\t');
+        // One column: an unquoted comma in the data is a decimal mark.
+        assert_eq!(csv_delimiter("price\n1,234\n"), b';');
+        assert_eq!(csv_delimiter("price\n12\n"), b',');
+        assert_eq!(csv_delimiter("note\n\"a,b\"\n"), b',');
+        assert_eq!(csv_delimiter("note\na,b\nc;d\n"), b'\t');
+        let single = parse_file("data.csv", b"\xef\xbb\xbfprice\n1,234\n", "", true).unwrap();
+        assert_eq!(single.rows, vec![vec!["1,234".to_string()]]);
+        assert!(single.decimal_comma);
         let most = "a\n".to_owned() + &"1\n".repeat(MAX_ROWS);
         assert_eq!(
             parse_file("data.csv", most.as_bytes(), "", true)

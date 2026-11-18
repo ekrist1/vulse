@@ -4327,6 +4327,26 @@ async fn csv_exports_use_semicolons_decimal_commas_and_norwegian_letters() {
     assert_eq!(status, StatusCode::OK, "{:?}", result.errors);
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     assert_eq!((result.unchanged, result.created, result.updated), (1, 0, 0));
+
+    // A single exported number column has no separator in its header.
+    let response = app
+        .call(
+            "POST",
+            &export,
+            Some(&cookie),
+            None,
+            Some(json!({"format":"csv","columns":["pris"]})),
+        )
+        .await;
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text, "\u{feff}pris\n1,234\n");
+    let (status, result) =
+        json_of::<ImportResult>(upsert_csv(&app, &cookie, &c.id, &text, true, "pris").await)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", result.errors);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!((result.unchanged, result.created, result.updated), (1, 0, 0));
 }
 
 #[tokio::test]

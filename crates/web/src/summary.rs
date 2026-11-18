@@ -316,33 +316,37 @@ fn summary_csv(fields: &[FieldDef], spec: &SummarySpec, result: &SummaryResult) 
         cells.extend(spec.measures.iter().map(|m| match row.values.get(&m.name) {
             Some(Value::Null) | None => String::new(),
             Some(Value::String(text)) => text.clone(),
+            // Decimal comma, like the record export: 12.5 is written as 12,5.
+            Some(Value::Number(number)) => number.to_string().replace('.', ","),
             Some(value) => value.to_string(),
         }));
         lines.push(csv_line(&cells));
     }
-    lines.join("\r\n") + "\r\n"
+    // The byte order mark makes Excel read the file as UTF-8 (æ, ø, å).
+    format!("\u{feff}{}\r\n", lines.join("\r\n"))
 }
 
-/// Quotes cells as needed and defuses spreadsheet formulas, like the record export.
+/// Quotes cells as needed and defuses spreadsheet formulas, like the record
+/// export. Cells are separated by `;`, since `,` is the decimal mark.
 fn csv_line(cells: &[String]) -> String {
     cells
         .iter()
         .map(|cell| {
             let cell = if cell.trim_start().starts_with(['=', '+', '-', '@'])
-                && cell.parse::<f64>().is_err()
+                && cell.replace(',', ".").parse::<f64>().is_err()
             {
                 format!("'{cell}")
             } else {
                 cell.clone()
             };
-            if cell.contains([',', '"', '\n', '\r']) {
+            if cell.contains([';', '"', '\n', '\r']) {
                 format!("\"{}\"", cell.replace('"', "\"\""))
             } else {
                 cell
             }
         })
         .collect::<Vec<_>>()
-        .join(",")
+        .join(";")
 }
 
 /// Filters that select one group's records in the table.
@@ -1111,6 +1115,12 @@ fn compact(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_lines_use_semicolons_and_keep_decimal_commas() {
+        let cells = ["Blåbær; Æ", "1,5", "-2,25", "=SUM(A1)", "Ørn"].map(String::from);
+        assert_eq!(csv_line(&cells), "\"Blåbær; Æ\";1,5;-2,25;'=SUM(A1);Ørn");
+    }
 
     #[test]
     fn ticks_are_round_and_cover_the_data() {

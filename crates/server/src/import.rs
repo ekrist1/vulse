@@ -30,6 +30,9 @@ struct Table {
     sheets: Vec<String>,
     sheet: String,
     first_row: usize,
+    /// A semicolon-separated CSV, where a comma in a number is always the
+    /// decimal mark (as in Vulse's own CSV exports).
+    decimal_comma: bool,
 }
 
 fn multipart_error(err: axum::extract::multipart::MultipartError) -> AppError {
@@ -174,7 +177,7 @@ pub async fn import_file(
                     if cell.trim().is_empty() {
                         continue;
                     }
-                    match decimal_comma(f.kind, cell).and_then(|c| convert(f.kind, &c)) {
+                    match decimal_comma(f.kind, cell, table.decimal_comma).and_then(|c| convert(f.kind, &c)) {
                         Ok(v) => {
                             obj.insert(target.clone(), v);
                         }
@@ -433,7 +436,7 @@ fn suggestions(table: &Table) -> FieldSuggestions {
             SuggestedField {
                 header: header.trim().into(),
                 name,
-                kind: suggested_kind(&cells),
+                kind: suggested_kind(&cells, table.decimal_comma),
                 samples,
             }
         })
@@ -452,11 +455,11 @@ fn suggestions(table: &Table) -> FieldSuggestions {
 
 /// The narrowest type every cell imports as: number, then date, then
 /// yes/no, then text. Empty columns are text.
-fn suggested_kind(cells: &[&str]) -> FieldType {
+fn suggested_kind(cells: &[&str], comma_is_decimal: bool) -> FieldType {
     let fits = |kind| {
         !cells.is_empty()
             && cells.iter().all(|cell| {
-                decimal_comma(kind, cell)
+                decimal_comma(kind, cell, comma_is_decimal)
                     .and_then(|c| convert(kind, &c))
                     .is_ok()
             })
@@ -563,8 +566,13 @@ fn validate_mapping(
 }
 /// Decimal-comma locales write 33,47 in files; a lone comma without a point
 /// in a number cell is read as the decimal mark. `1,234` could also be an
-/// English thousands separator, so that shape is refused rather than guessed.
-fn decimal_comma(kind: FieldType, cell: &str) -> Result<std::borrow::Cow<'_, str>, String> {
+/// English thousands separator, so that shape is refused rather than guessed,
+/// unless `comma_is_decimal` says the file already settles it.
+fn decimal_comma(
+    kind: FieldType,
+    cell: &str,
+    comma_is_decimal: bool,
+) -> Result<std::borrow::Cow<'_, str>, String> {
     if kind != FieldType::Number || cell.matches(',').count() != 1 || cell.contains('.') {
         return Ok(cell.into());
     }
@@ -572,7 +580,8 @@ fn decimal_comma(kind: FieldType, cell: &str) -> Result<std::borrow::Cow<'_, str
     let unsigned = trimmed.trim_start_matches(['-', '+']);
     if let Some((whole, fraction)) = unsigned.split_once(',') {
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if digits(whole)
+        if !comma_is_decimal
+            && digits(whole)
             && whole.len() <= 3
             && whole != "0"
             && fraction.len() == 3
@@ -665,8 +674,9 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Resul
     if name.to_ascii_lowercase().ends_with(".csv") {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         let text = std::str::from_utf8(bytes).map_err(|_| "CSV must use UTF-8 encoding")?;
+        let delimiter = csv_delimiter(text);
         let mut reader = csv::ReaderBuilder::new()
-            .delimiter(csv_delimiter(text))
+            .delimiter(delimiter)
             .has_headers(false)
             .from_reader(bytes);
         let mut records = reader.records();
@@ -700,6 +710,7 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Resul
             sheets: vec![],
             sheet: String::new(),
             first_row: if has_headers { 2 } else { 1 },
+            decimal_comma: delimiter == b';',
         });
     }
     if !name.to_ascii_lowercase().ends_with(".xlsx") {
@@ -752,6 +763,7 @@ fn parse_file(name: &str, bytes: &[u8], sheet: &str, has_headers: bool) -> Resul
         sheets,
         sheet: selected,
         first_row,
+        decimal_comma: false,
     })
 }
 
@@ -1034,7 +1046,8 @@ mod tests {
     #[test]
     fn numbers_accept_a_decimal_comma() {
         let number = |cell| {
-            decimal_comma(FieldType::Number, cell).and_then(|c| convert(FieldType::Number, &c))
+            decimal_comma(FieldType::Number, cell, false)
+                .and_then(|c| convert(FieldType::Number, &c))
         };
         assert_eq!(number("33,47").unwrap(), serde_json::json!(33.47));
         assert_eq!(number(" -0,5 ").unwrap(), serde_json::json!(-0.5));
@@ -1047,8 +1060,34 @@ mod tests {
             assert!(number(bad).is_err(), "{bad}");
         }
         assert!(number("1,234").unwrap_err().contains("1234 or 1.234"));
-        assert_eq!(decimal_comma(FieldType::String, "3,5").unwrap(), "3,5");
-        assert_eq!(decimal_comma(FieldType::String, "1,234").unwrap(), "1,234");
+        assert_eq!(
+            decimal_comma(FieldType::String, "3,5", false).unwrap(),
+            "3,5"
+        );
+        assert_eq!(
+            decimal_comma(FieldType::String, "1,234", false).unwrap(),
+            "1,234"
+        );
+        // In a semicolon-separated file the comma can only be the decimal mark.
+        let semicolon = |cell| {
+            decimal_comma(FieldType::Number, cell, true)
+                .and_then(|c| convert(FieldType::Number, &c))
+        };
+        assert_eq!(semicolon("1,234").unwrap(), serde_json::json!(1.234));
+        assert_eq!(semicolon("-12,500").unwrap(), serde_json::json!(-12.5));
+        for bad in ["1,234.5", "1,2,3", "abc"] {
+            assert!(semicolon(bad).is_err(), "{bad}");
+        }
+        assert!(
+            parse_file("data.csv", b"a;b\n1,5;2\n", "", true)
+                .unwrap()
+                .decimal_comma
+        );
+        assert!(
+            !parse_file("data.csv", b"a,b\n1,2\n", "", true)
+                .unwrap()
+                .decimal_comma
+        );
     }
     #[test]
     fn spreadsheet_and_text_dates_convert_to_iso_dates() {
